@@ -7,6 +7,12 @@
 - Submission period: OpenAI Build Week 2026
 - Evidence type: local Codex session metadata and verified repository actions
 
+## Supplemental public usage context
+
+![Codex profile activity card showing cumulative usage and a 37-day activity streak](./codex-profile-card.png)
+
+This Codex-generated profile card provides supplemental public context that the submitter is an active Codex user. It is not used as standalone proof that GPT-5.6 produced a specific change. Project-level attribution remains anchored to the `/feedback` session ID above, the Build Week scope record, and the verified repository actions below.
+
 ## Work represented
 
 The session covered repository mapping, competition-scope separation, review of the explicit thread-title candidate flow, release and test verification, and Build Week submission preparation.
