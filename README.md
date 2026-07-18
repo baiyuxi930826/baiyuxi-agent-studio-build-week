@@ -31,7 +31,7 @@ The eligible event-period work includes:
 3. Adding the explicit, editable thread-title candidate workflow with ownership, stale-response, pagination, and IME safeguards.
 4. Producing a clean public distribution with credential scanning and source provenance.
 
-See [BUILD_WEEK.md](BUILD_WEEK.md) and the [sanitized Codex session summary](docs/build-week-evidence/codex-session-summary.md) for evidence.
+See [BUILD_WEEK.md](BUILD_WEEK.md), the [sanitized Codex session summary](docs/build-week-evidence/codex-session-summary.md), and the [supplemental Codex usage card](docs/build-week-evidence/codex-profile-card.png) for evidence.
 
 ## Origin and licensing
 
