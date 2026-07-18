@@ -1,0 +1,213 @@
+'use client';
+
+import {
+  type Dispatch,
+  type MutableRefObject,
+  type SetStateAction,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from 'react';
+import { API_URL, apiFetch } from '@/utils/api-client';
+
+export type ConnectionLevel = 'online' | 'degraded' | 'offline';
+
+interface ConnectionProbeState {
+  api: ConnectionLevel;
+  socket: ConnectionLevel;
+  upstream: ConnectionLevel;
+  browserOnline: boolean;
+  isReadonly: boolean;
+  checkedAt: number | null;
+}
+
+const POLL_INTERVAL_MS = 15_000;
+const REQUEST_TIMEOUT_MS = 2_500;
+const FAILURE_THRESHOLD = 2;
+const LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+export function isLoopbackApiUrl(apiUrl: string): boolean {
+  try {
+    const hostname = new URL(apiUrl).hostname.toLowerCase();
+    return LOOPBACK_HOSTNAMES.has(hostname);
+  } catch {
+    return false;
+  }
+}
+
+export function shouldForceBrowserOffline(browserOnline: boolean, apiUrl: string): boolean {
+  return !browserOnline && !isLoopbackApiUrl(apiUrl);
+}
+
+export function deriveSocketLevel(
+  browserOnline: boolean,
+  socketConnected: boolean | null | undefined,
+  apiUrl: string,
+): ConnectionLevel {
+  if (shouldForceBrowserOffline(browserOnline, apiUrl)) return 'offline';
+  if (socketConnected == null) return 'online';
+  return socketConnected ? 'online' : 'degraded';
+}
+
+function getInitialBrowserOnline(): boolean {
+  if (typeof navigator === 'undefined') return true;
+  return navigator.onLine;
+}
+
+function getInitialConnectionLevel(): ConnectionLevel {
+  return shouldForceBrowserOffline(getInitialBrowserOnline(), API_URL) ? 'offline' : 'online';
+}
+
+async function probePublicEndpoint(path: string): Promise<ConnectionLevel> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${API_URL}${path}`, {
+      cache: 'no-store',
+      credentials: 'include',
+      signal: controller.signal,
+    });
+    if (res.ok) return 'online';
+    return 'degraded';
+  } catch {
+    return 'offline';
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Upstream probe: if roster is fetchable and at least one agent is routable, treat as online.
+ * We use this as a low-cost proxy signal for "model side reachable enough to serve".
+ */
+async function probeAgentsAvailability(): Promise<ConnectionLevel> {
+  try {
+    const res = await apiFetch('/api/agents');
+    if (!res.ok) return 'degraded';
+    const data = (await res.json().catch(() => null)) as {
+      agents?: Array<{ roster?: { available?: boolean } }>;
+    } | null;
+    const agents = Array.isArray(data?.agents) ? data.agents : [];
+    if (agents.length === 0) return 'degraded';
+    const hasRoutableAgent = agents.some((agent) => agent?.roster?.available !== false);
+    return hasRoutableAgent ? 'online' : 'degraded';
+  } catch {
+    return 'offline';
+  }
+}
+
+function mergeUpstreamSignal(ready: ConnectionLevel, agents: ConnectionLevel): ConnectionLevel {
+  if (ready === 'offline' || agents === 'offline') return 'offline';
+  if (ready === 'degraded' || agents === 'degraded') return 'degraded';
+  return 'online';
+}
+
+export function useConnectionStatus(socketConnected?: boolean | null): ConnectionProbeState {
+  const probesEnabled = process.env.NODE_ENV !== 'test';
+  const [browserOnline, setBrowserOnline] = useState<boolean>(getInitialBrowserOnline);
+  const [api, setApi] = useState<ConnectionLevel>(getInitialConnectionLevel);
+  const [upstream, setUpstream] = useState<ConnectionLevel>(getInitialConnectionLevel);
+  const [checkedAt, setCheckedAt] = useState<number | null>(null);
+  const mountedRef = useRef(true);
+  const apiFailureCountRef = useRef(0);
+  const upstreamFailureCountRef = useRef(0);
+  const browserOfflineForcesDown = shouldForceBrowserOffline(browserOnline, API_URL);
+
+  useEffect(() => {
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const applyWithFailureThreshold = useCallback(
+    (
+      next: ConnectionLevel,
+      failureCountRef: MutableRefObject<number>,
+      setter: Dispatch<SetStateAction<ConnectionLevel>>,
+    ) => {
+      if (next === 'online') {
+        failureCountRef.current = 0;
+        setter('online');
+        return;
+      }
+      failureCountRef.current += 1;
+      if (failureCountRef.current >= FAILURE_THRESHOLD) {
+        setter(next);
+      }
+    },
+    [],
+  );
+
+  const runProbe = useCallback(async () => {
+    if (browserOfflineForcesDown) return;
+    if (!probesEnabled) return;
+    const [apiLevel, readyLevel, agentsLevel] = await Promise.all([
+      probePublicEndpoint('/api/health'),
+      probePublicEndpoint('/api/ready'),
+      probeAgentsAvailability(),
+    ]);
+    if (!mountedRef.current) return;
+
+    applyWithFailureThreshold(apiLevel, apiFailureCountRef, setApi);
+    applyWithFailureThreshold(mergeUpstreamSignal(readyLevel, agentsLevel), upstreamFailureCountRef, setUpstream);
+    setCheckedAt(Date.now());
+  }, [applyWithFailureThreshold, browserOfflineForcesDown, probesEnabled]);
+
+  useEffect(() => {
+    if (browserOfflineForcesDown) {
+      apiFailureCountRef.current = 0;
+      upstreamFailureCountRef.current = 0;
+      setApi('offline');
+      setUpstream('offline');
+      setCheckedAt(Date.now());
+      return;
+    }
+
+    if (!probesEnabled) {
+      apiFailureCountRef.current = 0;
+      upstreamFailureCountRef.current = 0;
+      setApi('online');
+      setUpstream('online');
+      setCheckedAt(null);
+      return;
+    }
+
+    void runProbe();
+    const timer = setInterval(() => {
+      void runProbe();
+    }, POLL_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [browserOfflineForcesDown, runProbe, probesEnabled]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const handleOnline = () => {
+      setBrowserOnline(true);
+    };
+    const handleOffline = () => {
+      setBrowserOnline(false);
+    };
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
+  const socket = deriveSocketLevel(browserOnline, socketConnected, API_URL);
+
+  const isReadonly = browserOfflineForcesDown ? true : api === 'offline' && socket === 'offline';
+
+  return {
+    api,
+    socket,
+    upstream,
+    browserOnline,
+    isReadonly,
+    checkedAt,
+  };
+}

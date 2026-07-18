@@ -1,0 +1,73 @@
+/*
+ * F056 Phase E — Agent Persona Derived (dynamic derivation)
+ *
+ * Post-Option B: per-agent static tokens (light + dark) are generated dynamically
+ * by AgentHueInjector.tsx. This file only contains:
+ *   1. .agent-persona-derived — dynamic hue/chroma derivation for message bubbles (light + dark)
+ *   2. .agent-persona-preview-light / -dark — theme-independent preview formulas
+ *
+ * F056: message body text color is applied via inline style on the bubble div
+ * (color: var(--agent-msg-text)), NOT on .agent-persona-derived itself, to avoid
+ * leaking into agent name spans which need their own per-slug --color-{slug}-text.
+ */
+
+/* ============================================================
+ * 通用 Agent Persona 气泡派生（.agent-persona-derived）
+ *
+ * 组件（ChatMessage）从 agent 主色 hex 反推 hue/chroma，注入 --msg-hue / --msg-chroma
+ * 数值变量；本 class 派生 bubble / surface / inset / ring / text 五档。
+ * text 的 L/C 由 Tuner 的 msgText 控制（默认接近中性 --studio-text）。
+ * light/dark 由 [data-theme] 自动切换。
+ * ============================================================ */
+.agent-persona-derived {
+  --agent-msg-bubble: oklch(
+    var(--agent-bubble-l, 0.62) calc(var(--msg-chroma, 0.1) * var(--agent-bubble-cmul, 1)) var(--msg-hue, 297)
+  );
+  --agent-msg-surface: oklch(
+    var(--agent-surface-l, 0.85) calc(var(--msg-chroma, 0.1) * var(--agent-surface-cmul, 0.45)) var(--msg-hue, 297)
+  );
+  --agent-msg-inset: oklch(
+    var(--agent-inset-l, 0.25) calc(var(--msg-chroma, 0.1) * var(--agent-inset-cmul, 0.15)) var(--msg-hue, 297)
+  );
+  --agent-msg-inset-text: oklch(var(--agent-inset-text-l, 0.85) var(--agent-inset-text-c, 0.03) 30);
+  --agent-msg-text: oklch(var(--agent-msg-text-l, 0.25) var(--agent-msg-text-c, 0.01) 30);
+  --agent-msg-ring: oklch(
+    var(--agent-ring-l, 0.55) calc(var(--msg-chroma, 0.1) * var(--agent-ring-cmul, 1.1)) var(--msg-hue, 297)
+  );
+}
+
+[data-theme="dark"] .agent-persona-derived {
+  --agent-msg-bubble: oklch(
+    var(--agent-bubble-l, 0.68) calc(var(--msg-chroma, 0.1) * var(--agent-bubble-cmul, 0.85)) var(--msg-hue, 297)
+  );
+  --agent-msg-surface: oklch(
+    var(--agent-surface-l, 0.3) calc(var(--msg-chroma, 0.1) * var(--agent-surface-cmul, 0.15)) var(--msg-hue, 297)
+  );
+  --agent-msg-inset: oklch(
+    var(--agent-inset-l, 0.24) calc(var(--msg-chroma, 0.1) * var(--agent-inset-cmul, 0.1)) var(--msg-hue, 297)
+  );
+  --agent-msg-inset-text: oklch(var(--agent-inset-text-l, 0.8) var(--agent-inset-text-c, 0.02) 250);
+  --agent-msg-text: oklch(var(--agent-msg-text-l, 0.8) var(--agent-msg-text-c, 0.04) 30);
+  --agent-msg-ring: oklch(
+    var(--agent-ring-l, 0.7) calc(var(--msg-chroma, 0.1) * var(--agent-ring-cmul, 1)) var(--msg-hue, 297)
+  );
+}
+
+/* ── 成员编辑器 light/dark 双预览（hub-agent-editor-color-field）─────────
+ * 预览要在同一屏同时显示两个 mode，无法靠 [data-theme] 切换；故这两个类
+ * 各自硬编码完整 oklch 值（theme-independent），不依赖 --agent-msg-text-l
+ * 等仅在当前 mode 可用的变量。buildCSS() 运行后会用 Tuner 实际值覆盖。
+ * ⚠️ 硬编码值必须与 INIT defaults (oklch-tuner-engine.ts) 保持一致。 */
+.agent-persona-preview-light {
+  --agent-msg-surface: oklch(0.85 calc(var(--msg-chroma, 0.1) * 0.45) var(--msg-hue, 297));
+  --agent-msg-inset: oklch(0.25 calc(var(--msg-chroma, 0.1) * 0.15) var(--msg-hue, 297));
+  --agent-msg-inset-text: oklch(0.85 0.03 30);
+  --agent-msg-text: oklch(0.25 0.01 30);
+}
+
+.agent-persona-preview-dark {
+  --agent-msg-surface: oklch(0.3 calc(var(--msg-chroma, 0.1) * 0.15) var(--msg-hue, 297));
+  --agent-msg-inset: oklch(0.24 calc(var(--msg-chroma, 0.1) * 0.1) var(--msg-hue, 297));
+  --agent-msg-inset-text: oklch(0.8 0.02 250);
+  --agent-msg-text: oklch(0.8 0.04 30);
+}

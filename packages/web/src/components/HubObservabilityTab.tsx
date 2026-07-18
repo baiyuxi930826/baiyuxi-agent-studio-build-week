@@ -1,0 +1,273 @@
+'use client';
+
+import type React from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { apiFetch } from '@/utils/api-client';
+import { HubCallbackAuthPanel } from './HubCallbackAuthPanel';
+import { HubEvalTab } from './HubEvalTab';
+import { TraceBrowser } from './HubTraceTree';
+
+interface HealthData {
+  status: 'healthy' | 'degraded';
+  uptime: number;
+  otelEnabled: boolean;
+  readiness?: { status: 'ready' | 'degraded'; checks: Record<string, { ok: boolean; ms: number; error?: string }> };
+  errorRate: number | null;
+  traceStore: { spanCount: number; maxSpans: number; oldestStoredAt: number | null } | null;
+  metricsSnapshotStore: { snapshotCount: number; maxSnapshots: number } | null;
+  timestamp: number;
+}
+
+interface MetricsSnapshot {
+  timestamp: number;
+  metrics: Record<string, number>;
+}
+
+type SubTab = 'overview' | 'traces' | 'health' | 'callback-auth' | 'eval';
+
+const SUB_TAB_LABELS: Record<SubTab, string> = {
+  overview: '总览',
+  traces: 'Traces',
+  health: '健康',
+  'callback-auth': 'Callback Auth',
+  eval: 'Eval',
+};
+
+const SUB_TABS: SubTab[] = ['overview', 'traces', 'health', 'callback-auth', 'eval'];
+
+export interface HubObservabilityTabProps {
+  /** F174 D2b-3: open directly into a specific subtab (e.g. when D2b-1 详情 button navigates here). */
+  initialSubTab?: SubTab;
+  /**
+   * F174 D2b-3 cloud P2 #1403: per-navigation nonce. Bumps on every deep-link,
+   * so a second navigation with SAME (tab, subTab) still re-syncs subTab. Without
+   * this, value-only diff in the useEffect below would silently no-op when a
+   * user manually navigated away and then re-clicked 详情.
+   */
+  subTabNonce?: number;
+}
+
+export function HubObservabilityTab({ initialSubTab = 'overview', subTabNonce }: HubObservabilityTabProps = {}) {
+  const [subTab, setSubTab] = useState<SubTab>(initialSubTab);
+
+  // Sync prop → state on every initialSubTab change OR per-invocation nonce
+  // bump. The nonce dep handles the same-value re-deep-link case (cloud P2).
+  useEffect(() => {
+    setSubTab(initialSubTab);
+  }, [initialSubTab, subTabNonce]);
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center gap-2" data-guide-id="observability.subtabs">
+        {SUB_TABS.map((t) => (
+          <button
+            key={t}
+            type="button"
+            onClick={() => setSubTab(t)}
+            data-guide-id={`observability.${t}`}
+            className={`px-3 py-1.5 text-xs transition-colors ${
+              subTab === t
+                ? 'border-b-2 border-[var(--console-button-emphasis)] font-semibold text-[var(--console-button-emphasis)]'
+                : 'font-medium text-studio-muted hover:text-studio-secondary'
+            }`}
+          >
+            {SUB_TAB_LABELS[t]}
+          </button>
+        ))}
+      </div>
+
+      {subTab === 'overview' && <OverviewPanel />}
+      {subTab === 'traces' && <TraceBrowser />}
+      {subTab === 'health' && <HealthPanel />}
+      {subTab === 'callback-auth' && <HubCallbackAuthPanel />}
+      {subTab === 'eval' && <HubEvalTab />}
+    </div>
+  );
+}
+
+function MetricCard({ label, value, sub }: { label: string; value: string; sub?: string }) {
+  return (
+    <div className="rounded-lg bg-studio-surface-elevated px-4 py-3">
+      <div className="text-xs text-studio-muted">{label}</div>
+      <div className="mt-1 text-xl font-semibold text-studio">{value}</div>
+      {sub && <div className="text-xs text-studio-secondary">{sub}</div>}
+    </div>
+  );
+}
+
+function OverviewPanel() {
+  const [snapshots, setSnapshots] = useState<MetricsSnapshot[]>([]);
+  const [loading, setLoading] = useState(true);
+  const timerRef = useRef<ReturnType<typeof setInterval>>();
+
+  const fetchHistory = useCallback(async () => {
+    try {
+      const since = Date.now() - 30 * 60 * 1000;
+      const res = await apiFetch(`/api/telemetry/metrics/history?since=${since}`);
+      if (res.ok) {
+        const data = (await res.json()) as { snapshots: MetricsSnapshot[] };
+        setSnapshots(data.snapshots);
+      }
+    } catch {
+      /* ignore */
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchHistory();
+    timerRef.current = setInterval(fetchHistory, 30_000);
+    return () => clearInterval(timerRef.current);
+  }, [fetchHistory]);
+
+  const latest = snapshots.length > 0 ? snapshots[snapshots.length - 1]!.metrics : {};
+
+  const invOk = sumByPrefix(latest, 'agent_studio_invocation_completed', 'status="ok"');
+  const invErr = sumByPrefix(latest, 'agent_studio_invocation_completed', 'status="error"');
+  const invocations = sumByPrefix(latest, 'agent_studio_agent_invocation_count');
+  const activeInv = sumByPrefix(latest, 'agent_studio_invocation_active');
+
+  if (loading) return <p className="text-sm text-studio-muted">...</p>;
+
+  return (
+    <div className="space-y-4" data-guide-id="observability.overview-panel">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <MetricCard label="Invocation (ok)" value={String(invOk)} />
+        <MetricCard
+          label="Invocation (error)"
+          value={String(invErr)}
+          sub={invOk + invErr > 0 ? `${((invErr / (invOk + invErr)) * 100).toFixed(1)}% error` : undefined}
+        />
+        <MetricCard label="Invocations" value={String(invocations)} />
+        <MetricCard label="Active" value={String(activeInv)} />
+        <MetricCard label="Snapshots" value={`${snapshots.length}`} sub="(last 30min)" />
+      </div>
+
+      {snapshots.length > 1 && (
+        <TrendChart
+          snapshots={snapshots}
+          metricPrefix="agent_studio_invocation_completed"
+          label="Invocation Completed"
+        />
+      )}
+    </div>
+  );
+}
+
+function TrendChart({
+  snapshots,
+  metricPrefix,
+  label,
+}: {
+  snapshots: MetricsSnapshot[];
+  metricPrefix: string;
+  label: string;
+}) {
+  if (snapshots.length < 2) return null;
+
+  const values = snapshots.map((s) => sumByPrefix(s.metrics, metricPrefix));
+  const max = Math.max(...values, 1);
+  const width = 400;
+  const height = 80;
+  const step = width / (values.length - 1);
+
+  const points = values.map((v, i) => `${i * step},${height - (v / max) * height}`).join(' ');
+
+  return (
+    <div
+      className="rounded-lg bg-studio-surface-elevated p-3"
+      style={{ '--dataviz-trend-line': 'var(--chart-4)' } as React.CSSProperties}
+    >
+      <div className="mb-2 text-xs text-studio-muted">{label}</div>
+      <svg viewBox={`0 0 ${width} ${height}`} className="h-20 w-full" preserveAspectRatio="none">
+        <polyline points={points} fill="none" stroke="var(--dataviz-trend-line)" strokeWidth="2" />
+      </svg>
+    </div>
+  );
+}
+
+function HealthPanel() {
+  const [health, setHealth] = useState<HealthData | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  const fetchHealth = useCallback(async () => {
+    try {
+      const res = await apiFetch('/api/telemetry/health');
+      if (res.ok || res.status === 503) setHealth((await res.json()) as HealthData);
+    } catch {
+      /* ignore */
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchHealth();
+  }, [fetchHealth]);
+
+  if (loading) return <p className="text-sm text-studio-muted">...</p>;
+  if (!health) return <p className="text-sm text-studio-secondary">Unable to load health data.</p>;
+
+  return (
+    <div className="space-y-3" data-guide-id="observability.health-panel">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <MetricCard label="Status" value={health.status === 'healthy' ? '✓ Healthy' : '⚠ Degraded'} />
+        <MetricCard label="Uptime" value={formatUptime(health.uptime)} />
+        <MetricCard label="OTel" value={health.otelEnabled ? 'Enabled' : 'Disabled'} />
+        <MetricCard
+          label="Error Rate"
+          value={health.errorRate !== null ? `${(health.errorRate * 100).toFixed(1)}%` : 'N/A'}
+        />
+      </div>
+
+      {health.readiness && (
+        <div className="rounded-lg bg-studio-surface-elevated p-3">
+          <div className="mb-1 text-xs font-medium text-studio-muted">Readiness Checks</div>
+          {Object.entries(health.readiness.checks).map(([name, check]) => (
+            <div key={name} className="flex items-center gap-2 text-xs">
+              <span className={check.ok ? 'text-conn-green-text' : 'text-conn-red-text'}>{check.ok ? '✓' : '✗'}</span>
+              <span className="text-studio">{name}</span>
+              <span className="text-studio-muted">{check.ms}ms</span>
+              {check.error && <span className="text-conn-red-text">{check.error}</span>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="grid grid-cols-2 gap-3">
+        <MetricCard
+          label="Trace Store"
+          value={health.traceStore ? `${health.traceStore.spanCount} spans` : 'N/A'}
+          sub={health.traceStore ? `max ${health.traceStore.maxSpans}` : undefined}
+        />
+        <MetricCard
+          label="Snapshot Store"
+          value={health.metricsSnapshotStore ? `${health.metricsSnapshotStore.snapshotCount} snapshots` : 'N/A'}
+          sub={health.metricsSnapshotStore ? `max ${health.metricsSnapshotStore.maxSnapshots}` : undefined}
+        />
+      </div>
+      {health.traceStore?.oldestStoredAt && (
+        <div className="text-xs text-studio-muted">
+          Oldest span: {new Date(health.traceStore.oldestStoredAt).toLocaleString()}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function sumByPrefix(metrics: Record<string, number>, prefix: string, filter?: string): number {
+  let total = 0;
+  for (const [key, value] of Object.entries(metrics)) {
+    if (!key.startsWith(prefix)) continue;
+    if (filter && !key.includes(filter)) continue;
+    total += value;
+  }
+  return total;
+}
+
+function formatUptime(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}

@@ -1,0 +1,169 @@
+/**
+ * Task Types (毛线球)
+ * 智能体任务系统 — 让每个智能体追踪自己负责的事项
+ *
+ * #320: Unified model — PR tracking merged into Task system.
+ * kind=work: human/agent collaboration tasks (original)
+ * kind=pr_tracking: automated PR monitoring tasks (merged from PrTrackingStore)
+ */
+
+import type { DispatchGateState } from './cross-thread-affordance.js';
+import type { AgentId } from './ids.js';
+
+// Re-export affordance types so existing consumers don't break
+export type {
+  DispatchGateState,
+  SuggestedCrossPostAction,
+  SuggestedCrossPostActionSource,
+} from './cross-thread-affordance.js';
+export { extractFeatureIds } from './cross-thread-affordance.js';
+
+export type TaskStatus = 'todo' | 'doing' | 'blocked' | 'done';
+
+/**
+ * Task kind discriminator (#320, F202-2D).
+ * - work: manual tasks created by agents/humans
+ * - pr_tracking: automated PR tasks (review-feedback, cicd-check, conflict-check)
+ * - issue_tracking: automated GitHub issue comment tracking (F202 Phase 2D)
+ */
+export type TaskKind = 'work' | 'pr_tracking' | 'issue_tracking';
+
+/** Tracking kinds that receive eviction/TTL protection when active (status !== 'done'). */
+export function isTrackingKind(kind: TaskKind): kind is 'pr_tracking' | 'issue_tracking' {
+  return kind === 'pr_tracking' || kind === 'issue_tracking';
+}
+
+/** CI/CD automation state for pr_tracking tasks */
+export interface CiAutomationState {
+  readonly headSha?: string;
+  readonly lastFingerprint?: string;
+  readonly lastBucket?: string;
+  readonly lastNotifiedAt?: number;
+  readonly enabled?: boolean;
+  readonly skipNotified?: boolean;
+  /** Terminal PR state — persisted by CiCdRouter on lifecycle close (F200 AC-D2.3). */
+  readonly prState?: 'merged' | 'closed';
+}
+
+/** Conflict detection automation state for pr_tracking tasks */
+export interface ConflictAutomationState {
+  readonly mergeState?: string;
+  readonly lastFingerprint?: string;
+  readonly lastNotifiedAt?: number;
+}
+
+/** Review feedback automation state for pr_tracking tasks */
+export interface ReviewAutomationState {
+  readonly lastCommentCursor?: number;
+  readonly lastDecisionCursor?: number;
+  readonly lastNotifiedAt?: number;
+  /** #949: Number of MR reviews completed on the current thread. Used for thread rotation. */
+  readonly completedReviewCount?: number;
+}
+
+/**
+ * F140: what the agent is currently waiting on for this tracked PR — the wake intent, NOT the repo
+ * type (a private PR can be 'merge'; an open-source PR can be 'review'). Decides whether a CI-pass
+ * is noise (review-wait) or an action signal (merge-wait). Agents re-register to flip it.
+ *   - review (default): waiting on review feedback → CI-pass stays silent (thread message only).
+ *   - merge: waiting on CI-green to merge (own approved PR / outbound PR / owner-merge of another's
+ *     PR) → CI-pass wakes (→ merge-gate).
+ * CI fail / review feedback / conflict always wake under both intents.
+ */
+export type PrTrackingIntent = 'review' | 'merge';
+
+/** Issue comment automation state for issue_tracking tasks (F202 Phase 2D) */
+export interface IssueAutomationState {
+  readonly lastCommentCursor?: number;
+  readonly lastNotifiedAt?: number;
+  readonly issueState?: 'open' | 'closed';
+  /**
+   * F168 Phase B: dual-cursor delivery tracking.
+   * Tracks the max comment id that was successfully delivered (notified) to the owner.
+   * Separate from lastCommentCursor (collection) so delivery retries don't re-append events.
+   * Undefined means "not yet managed by dual-cursor; default to lastCommentCursor".
+   */
+  readonly lastDeliveredCursor?: number;
+}
+
+/** Composite automation state embedded in pr_tracking/issue_tracking tasks (#320 KD-14, F202-2D) */
+export interface AutomationState {
+  readonly ci?: CiAutomationState;
+  readonly conflict?: ConflictAutomationState;
+  readonly review?: ReviewAutomationState;
+  readonly issue?: IssueAutomationState;
+  readonly closedAt?: number;
+  /** F140: wake intent for this tracked PR (defaults to 'review' when absent). */
+  readonly intent?: PrTrackingIntent;
+  /** F202 Phase 2C: user-provided instructions appended to trigger messages. Task preference, not system override. */
+  readonly trackingInstructions?: string;
+}
+
+export interface TaskItem {
+  readonly id: string;
+  /** Task kind: 'work' (default) or 'pr_tracking' (#320) */
+  readonly kind: TaskKind;
+  readonly threadId: string;
+  /**
+   * Unique subject key for dedup/lookup (#320 KD-15).
+   * Format: `pr:{owner/repo}#{num}` | `thread:{threadId}` | `repo:{owner/repo}`
+   * Null for kind=work tasks that don't need subject-based dedup.
+   */
+  readonly subjectKey: string | null;
+  readonly title: string;
+  readonly ownerAgentId: AgentId | null;
+  readonly status: TaskStatus;
+  readonly why: string;
+  readonly createdBy: AgentId | 'user' | 'system';
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  /** PR tracking automation state (#320 KD-14). Only present for kind=pr_tracking. */
+  readonly automationState?: AutomationState;
+  /** User who registered this task (for ownership checks). */
+  readonly userId?: string;
+  /** Source message ID for traceability (4-A feature) */
+  readonly sourceMessageId?: string;
+  /** Source summary ID for traceability (4-A feature) */
+  readonly sourceSummaryId?: string;
+
+  // --- F193 Phase E (dispatch gate) ---
+
+  /** Feature ID explicitly associated with this task (e.g. "F193"). Optional override. */
+  readonly relatedFeatureId?: string;
+  /** All F-IDs auto-extracted from title + why (informational, for gate trigger logic) */
+  readonly detectedFeatureIds?: string[];
+  /** Dispatch gate state. Present when task references features outside current thread scope. */
+  readonly dispatchGate?: DispatchGateState;
+}
+
+export type CreateTaskInput = Pick<TaskItem, 'threadId' | 'title' | 'why' | 'createdBy'> & {
+  kind?: TaskKind;
+  subjectKey?: string | null;
+  ownerAgentId?: AgentId | null;
+  automationState?: AutomationState;
+  userId?: string;
+  sourceMessageId?: string;
+  sourceSummaryId?: string;
+  // F193 Phase E (dispatch gate)
+  relatedFeatureId?: string;
+  /** Agent's current feature context — used to determine if detected F-IDs are "external" */
+  currentFeatureId?: string;
+  /** Auto-extracted F-IDs (computed by MCP handler, passed through to store) */
+  detectedFeatureIds?: string[];
+  dispatchGate?: DispatchGateState;
+};
+
+/** Mutable partial for updates — strips readonly from TaskItem fields */
+export type UpdateTaskInput = {
+  title?: string;
+  ownerAgentId?: AgentId | null;
+  status?: TaskStatus;
+  why?: string;
+  automationState?: AutomationState;
+  /** #949: Thread rotation — allow reassigning a task to a new thread. */
+  threadId?: string;
+  /** F193-E1 P1-4: allow patching dispatchGate on existing tasks */
+  dispatchGate?: DispatchGateState;
+};
+
+// F193 Phase E utilities re-exported from cross-thread-affordance.ts (see top of file)

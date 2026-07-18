@@ -1,0 +1,226 @@
+/*
+ * F056 Phase E — console 层 token 定义（--console-* alias）
+ *
+ * 从 console-shell.css 拆出 :root alias 段（350 行硬限制 + token/类规则分离）。
+ * console-* token 主要走 :root alias；dark 模式有一段 override 把三栏
+ * 结构镜像 light（ActivityBar/Chat 对调，见文件底部）。
+ *
+ * 保留独立色板：terminal-*（IDE 风格，跟 code-* 联动）。
+ */
+
+:root {
+  /* ============ Structural surfaces — studio-surface 4 档（铲屎官指定梯度） ============
+   * 基于 develop_base 实测 hex 反推 OKLCH：
+   *   sunken   (层1·基底) → ActivityBar / code / field
+   *   surface  (层2·承载) → ThreadSidebar / RightPanel
+   *   elevated (层3·抬升) → Chat 主区
+   *   canvas   (层4·浮出) → Card 浮起
+   * Light/Dark 统一映射，不再镜像（铲屎官 2026-05-28 改版）。 */
+  --console-shell-bg: color-mix(in oklch, var(--studio-surface-elevated) 84%, var(--studio-surface-sunken) 16%);
+  --console-panel-bg: color-mix(in oklch, var(--studio-surface) 92%, var(--studio-surface-sunken) 8%);
+  --console-card-bg: var(--studio-surface-canvas);
+  /* Search/trash derive from base (层2) with fixed darker offset, NOT from sunken.
+   * This decouples them from the sunken slider — they track the thread panel. */
+  --console-card-soft-bg: color-mix(in oklch, var(--studio-surface), black 3%);
+  --console-code-bg: var(--studio-surface-sunken);
+  --console-pill-bg: color-mix(in oklch, var(--studio-surface) 88%, var(--studio-surface-canvas) 12%);
+  --console-field-bg: var(--studio-surface);
+  --console-rail-bg: color-mix(in oklch, var(--studio-surface-sunken) 92%, black 8%);
+  --console-rail-item: color-mix(in oklch, var(--studio-surface) 88%, var(--studio-surface-sunken) 12%);
+  --console-rail-active: color-mix(in srgb, var(--studio-accent) 10%, var(--console-card-bg) 90%);
+  --console-hover-bg: color-mix(in srgb, var(--studio-accent) 9%, transparent);
+  --console-active-bg: color-mix(in srgb, var(--studio-accent) 15%, var(--console-card-bg) 85%);
+  --console-modal-close-bg: var(--studio-surface);
+  --console-persistence-bg: var(--semantic-warning-surface);
+
+  /* ============ Borders ============ */
+  --console-border-soft: color-mix(in srgb, var(--studio-border-subtle) 78%, var(--studio-text) 12%);
+  --console-border-strong: color-mix(in srgb, var(--studio-border) 72%, var(--studio-text) 24%);
+  --console-diag-border: oklch(0.58 0.12 225 / 0.2);
+
+  /* ============ Shadows — elevation tokens（dark mode 自动 inset 高光） ============ */
+  --console-shadow-soft: var(--shadow-elevation-1);
+  /* Rail (ActivityBar) active/hover lift — wider/softer than elevation-1, cool-tinted */
+  --console-rail-shadow: inset -1px 0 0 color-mix(in srgb, var(--console-border-soft) 72%, transparent);
+
+  /* ============ Accents ============ */
+  --console-input-stroke: var(--accent-400);
+  --console-button-emphasis: var(--neutral-800);
+  --console-button-emphasis-hover: var(--neutral-700);
+  --console-voice-companion: var(--chart-5);
+
+  /* ============ Modal / Hint text ============ */
+  --console-modal-title: var(--accent-700);
+  --console-modal-close-fg: var(--neutral-600);
+  --console-advanced-hint: var(--accent-700);
+  --console-template-text: var(--neutral-700);
+  --console-voice-hint: var(--neutral-500);
+
+  /* ============ Agent avatar fallback ============ */
+  --console-agent-fallback: var(--neutral-400);
+
+  /* ============ CLI labels (categorical via chart palette) ============ */
+  --console-cli-check-fg: var(--semantic-info);
+  --console-cli-status-fg: var(--neutral-500);
+  --console-diag-key: var(--chart-5);
+  --console-diag-val: var(--chart-1);
+
+  /* ============ Scrim overlays ============ */
+  --console-overlay-backdrop: var(--scrim-light);
+  --console-overlay-medium: var(--scrim-dim);
+  --console-overlay-control: var(--scrim-dim);
+  --console-overlay-control-hover: var(--scrim-heavy);
+  --console-overlay-heavy: var(--scrim-heavy);
+  --console-overlay-heavy-hover: oklch(0 0 0 / 0.92);
+  --console-overlay-light: var(--scrim-light);
+
+  /* ============ X-Ray (Prompt 调试紫色派生 — 跟 chart-5 联动) ============ */
+  --console-xray-bg: color-mix(in srgb, var(--chart-5) 10%, var(--studio-surface) 90%);
+  --console-xray-text: var(--chart-5);
+  --console-xray-border: color-mix(in srgb, var(--chart-5) 22%, var(--studio-surface) 78%);
+  --console-xray-btn-bg: color-mix(in srgb, var(--chart-5) 8%, var(--studio-surface) 92%);
+  --console-xray-btn-hover: color-mix(in srgb, var(--chart-5) 16%, var(--studio-surface) 84%);
+
+  /* ============ Runtime (绿色调，走 semantic-success) ============ */
+  --console-runtime-bg: var(--semantic-success-surface);
+  --console-runtime-field-bg: color-mix(in srgb, var(--semantic-success) 14%, var(--studio-surface) 86%);
+  --console-runtime-label: var(--semantic-success);
+  --console-runtime-title: var(--semantic-success);
+  --console-runtime-muted: color-mix(in srgb, var(--semantic-success) 70%, var(--studio-surface) 30%);
+  --console-runtime-hint: color-mix(in srgb, var(--semantic-success) 60%, var(--studio-surface) 40%);
+  --console-runtime-group-bg: color-mix(in srgb, var(--semantic-success) 6%, var(--studio-surface) 94%);
+
+  /* ============ Chart palette aliases ============ */
+  --console-chart-system: var(--chart-4);
+  --console-chart-mission: var(--chart-1);
+  --console-chart-user: var(--chart-3);
+
+  /* ============ CLI Diagnostics — severity banner palette (F212) ============ */
+  --cli-sev-error-bg: var(--semantic-critical-surface);
+  --cli-sev-error-border: color-mix(in srgb, var(--semantic-critical) 30%, var(--semantic-critical-surface) 70%);
+  --cli-sev-error-accent: var(--semantic-critical);
+  --cli-sev-warning-bg: var(--semantic-warning-surface);
+  --cli-sev-warning-border: color-mix(in srgb, var(--semantic-warning) 30%, var(--semantic-warning-surface) 70%);
+  --cli-sev-warning-accent: var(--semantic-warning);
+  --cli-sev-info-bg: var(--neutral-100);
+  --cli-sev-info-border: var(--neutral-300);
+  --cli-sev-info-accent: var(--neutral-600);
+  --cli-sev-cognitive-bg: color-mix(in srgb, var(--chart-5) 10%, var(--studio-surface) 90%);
+  --cli-sev-cognitive-border: color-mix(in srgb, var(--chart-5) 25%, var(--studio-surface) 75%);
+  --cli-sev-cognitive-accent: var(--chart-5);
+  --cli-sev-text: var(--studio-text);
+  --cli-diag-hint: var(--studio-text-muted);
+  --cli-diag-meta: var(--neutral-400);
+  --cli-diag-excerpt-bg: var(--neutral-950);
+  --cli-diag-excerpt-text: var(--console-diag-val);
+
+  /* ============ Data visualization (HubToolUsageTab) ============ */
+  --dataviz-native: var(--chart-5);
+  --dataviz-native-bg: color-mix(in srgb, var(--chart-5) 10%, var(--studio-surface) 90%);
+  --dataviz-mcp: var(--chart-1);
+  --dataviz-mcp-bg: color-mix(in srgb, var(--chart-1) 10%, var(--studio-surface) 90%);
+  --dataviz-skill: var(--chart-3);
+  --dataviz-skill-bg: color-mix(in srgb, var(--chart-3) 10%, var(--studio-surface) 90%);
+
+  /* ============ Semantic surfaces — 跟 theme-tokens.css 别名兼容 ============ */
+  --semantic-success-text: var(--semantic-success);
+  --semantic-warning-bg: var(--semantic-warning-surface);
+  --semantic-warning-text: var(--semantic-warning);
+  --semantic-error-text: var(--semantic-critical);
+  --semantic-info-text: var(--semantic-info);
+
+  /* ============ Mission Control — workflow status + risk palette ============ */
+  --mc-status-open-dot: #94a3b8;
+  --mc-status-open-bg: #eef2f7;
+  --mc-status-open-text: #475569;
+  --mc-status-suggested-dot: #2f6eea;
+  --mc-status-suggested-bg: #e9f0ff;
+  --mc-status-suggested-text: #2558c7;
+  --mc-status-dispatched-dot: #14a0b8;
+  --mc-status-dispatched-bg: #e4f8fb;
+  --mc-status-dispatched-text: #0d7285;
+  --mc-status-done-dot: #2f9e69;
+  --mc-status-done-bg: #e8f7ef;
+  --mc-status-done-text: #247a52;
+  --mc-status-risk: #c2415b;
+  --mc-edge-evolved: #2f6eea;
+  --mc-edge-blocked: #dc445d;
+  --mc-edge-related: #64748b;
+  --mc-accent: #2f6eea;
+  --mc-accent-hover: #2558c7;
+  --mc-slice-learning: #2f6eea;
+  --mc-slice-value: #2f9e69;
+  --mc-slice-hardening: #7c6ee6;
+  --mc-risk-critical: #c2415b;
+  --mc-risk-high: #d1881a;
+  --mc-risk-medium: #64748b;
+
+  /* ============ Workspace — surface / accent / editor ============ */
+  --ws-surface: #f7f9fc;
+  --ws-surface-hover: #eef4ff;
+  --ws-surface-warm: #f0f4f9;
+  --ws-surface-alert: #fff1f4;
+  --ws-accent: #3f6fe5;
+  --ws-accent-hover: #315dcc;
+  --ws-text: #263142;
+  /* Editor 永远深色（跟 terminal 一样不随 mode 切换） */
+  --ws-editor-bg: #151922;
+  --ws-editor-surface: #202635;
+  --ws-editor-hover: #252d3d;
+  --ws-editor-deep: #0f131b;
+  --ws-editor-fg: #f4f7fb;
+  --ws-editor-gutter: #56627a;
+
+  /* ============ Terminal — 跟 code block IDE palette 联动（永远深色，不跟 mode 切换） ============ */
+  --terminal-text: oklch(0.92 0.01 30);
+  --terminal-fg: oklch(0.92 0.01 30);
+  --terminal-text-muted: oklch(0.62 0.005 30);
+  --terminal-text-dim: oklch(0.5 0.005 30);
+  --terminal-text-faint: oklch(0.4 0.005 30);
+  --terminal-chrome: oklch(0.35 0.01 250);
+  --terminal-btn-border: oklch(0.4 0.005 250);
+  --terminal-btn-danger-border: oklch(0.4 0.13 25);
+  --terminal-status-ok: oklch(0.78 0.14 145);
+  --terminal-status-warn: oklch(0.78 0.14 70);
+  --terminal-status-error: oklch(0.72 0.15 25);
+  --terminal-status-info: oklch(0.72 0.14 230);
+}
+
+/* ============================================================
+ * Dark override — 统一三栏映射（铲屎官 2026-05-28 改版）
+ *
+ * Light/Dark 共用同一 token→区域 映射，不再镜像：
+ *   sunken (层1·基底)  → ActivityBar / code field
+ *   surface (层2·承载) → ThreadSidebar / RightPanel
+ *   elevated (层3·抬升) → Chat 主区
+ *   canvas (层4·浮出)  → Card 浮起
+ * ============================================================ */
+[data-theme="dark"] {
+  /* Dark rail shadow — deeper, no brown tint to avoid muddy look on dark surfaces */
+  --console-rail-shadow: 0 5px 14px oklch(0 0 0 / 0.4), inset 0 1px 0 oklch(1 0 0 / 0.08);
+
+  /* Mission Control dark */
+  --mc-status-open-dot: #94a3b8;
+  --mc-status-open-bg: color-mix(in srgb, #94a3b8 14%, var(--console-card-bg) 86%);
+  --mc-status-open-text: #cbd5e1;
+  --mc-status-suggested-dot: #7da2ff;
+  --mc-status-suggested-bg: color-mix(in srgb, #3f6fe5 18%, var(--console-card-bg) 82%);
+  --mc-status-suggested-text: #a7bdff;
+  --mc-status-dispatched-dot: #45c5d6;
+  --mc-status-dispatched-bg: color-mix(in srgb, #14a0b8 18%, var(--console-card-bg) 82%);
+  --mc-status-dispatched-text: #8de4ee;
+  --mc-status-done-dot: #65c994;
+  --mc-status-done-bg: color-mix(in srgb, #2f9e69 18%, var(--console-card-bg) 82%);
+  --mc-status-done-text: #9be4be;
+  --mc-status-risk: #f2778d;
+  --mc-edge-evolved: #7da2ff;
+  --mc-edge-blocked: #f2778d;
+  --mc-edge-related: #94a3b8;
+  --mc-accent: #7da2ff;
+  --mc-accent-hover: #a7bdff;
+  --mc-slice-learning: #7da2ff;
+  --mc-slice-value: #65c994;
+  --mc-slice-hardening: #a89df7;
+  --mc-risk-critical: #f2778d;
+  --mc-risk-high: #e3a845;
+}

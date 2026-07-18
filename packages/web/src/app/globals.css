@@ -1,0 +1,302 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Design tokens live in theme-tokens.css (imported via layout.tsx) */
+
+@font-face {
+  font-family: "Plus Jakarta Sans";
+  src: url("../fonts/PlusJakartaSans-Variable.woff2") format("woff2");
+  font-weight: 200 800;
+  font-style: normal;
+  font-display: swap;
+}
+
+body {
+  font-family: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  color: var(--text-primary);
+  background: var(--bg-app);
+  letter-spacing: 0;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--studio-accent) 22%, transparent);
+  color: var(--studio-text);
+}
+
+:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--studio-accent) 78%, white 22%);
+  outline-offset: 2px;
+}
+
+/* === Mobile PWA: safe-area insets for notched devices === */
+@supports (padding-top: env(safe-area-inset-top)) {
+  .safe-area-top {
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+}
+
+@supports (padding-bottom: env(safe-area-inset-bottom)) {
+  .safe-area-bottom {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+}
+
+/* Quest input highlight: gentle amber glow on input area */
+@keyframes quest-glow {
+  0%,
+  100% {
+    box-shadow: 0 0 4px rgba(245, 158, 11, 0.3);
+  }
+  50% {
+    box-shadow:
+      0 0 12px rgba(245, 158, 11, 0.5),
+      0 0 4px rgba(245, 158, 11, 0.2);
+  }
+}
+.quest-input-highlight {
+  animation: quest-glow 2.5s ease-in-out infinite;
+  border-color: rgb(245, 158, 11) !important;
+}
+
+/* F155: Guide Engine Animations — wrapped for reduced-motion (A-3) */
+@keyframes guide-breathe {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.03);
+    opacity: 0.85;
+  }
+}
+
+@keyframes guide-hud-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* F226: presentation float tear-off enter animation (烁烁 UX — 让"撕下来"有视觉反馈) */
+@keyframes f226-float-in {
+  from {
+    opacity: 0;
+    transform: scale(0.94) translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+.f226-float-in {
+  animation: f226-float-in 280ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* 砚砚: respect reduced-motion — disable the tear-off animation for sensitive users */
+@media (prefers-reduced-motion: reduce) {
+  .f226-float-in {
+    animation: none;
+  }
+}
+
+@keyframes guide-success-flash {
+  0% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(0.9);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+@keyframes guide-error-shake {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  25% {
+    transform: translateX(-3px);
+  }
+  75% {
+    transform: translateX(3px);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .animate-guide-hud-enter {
+    animation: guide-hud-enter 160ms ease-out;
+  }
+
+  .animate-guide-success {
+    animation: guide-success-flash 0.4s ease-out;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-guide-hud-enter {
+    animation: none;
+  }
+
+  .animate-guide-success {
+    animation: none;
+  }
+
+  /* Disable breathe ring and transitions on guide overlay elements */
+  [style*="guide-breathe"] {
+    animation: none !important;
+  }
+}
+
+/* F229 PR-A3a: concierge orb animation */
+/* V4: idle 态慢呼吸（4s，scale 1→1.04→1） */
+@keyframes concierge-breathe {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.04);
+  }
+}
+
+/* V4: 气泡弹出（200ms，从 origin-bottom-right 弹入） */
+@keyframes concierge-bubble-pop {
+  from {
+    transform: scale(0.8);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* V8: reduced-motion — 静态化 concierge orb 动画（重定义 keyframes 为 no-op） */
+@media (prefers-reduced-motion: reduce) {
+  @keyframes concierge-breathe {
+    0%,
+    100%,
+    50% {
+      transform: scale(1);
+    }
+  }
+  @keyframes concierge-bubble-pop {
+    from,
+    to {
+      transform: scale(1);
+      opacity: 1;
+    }
+  }
+}
+
+.animate-guide-error {
+  animation: guide-error-shake 0.3s ease-out;
+}
+
+/* Tier 3 System Notice — tone binding + entrance animation */
+[data-notice-tone="info"] {
+  --notice-label: var(--notice-info-label);
+  --notice-icon: var(--notice-info-icon);
+  --notice-border: var(--notice-info-border);
+  --notice-surface: var(--studio-surface);
+}
+[data-notice-tone="warning"] {
+  --notice-label: var(--notice-warning-label);
+  --notice-icon: var(--notice-warning-icon);
+  --notice-border: var(--notice-warning-border);
+  --notice-surface: var(--studio-surface);
+}
+[data-notice-tone="error"] {
+  --notice-label: var(--notice-error-label);
+  --notice-icon: var(--notice-error-icon);
+  --notice-border: var(--notice-error-border);
+  --notice-surface: var(--notice-error-surface);
+}
+.system-notice-bar__label {
+  color: var(--notice-label);
+}
+.system-notice-bar__icon {
+  color: var(--notice-icon);
+}
+.system-notice-bar {
+  border: 1px solid var(--notice-border);
+  background: color-mix(in srgb, var(--notice-surface) 90%, transparent);
+}
+@keyframes system-notice-enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .system-notice-bar {
+    animation: system-notice-enter var(--notice-enter-duration) var(--notice-enter-easing);
+  }
+}
+
+/* #738: Voice message sound bar animation */
+@keyframes sound-bar {
+  0%,
+  100% {
+    height: 4px;
+  }
+  50% {
+    height: 14px;
+  }
+}
+.animate-sound-bar {
+  animation: sound-bar 0.6s ease-in-out infinite;
+}
+
+/* #738: Slow ping for speaker icon waves */
+@keyframes ping-slow {
+  0% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+.animate-ping-slow {
+  animation: ping-slow 1.2s ease-in-out infinite;
+}
+.animation-delay-200 {
+  animation-delay: 200ms;
+}
+
+/* Werewolf Cute Theme → werewolf-theme.css */
+
+/* F097/F056: CLI/Thinking table overrides — inherit agent-msg-inset-text
+ * so light-mode dark-inset and dark-mode dark-inset both get readable text.
+ * Falls back to studio neutrals when --agent-msg-inset-text is unset. */
+.cli-output-md thead {
+  background: rgba(255, 255, 255, 0.06);
+}
+.cli-output-md th {
+  border-color: rgba(255, 255, 255, 0.12);
+  color: var(--agent-msg-inset-text, var(--studio-text-secondary));
+}
+.cli-output-md td {
+  border-color: rgba(255, 255, 255, 0.08);
+  color: var(--agent-msg-inset-text, var(--studio-text-muted));
+}
+.cli-output-md code {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--agent-msg-inset-text, var(--studio-text-secondary));
+}

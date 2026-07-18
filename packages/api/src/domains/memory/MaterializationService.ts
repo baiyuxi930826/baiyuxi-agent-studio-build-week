@@ -1,0 +1,118 @@
+// F102: IMaterializationService — approved marker → .md file → trigger reindex
+// Phase A: basic skeleton; Phase B: full .md patch + git commit
+
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import type {
+  EvidenceKind,
+  IIndexBuilder,
+  IMarkerQueue,
+  IMaterializationService,
+  MaterializeOptions,
+  MaterializeResult,
+} from './interfaces.js';
+import { EVIDENCE_KINDS } from './interfaces.js';
+
+const KIND_TO_DIR: Record<EvidenceKind, string> = {
+  feature: 'features',
+  decision: 'decisions',
+  plan: 'plans',
+  session: 'evidence',
+  lesson: 'lessons',
+  thread: 'evidence',
+  discussion: 'discussions',
+  research: 'research',
+  'pack-knowledge': 'pack-knowledge',
+};
+
+export class MaterializationService implements IMaterializationService {
+  constructor(
+    private readonly markerQueue: IMarkerQueue,
+    private readonly docsRoot: string,
+    private readonly indexBuilder?: Pick<IIndexBuilder, 'incrementalUpdate'>,
+  ) {}
+
+  async canMaterialize(markerId: string): Promise<boolean> {
+    const markers = await this.markerQueue.list();
+    const marker = markers.find((m) => m.id === markerId);
+    return marker?.status === 'approved';
+  }
+
+  async materialize(markerId: string, options?: MaterializeOptions): Promise<MaterializeResult> {
+    const markers = await this.markerQueue.list();
+    const marker = markers.find((m) => m.id === markerId);
+    if (!marker) throw new Error(`Marker not found: ${markerId}`);
+    if (marker.status !== 'approved') {
+      throw new Error(`Marker ${markerId} not approved (status: ${marker.status})`);
+    }
+
+    // Validate and determine output path based on targetKind
+    const kind = marker.targetKind ?? 'lesson';
+    if (!EVIDENCE_KINDS.includes(kind)) {
+      throw new Error(`Invalid targetKind: ${kind}`);
+    }
+    const anchor = `${kind}-${markerId}`;
+    const subDir = KIND_TO_DIR[kind];
+    const root = options?.targetRoot ?? this.docsRoot;
+    const dir = join(root, subDir);
+    mkdirSync(dir, { recursive: true });
+
+    // Conflict handling: append -N suffix if file already exists
+    let outputPath = join(dir, `${anchor}.md`);
+    if (existsSync(outputPath)) {
+      let n = 2;
+      while (existsSync(join(dir, `${anchor}-${n}.md`))) n++;
+      outputPath = join(dir, `${anchor}-${n}.md`);
+    }
+
+    // Write .md file with frontmatter
+    const frontmatter = [
+      '---',
+      `anchor: ${anchor}`,
+      `doc_kind: ${kind}`,
+      `materialized_from: ${markerId}`,
+      `created: ${new Date().toISOString().split('T')[0]}`,
+    ];
+    if (marker.targetCollectionId) frontmatter.push(`target_collection: ${marker.targetCollectionId}`);
+    if (marker.sourceCollectionId) frontmatter.push(`source_collection: ${marker.sourceCollectionId}`);
+    frontmatter.push('---');
+    const md = [...frontmatter, '', marker.content, ''].join('\n');
+    writeFileSync(outputPath, md);
+
+    // Git commit the materialized file — OPT-IN only (default off). Auto-committing
+    // onto the current branch (e.g. runtime/main-sync) silently diverges it and
+    // breaks the next ff-only sync; callers must opt in explicitly.
+    const committed = options?.commit === true ? this.commitFile(outputPath, anchor) : false;
+
+    // Trigger reindex: use override if provided, null = skip, undefined = default
+    let reindexed = false;
+    const effectiveBuilder = options?.indexBuilder === undefined ? this.indexBuilder : options.indexBuilder;
+    if (effectiveBuilder) {
+      try {
+        await effectiveBuilder.incrementalUpdate([outputPath]);
+        reindexed = true;
+      } catch {
+        // Reindex failed — continue gracefully
+      }
+    }
+
+    // Transition marker to materialized
+    await this.markerQueue.transition(markerId, 'materialized');
+
+    return { markerId, outputPath, anchor, committed, reindexed };
+  }
+
+  /** Git-commit a materialized file (opt-in). Returns false if not in a repo or the commit fails. */
+  private commitFile(outputPath: string, anchor: string): boolean {
+    try {
+      const cwd = dirname(outputPath);
+      execFileSync('git', ['add', outputPath], { cwd, stdio: 'pipe' });
+      execFileSync('git', ['commit', '-m', `materialize: ${anchor}`], { cwd, stdio: 'pipe' });
+      return true;
+    } catch {
+      // Not in a git repo or commit failed — continue gracefully
+      return false;
+    }
+  }
+}

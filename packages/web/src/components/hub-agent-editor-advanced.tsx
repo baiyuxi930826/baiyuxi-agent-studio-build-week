@@ -1,0 +1,259 @@
+'use client';
+
+import type { AgentData } from '@/hooks/useAgentData';
+import {
+  CODEX_APPROVAL_OPTIONS,
+  CODEX_AUTH_MODE_OPTIONS,
+  CODEX_SANDBOX_OPTIONS,
+  type CodexRuntimeSettings,
+  getCliEffortOptionsForClient,
+  type HubAgentEditorFormState,
+  SESSION_CHAIN_OPTIONS,
+  SESSION_STRATEGY_OPTIONS,
+  type StrategyFormState,
+} from './hub-agent-editor.model';
+import { RangeField, SectionCard, SelectField, TextField } from './hub-agent-editor-fields';
+import { TagEditor } from './hub-tag-editor';
+
+type FormPatch = Partial<HubAgentEditorFormState>;
+
+export function AdvancedRuntimeSection({
+  agent,
+  form,
+  strategyForm,
+  loadingStrategy,
+  strategyError,
+  codexSettings,
+  loadingCodexSettings,
+  codexSettingsError,
+  codexSettingsEditable,
+  showCodexSettings,
+  onChange,
+  onStrategyChange,
+  onCodexChange,
+}: {
+  agent?: AgentData | null;
+  form: HubAgentEditorFormState;
+  strategyForm: StrategyFormState | null;
+  loadingStrategy: boolean;
+  strategyError: string | null;
+  codexSettings: CodexRuntimeSettings | null;
+  loadingCodexSettings: boolean;
+  codexSettingsError: string | null;
+  codexSettingsEditable: boolean;
+  showCodexSettings: boolean;
+  onChange: (patch: FormPatch) => void;
+  onStrategyChange: (patch: Partial<StrategyFormState>) => void;
+  onCodexChange: (patch: Partial<CodexRuntimeSettings>) => void;
+}) {
+  const effectiveCodexSettings = codexSettings ?? {
+    sandboxMode: 'workspace-write' as const,
+    approvalPolicy: 'on-request' as const,
+    authMode: 'oauth' as const,
+  };
+  const cliEffortOptions = getCliEffortOptionsForClient(form.clientId);
+  const sessionChainEnabled = form.sessionChain === 'true' && (strategyForm?.sessionChainEnabled ?? true);
+
+  return (
+    <SectionCard
+      title="高级运行时参数"
+      description="contextBudget + Session 策略 + Client 特有参数。标有 (Codex) 的参数仅在选择对应 Client 时显示。"
+      tone="success"
+    >
+      <p className="text-xs leading-5 text-[var(--console-runtime-hint)]">
+        上下文预算会随成员配置一起持久化到运行时 catalog。4 项要么全部留空，要么全部填写。
+      </p>
+      <div className="space-y-2">
+        <TextField
+          label="Max Prompt Tokens"
+          value={form.maxPromptTokens}
+          onChange={(value) => onChange({ maxPromptTokens: value })}
+          inputMode="numeric"
+          tone="success"
+          placeholder="留空默认 48000"
+        />
+        <TextField
+          label="Max Context Tokens"
+          value={form.maxContextTokens}
+          onChange={(value) => onChange({ maxContextTokens: value })}
+          inputMode="numeric"
+          tone="success"
+          placeholder="留空默认 128000"
+        />
+        <TextField
+          label="Max Messages"
+          value={form.maxMessages}
+          onChange={(value) => onChange({ maxMessages: value })}
+          inputMode="numeric"
+          tone="success"
+          placeholder="留空默认 50"
+        />
+        <TextField
+          label="Max Content Length Per Msg"
+          ariaLabel="Max Content Length Per Msg"
+          value={form.maxContentLengthPerMsg}
+          onChange={(value) => onChange({ maxContentLengthPerMsg: value })}
+          inputMode="numeric"
+          tone="success"
+          placeholder="留空默认 16000"
+        />
+        <SelectField
+          label="Session Chain"
+          value={form.sessionChain}
+          options={SESSION_CHAIN_OPTIONS}
+          onChange={(value) => onChange({ sessionChain: value as HubAgentEditorFormState['sessionChain'] })}
+          tone="success"
+        />
+        {cliEffortOptions ? (
+          <SelectField
+            label="CLI Effort"
+            value={form.cliEffort}
+            options={[
+              { value: '', label: '默认（按 Client）' },
+              ...cliEffortOptions.map((value) => ({ value, label: value })),
+            ]}
+            onChange={(value) => onChange({ cliEffort: value as HubAgentEditorFormState['cliEffort'] })}
+            tone="success"
+          />
+        ) : null}
+        {form.clientId !== 'antigravity' && form.clientId !== 'agentrunner' ? (
+          <div className="space-y-1">
+            <p className="text-sm font-medium text-studio">额外 CLI 参数</p>
+            <TagEditor
+              tags={form.cliConfigArgs}
+              onChange={(nextTags) => onChange({ cliConfigArgs: nextTags })}
+              addLabel="+ 添加参数"
+              placeholder="例如 --model xxx 或 --flag value"
+              emptyLabel="无额外参数"
+              tone="green"
+            />
+            <p className="text-label leading-4 text-studio-muted">
+              每条直接追加到 CLI 命令，与系统参数重复时以用户参数为准。`CLI Effort` 请优先用上面的结构化字段。
+            </p>
+          </div>
+        ) : null}
+      </div>
+
+      {agent ? (
+        <div className="space-y-3 rounded-[14px] bg-[var(--console-runtime-group-bg)] p-[14px]">
+          {loadingStrategy ? <p className="text-sm text-studio-secondary">Session 策略加载中...</p> : null}
+          {strategyError ? (
+            <p className="rounded-[20px] border border-conn-red-ring bg-conn-red-bg px-3 py-2 text-sm text-conn-red-text">
+              {strategyError}
+            </p>
+          ) : null}
+          {strategyForm && !sessionChainEnabled ? (
+            <div className="rounded-[10px] bg-[var(--console-field-bg)] px-4 py-3 text-xs leading-5 text-[var(--studio-accent)]">
+              <p className="font-semibold">Session Chain 未开启</p>
+              <p>
+                当前成员不会记录或续接 Session Chain，下面的 Session 策略不会生效；先开启 Session Chain 后再配置策略。
+              </p>
+            </div>
+          ) : null}
+          {strategyForm && sessionChainEnabled ? (
+            <div className="space-y-4">
+              <div className="rounded-[10px] bg-[var(--console-runtime-field-bg)] px-4 py-3 text-xs leading-5 text-[var(--console-runtime-hint)]">
+                阈值基于 context 填充率 = 当前 tokens / Max Context Tokens。拖动滑条调节百分比。
+              </div>
+              <div className="space-y-2">
+                <SelectField
+                  label="Session Strategy"
+                  value={strategyForm.strategy}
+                  options={SESSION_STRATEGY_OPTIONS.filter(
+                    (option) => option.value !== 'hybrid' || strategyForm.hybridCapable,
+                  )}
+                  onChange={(value) => onStrategyChange({ strategy: value as StrategyFormState['strategy'] })}
+                  tone="success"
+                />
+                <RangeField
+                  label={strategyForm.strategy === 'compress' ? 'Session Observe Threshold' : 'Session Warn Threshold'}
+                  value={strategyForm.warnThreshold}
+                  onChange={(value) => onStrategyChange({ warnThreshold: value })}
+                  hint={
+                    strategyForm.strategy === 'compress'
+                      ? 'context 填充到此比例时前端弹出观测提示（compress 下仅观测，不触发封印）'
+                      : 'context 填充到此比例时前端弹出警告提示'
+                  }
+                />
+                <RangeField
+                  label={
+                    strategyForm.strategy === 'compress'
+                      ? 'Session Observe Threshold (upper)'
+                      : 'Session Action Threshold'
+                  }
+                  value={strategyForm.actionThreshold}
+                  onChange={(value) => onStrategyChange({ actionThreshold: value })}
+                  hint={
+                    strategyForm.strategy === 'compress'
+                      ? 'compress 策略下此阈值仅用于观测，不触发封印。Session 会在 CLI 压缩后继续存活'
+                      : 'context 填充到此比例时触发 Session 策略动作（如 handoff 换 session）'
+                  }
+                />
+                {strategyForm.strategy === 'hybrid' ? (
+                  <TextField
+                    label="Max Compressions"
+                    value={strategyForm.maxCompressions}
+                    onChange={(value) => onStrategyChange({ maxCompressions: value })}
+                    inputMode="numeric"
+                    tone="success"
+                  />
+                ) : null}
+              </div>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      {showCodexSettings ? (
+        <div className="space-y-3 rounded-[14px] bg-[var(--console-runtime-group-bg)] p-[14px]">
+          {loadingCodexSettings ? <p className="text-sm text-studio-secondary">Codex 运行参数加载中...</p> : null}
+          {codexSettingsError ? (
+            <p className="rounded-[20px] border border-conn-red-ring bg-conn-red-bg px-3 py-2 text-sm text-conn-red-text">
+              {codexSettingsError}
+            </p>
+          ) : null}
+          {!loadingCodexSettings && !codexSettingsEditable ? (
+            <p className="rounded-[10px] bg-[var(--console-field-bg)] px-3 py-2 text-xs leading-5 text-[var(--studio-accent)]">
+              Codex 配置基线未加载成功，以下 3 项已禁用；请刷新后重试，避免保存时误以为已生效。
+            </p>
+          ) : null}
+          <p className="text-center text-xs font-semibold text-studio-muted">
+            ── Codex 专属 (仅 Client=Codex 时显示) ──
+          </p>
+          <p className="rounded-[10px] bg-[var(--console-runtime-field-bg)] px-3 py-2 text-xs leading-5 text-[var(--console-runtime-hint)]">
+            成员资料与 Codex 执行参数收敛到同一个入口保存。保存后会分别写入成员 overlay 与全局运行配置。
+          </p>
+          <div className="space-y-2">
+            <SelectField
+              label="Codex Sandbox (Codex)"
+              ariaLabel="Codex Sandbox"
+              value={effectiveCodexSettings.sandboxMode}
+              options={CODEX_SANDBOX_OPTIONS}
+              onChange={(value) => onCodexChange({ sandboxMode: value as CodexRuntimeSettings['sandboxMode'] })}
+              disabled={!codexSettingsEditable}
+              tone="success"
+            />
+            <SelectField
+              label="Codex Approval (Codex)"
+              ariaLabel="Codex Approval"
+              value={effectiveCodexSettings.approvalPolicy}
+              options={CODEX_APPROVAL_OPTIONS}
+              onChange={(value) => onCodexChange({ approvalPolicy: value as CodexRuntimeSettings['approvalPolicy'] })}
+              disabled={!codexSettingsEditable}
+              tone="success"
+            />
+            <SelectField
+              label="Codex Auth Mode (Codex)"
+              ariaLabel="Codex Auth Mode"
+              value={effectiveCodexSettings.authMode}
+              options={CODEX_AUTH_MODE_OPTIONS}
+              onChange={(value) => onCodexChange({ authMode: value as CodexRuntimeSettings['authMode'] })}
+              disabled={!codexSettingsEditable}
+              tone="success"
+            />
+          </div>
+        </div>
+      ) : null}
+    </SectionCard>
+  );
+}

@@ -1,0 +1,236 @@
+import React, { act } from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { MobileStatusSheet } from '@/components/MobileStatusSheet';
+import type { AgentStatus, IntentMode } from '@/components/status-helpers';
+import type { AgentInvocationInfo } from '@/stores/chatStore';
+import { useChatStore } from '@/stores/chatStore';
+
+const TEST_CATS = [
+  {
+    id: 'opus',
+    displayName: 'Ethan（任务主控与实现）',
+    color: { primary: '#9B7EBD', secondary: '#E8D5F5' },
+    mentionPatterns: ['@opus'],
+    clientId: 'anthropic',
+    defaultModel: 'claude-opus-4-6',
+    avatar: '',
+    roleDescription: '',
+    personality: '',
+  },
+  {
+    id: 'codex',
+    displayName: 'Owen（验证与审查）',
+    color: { primary: '#5B8C5A', secondary: '#D5E8D4' },
+    mentionPatterns: ['@codex'],
+    clientId: 'openai',
+    defaultModel: 'gpt-5.5',
+    avatar: '',
+    roleDescription: '',
+    personality: '',
+  },
+];
+
+vi.mock('@/hooks/useAgentData', () => ({
+  formatAgentName: (agent: { displayName: string; variantLabel?: string }) =>
+    agent.variantLabel ? `${agent.displayName}（${agent.variantLabel}）` : agent.displayName,
+  useAgentData: () => ({
+    agents: TEST_CATS,
+    isLoading: false,
+    hasFetched: true,
+    getAgentById: (id: string) => TEST_CATS.find((agent) => agent.id === id),
+    getAgentsByRole: () => new Map(),
+    refresh: async () => TEST_CATS,
+  }),
+}));
+
+describe('MobileStatusSheet', () => {
+  let container: HTMLDivElement;
+  let root: Root;
+
+  const baseProps = {
+    open: false,
+    onClose: () => {},
+    intentMode: null as IntentMode,
+    targetAgents: [] as string[],
+    agentStatuses: {} as Record<string, AgentStatus>,
+    agentInvocations: {} as Record<string, AgentInvocationInfo>,
+    threadId: 'thread-1',
+    messageSummary: { total: 10, assistant: 5, system: 2, evidence: 1, followup: 0 },
+  };
+
+  beforeAll(() => {
+    (globalThis as { React?: typeof React }).React = React;
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  });
+
+  beforeEach(() => {
+    useChatStore.setState({ activeInvocations: {} });
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    useChatStore.setState({ activeInvocations: {} });
+    container.remove();
+  });
+
+  afterAll(() => {
+    delete (globalThis as { React?: typeof React }).React;
+    delete (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT;
+  });
+
+  it('renders nothing visible when closed (translate-y-full)', () => {
+    act(() => {
+      root.render(React.createElement(MobileStatusSheet, baseProps));
+    });
+    // When closed, the sheet should have translate-y-full (hidden off-screen)
+    // and the backdrop should have pointer-events-none
+    const backdrop = container.querySelector('[class*="pointer-events-none"]');
+    expect(backdrop).toBeTruthy();
+  });
+
+  it('renders visible when open (translate-y-0)', () => {
+    act(() => {
+      root.render(React.createElement(MobileStatusSheet, { ...baseProps, open: true }));
+    });
+    const sheet = container.querySelector('[class*="translate-y-0"]');
+    expect(sheet).toBeTruthy();
+  });
+
+  it('displays thread ID and message summary', () => {
+    act(() => {
+      root.render(React.createElement(MobileStatusSheet, { ...baseProps, open: true }));
+    });
+    expect(container.textContent).toContain('thread-1');
+    expect(container.textContent).toContain('10');
+  });
+
+  it('displays agent names when targetAgents are set', () => {
+    const props = {
+      ...baseProps,
+      open: true,
+      targetAgents: ['opus', 'codex'],
+      agentStatuses: { opus: 'pending' as AgentStatus, codex: 'streaming' as AgentStatus },
+    };
+    act(() => {
+      root.render(React.createElement(MobileStatusSheet, props));
+    });
+    expect(container.textContent).toContain('Ethan（任务主控与实现）');
+    expect(container.textContent).toContain('Owen（验证与审查）');
+  });
+
+  it('AC-Z15 R7: ideate mode preserves targetAgents UNION on mobile sheet (cloud Codex P2)', () => {
+    // Cloud Codex P2: MobileStatusSheet 没把 intentMode 传给 deriveActiveAgents，
+    // ideate 多角色场景 agent 完成清 slot 后卡片消失，跨 panel coherence 规失。
+    const props = {
+      ...baseProps,
+      open: true,
+      intentMode: 'ideate' as IntentMode,
+      targetAgents: ['opus', 'codex'],
+      agentStatuses: { opus: 'streaming' as AgentStatus, codex: 'done' as AgentStatus },
+      activeInvocations: {
+        'inv-opus-1': { agentId: 'opus', mode: 'ideate' },
+        // codex slot 已清，ideate UNION 应保留卡片
+      },
+      hasActiveInvocation: true,
+    };
+
+    act(() => {
+      root.render(React.createElement(MobileStatusSheet, props));
+    });
+
+    // GREEN after R7: ideate UNION → 两个角色都在
+    // RED before R7: slot-first → 只剩 opus
+    expect(container.textContent).toContain('Ethan（任务主控与实现）');
+    expect(container.textContent).toContain('Owen（验证与审查）');
+  });
+
+  it('prefers activeInvocations over stale targetAgents when provided', () => {
+    const props = {
+      ...baseProps,
+      open: true,
+      targetAgents: ['codex'],
+      agentStatuses: { codex: 'pending' as AgentStatus, dare: 'streaming' as AgentStatus },
+      activeInvocations: {
+        'inv-dare-1': { agentId: 'dare', mode: 'execute' },
+      },
+      hasActiveInvocation: true,
+    };
+
+    act(() => {
+      root.render(React.createElement(MobileStatusSheet, props));
+    });
+
+    expect(container.textContent).toContain('dare');
+    expect(container.textContent).not.toContain('Owen（验证与审查）');
+  });
+
+  it('shows close button that calls onClose', () => {
+    let closed = false;
+    const props = {
+      ...baseProps,
+      open: true,
+      onClose: () => {
+        closed = true;
+      },
+    };
+    act(() => {
+      root.render(React.createElement(MobileStatusSheet, props));
+    });
+    const closeBtn = container.querySelector('button[aria-label="关闭状态面板"]');
+    expect(closeBtn).toBeTruthy();
+    act(() => {
+      closeBtn?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    expect(closed).toBe(true);
+  });
+
+  it('does not mark completed snapshots as 当前调用', () => {
+    const props = {
+      ...baseProps,
+      open: true,
+      targetAgents: [],
+      agentStatuses: { codex: 'done' as AgentStatus },
+      agentInvocations: {
+        codex: {
+          startedAt: Date.now() - 1000,
+          taskProgress: {
+            tasks: [{ id: 't-1', subject: 'Done item', status: 'completed' as const }],
+            lastUpdate: Date.now(),
+            snapshotStatus: 'completed' as const,
+          },
+        },
+      },
+    };
+    act(() => {
+      root.render(React.createElement(MobileStatusSheet, props));
+    });
+    expect(container.textContent).toContain('角色状态');
+    expect(container.textContent).not.toContain('当前调用');
+  });
+
+  it('shows agents that only exist in activeInvocations on mobile', () => {
+    const props = {
+      ...baseProps,
+      open: true,
+      targetAgents: ['opus'],
+      agentStatuses: { opus: 'streaming' as AgentStatus, codex: 'pending' as AgentStatus },
+      activeInvocations: {
+        'inv-main': { agentId: 'opus', mode: 'ideate' },
+        'inv-main-codex': { agentId: 'codex', mode: 'ideate' },
+      },
+      hasActiveInvocation: true,
+    };
+
+    act(() => {
+      root.render(React.createElement(MobileStatusSheet, props));
+    });
+
+    expect(container.textContent).toContain('当前调用');
+    expect(container.textContent).toContain('Ethan（任务主控与实现）');
+    expect(container.textContent).toContain('Owen（验证与审查）');
+  });
+});

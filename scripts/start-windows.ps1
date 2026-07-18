@@ -1,0 +1,695 @@
+<#
+.SYNOPSIS
+  Baiyuxi Agent Studio (Agent Studio) - Windows Startup Script
+
+.DESCRIPTION
+  Starts API server and Frontend (Next.js) with .env loading.
+  Optionally starts Redis if available.
+  Default: production mode (next build + next start). Use -Dev for hot reload.
+
+.EXAMPLE
+  .\scripts\start-windows.ps1              # production mode (default)
+  .\scripts\start-windows.ps1 -Quick       # skip rebuild
+  .\scripts\start-windows.ps1 -Memory      # skip Redis, use in-memory storage
+  .\scripts\start-windows.ps1 -Dev         # development mode (next dev, hot reload)
+  .\scripts\start-windows.ps1 -Debug       # enable debug-level logging (writes to data/logs/api/)
+#>
+
+param(
+    [switch]$Quick,
+    [switch]$Memory,
+    [switch]$Dev,
+    [switch]$Debug
+)
+
+$ErrorActionPreference = "Stop"
+
+# baiyuxi-agent-studio#269: ensure UTF-8 output on CJK locale systems.
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::InputEncoding  = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+
+# -- Helpers -------------------------------------------------
+function Write-Step  { param([string]$msg) Write-Host "`n==> $msg" -ForegroundColor Cyan }
+function Write-Ok    { param([string]$msg) Write-Host "  [OK] $msg" -ForegroundColor Green }
+function Write-Warn  { param([string]$msg) Write-Host "  [!!] $msg" -ForegroundColor Yellow }
+function Write-Err   { param([string]$msg) Write-Host "  [ERR] $msg" -ForegroundColor Red }
+
+# -- Resolve project root ------------------------------------
+$ScriptPath = if ($PSCommandPath) { $PSCommandPath } elseif ($MyInvocation.MyCommand.Path) { $MyInvocation.MyCommand.Path } else { $null }
+if (-not $ScriptPath) {
+    Write-Err "Could not resolve start-windows.ps1 path. Run with: powershell -ExecutionPolicy Bypass -File .\scripts\start-windows.ps1"
+    exit 1
+}
+$ScriptDir = Split-Path -Parent $ScriptPath
+. (Join-Path $ScriptDir "install-windows-helpers.ps1")
+$ProjectRoot = Split-Path -Parent $ScriptDir
+Set-Location $ProjectRoot
+
+$Profile_ = $env:AGENT_STUDIO_PROFILE  # set by start-entry.mjs when --profile=* is given
+Write-Host "Agent Studio - Windows Startup" -ForegroundColor Cyan
+Write-Host "=========================="
+if ($Profile_) { Write-Host "  Profile: $Profile_" -ForegroundColor Cyan }
+
+# -- Clear inherited profile env (mirrors start-dev.sh clear_inherited_profile_env) --
+# When strict mode is on, clear ambient profile-controlled vars before loading .env,
+# so only .env overrides and profile defaults take effect -- not leaked shell exports.
+$profileControlledVars = @(
+    'ANTHROPIC_PROXY_ENABLED', 'ASR_ENABLED', 'TTS_ENABLED',
+    'LLM_POSTPROCESS_ENABLED', 'EMBED_ENABLED',
+    'MESSAGE_TTL_SECONDS', 'THREAD_TTL_SECONDS',
+    'TASK_TTL_SECONDS', 'SUMMARY_TTL_SECONDS',
+    'REDIS_PROFILE'
+)
+if ($env:AGENT_STUDIO_STRICT_PROFILE_DEFAULTS -eq "1" -and $Profile_) {
+    foreach ($var in $profileControlledVars) {
+        [System.Environment]::SetEnvironmentVariable($var, $null, "Process")
+    }
+}
+
+# -- Load .env -----------------------------------------------
+$envFile = Join-Path $ProjectRoot ".env"
+if (Test-Path $envFile) {
+    Get-Content $envFile | ForEach-Object {
+        $line = $_.Trim()
+        if ($line -and -not $line.StartsWith("#")) {
+            $parts = $line -split "=", 2
+            if ($parts.Count -eq 2) {
+                $key = $parts[0].Trim()
+                $val = $parts[1].Trim().Trim('"').Trim("'")
+                [System.Environment]::SetEnvironmentVariable($key, $val, "Process")
+            }
+        }
+    }
+    Write-Ok ".env loaded"
+} else {
+    Write-Warn ".env not found - using defaults"
+}
+
+function Preserve-ServiceFlagForApiLifecycle {
+    param([string]$SourceName, [string]$TargetName)
+    $value = [System.Environment]::GetEnvironmentVariable($SourceName, "Process")
+    if ($null -ne $value -and $value -ne "") {
+        [System.Environment]::SetEnvironmentVariable($TargetName, $value, "Process")
+    }
+}
+
+Preserve-ServiceFlagForApiLifecycle -SourceName "ASR_ENABLED" -TargetName "AGENT_STUDIO_SERVICE_ASR_ENABLED"
+Preserve-ServiceFlagForApiLifecycle -SourceName "TTS_ENABLED" -TargetName "AGENT_STUDIO_SERVICE_TTS_ENABLED"
+Preserve-ServiceFlagForApiLifecycle -SourceName "LLM_POSTPROCESS_ENABLED" -TargetName "AGENT_STUDIO_SERVICE_LLM_POSTPROCESS_ENABLED"
+Preserve-ServiceFlagForApiLifecycle -SourceName "EMBED_ENABLED" -TargetName "AGENT_STUDIO_SERVICE_EMBED_ENABLED"
+Preserve-ServiceFlagForApiLifecycle -SourceName "AUDIO_SERVICE_ENABLED" -TargetName "AGENT_STUDIO_SERVICE_AUDIO_ENABLED"
+
+# -- Apply profile defaults (mirrors start-dev.sh apply_profile_defaults) --
+# Profile defaults are fallbacks: .env value wins if set, otherwise profile default applies.
+$profileDefaults = @{}
+switch ($Profile_) {
+    'opensource' {
+        $profileDefaults = @{
+            ANTHROPIC_PROXY_ENABLED = '0'; ASR_ENABLED = '0'
+            TTS_ENABLED = '0'; LLM_POSTPROCESS_ENABLED = '0'
+            MESSAGE_TTL_SECONDS = '0'; THREAD_TTL_SECONDS = '0'
+            TASK_TTL_SECONDS = '0'; SUMMARY_TTL_SECONDS = '0'
+            REDIS_PROFILE = 'opensource'
+        }
+    }
+    'production' {
+        $profileDefaults = @{
+            ANTHROPIC_PROXY_ENABLED = '0'; ASR_ENABLED = '0'
+            TTS_ENABLED = '0'; LLM_POSTPROCESS_ENABLED = '0'
+            MESSAGE_TTL_SECONDS = '0'; THREAD_TTL_SECONDS = '0'
+            TASK_TTL_SECONDS = '0'; SUMMARY_TTL_SECONDS = '0'
+            REDIS_PROFILE = 'opensource'
+        }
+    }
+    'dev' {
+        $profileDefaults = @{
+            ANTHROPIC_PROXY_ENABLED = '1'; ASR_ENABLED = '1'
+            TTS_ENABLED = '1'; LLM_POSTPROCESS_ENABLED = '1'
+            MESSAGE_TTL_SECONDS = '0'; THREAD_TTL_SECONDS = '0'
+            TASK_TTL_SECONDS = '0'; SUMMARY_TTL_SECONDS = '0'
+            REDIS_PROFILE = 'dev'
+        }
+    }
+    default {
+        if ($Profile_) {
+            Write-Err "Unknown profile '$Profile_'. Valid: dev, production, opensource"
+            exit 1
+        }
+    }
+}
+# resolve_config: env override > profile default
+foreach ($entry in $profileDefaults.GetEnumerator()) {
+    $current = [System.Environment]::GetEnvironmentVariable($entry.Key, "Process")
+    if (-not $current) {
+        [System.Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+    }
+}
+if ($Profile_ -and $profileDefaults.Count -gt 0) {
+    Write-Ok "Profile defaults applied ($Profile_)"
+}
+
+$pnpmCommand = Resolve-ToolCommand -Name "pnpm"
+if (-not $pnpmCommand) {
+    Write-Err "pnpm not found. Run .\scripts\install.ps1 first."
+    exit 1
+}
+Write-Ok "pnpm: $pnpmCommand"
+
+# -- Ports ---------------------------------------------------
+$ApiPort = if ($env:API_SERVER_PORT) { $env:API_SERVER_PORT } else { "3004" }
+$WebPort = if ($env:FRONTEND_PORT) { $env:FRONTEND_PORT } else { "3003" }
+$RedisPort = if ($env:REDIS_PORT) { $env:REDIS_PORT } else { "6399" }
+$RunDir = Join-Path $ProjectRoot ".agent-studio/run/windows"
+$ApiPidFile = Join-Path $RunDir "api-$ApiPort.pid"
+$WebPidFile = Join-Path $RunDir "web-$WebPort.pid"
+New-Item -Path $RunDir -ItemType Directory -Force | Out-Null
+
+# -- Kill existing port processes ----------------------------
+function Get-ManagedProcessId {
+    param([string]$PidFile)
+    if (-not (Test-Path $PidFile)) {
+        return $null
+    }
+    try {
+        return [int](Get-Content $PidFile -TotalCount 1).Trim()
+    } catch {
+        return $null
+    }
+}
+
+function Clear-ManagedProcessId {
+    param([string]$PidFile)
+    Remove-Item $PidFile -ErrorAction SilentlyContinue
+}
+
+function Set-ManagedProcessId {
+    param([int]$Port, [string]$PidFile)
+    $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($listener) {
+        Set-Content -Path $PidFile -Value "$($listener.OwningProcess)" -Encoding ASCII
+    }
+}
+
+function Get-ProcessCommandLine {
+    param([int]$ProcessId)
+    try {
+        $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop
+        return $processInfo.CommandLine
+    } catch {
+        return $null
+    }
+}
+
+function Test-AgentStudioOwnedProcess {
+    param([int]$ProcessId, [string]$ProjectRoot)
+    $commandLine = Get-ProcessCommandLine -ProcessId $ProcessId
+    if (-not $commandLine) {
+        return $false
+    }
+    # Normalize ProjectRoot with trailing separator to avoid substring false positives
+    # e.g. C:\projects\agent-studio must not match C:\projects\agent-studio-test
+    $normalizedRoot = $ProjectRoot.TrimEnd('\', '/') + '\'
+    return ($commandLine -like "*$normalizedRoot*") -or ($commandLine -like "*$ProjectRoot`"*") -or ($commandLine -like "*$ProjectRoot'*")
+}
+
+function Stop-PortProcess {
+    param([int]$Port, [string]$Name, [string]$PidFile, [string]$ProjectRoot)
+    $connections = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    if ($connections) {
+        $managedPid = Get-ManagedProcessId -PidFile $PidFile
+        foreach ($conn in $connections) {
+            $isManagedPid = $managedPid -and ($conn.OwningProcess -eq $managedPid)
+            $isAgentStudioOwned = $isManagedPid -or (Test-AgentStudioOwnedProcess -ProcessId $conn.OwningProcess -ProjectRoot $ProjectRoot)
+            if (-not $isAgentStudioOwned) {
+                Write-Err "Port $Port ($Name) is in use by non-Baiyuxi Agent Studio PID $($conn.OwningProcess). Stop it manually or change the configured port."
+                throw "Port $Port ($Name) is in use by a non-Baiyuxi Agent Studio process"
+            }
+            Write-Warn "Port $Port ($Name) in use by PID $($conn.OwningProcess) - stopping"
+            Stop-Process -Id $conn.OwningProcess -Force -ErrorAction SilentlyContinue
+        }
+        Clear-ManagedProcessId -PidFile $PidFile
+        Start-Sleep -Seconds 1
+    }
+}
+
+function Get-LoopbackHttpPort {
+    param([string]$Url, [int]$DefaultPort)
+
+    if (-not $Url) {
+        return $null
+    }
+
+    $uri = $null
+    if (-not [System.Uri]::TryCreate($Url, [System.UriKind]::Absolute, [ref]$uri)) {
+        return $null
+    }
+
+    $isLoopbackHost = $uri.Host -eq "localhost"
+    $ipAddress = $null
+    if (-not $isLoopbackHost -and [System.Net.IPAddress]::TryParse($uri.Host, [ref]$ipAddress)) {
+        $isLoopbackHost = [System.Net.IPAddress]::IsLoopback($ipAddress)
+    }
+
+    if (-not $isLoopbackHost) {
+        return $null
+    }
+
+    if ($uri.Port -gt 0) {
+        return $uri.Port
+    }
+
+    return $DefaultPort
+}
+
+function Wait-ForListeningPort {
+    param([int]$Port, [int]$TimeoutSec = 60)
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($listener) {
+            return $true
+        }
+        Start-Sleep -Seconds 1
+    }
+    return $false
+}
+
+$embedMode = if ($env:EMBED_MODE) { $env:EMBED_MODE.Trim().ToLowerInvariant() } else { "off" }
+$embedEnabledRaw = [System.Environment]::GetEnvironmentVariable("EMBED_ENABLED", "Process")
+$embedEnabled = if ($null -ne $embedEnabledRaw -and $embedEnabledRaw -ne "") {
+    @("1", "true", "yes", "on") -contains $embedEnabledRaw.Trim().ToLowerInvariant()
+} else {
+    @("on", "shadow") -contains $embedMode
+}
+$env:EMBED_ENABLED = if ($embedEnabled) { "1" } else { "0" }
+
+# Embedding sidecar lifecycle is owned by the API startup reconciler: it reads
+# .agent-studio/services.json and starts or cleans Agent Studio-owned listeners based
+# on Console state. This script only computes EMBED_URL/EMBED_PORT so the API
+# can locate the sidecar.
+$embedPortDefault = if ($env:EMBED_PORT) { [int]$env:EMBED_PORT } else { 9880 }
+$configuredEmbedUrl = if ($env:EMBED_URL) { $env:EMBED_URL.Trim() } else { "" }
+$localEmbedPort = Get-LoopbackHttpPort -Url $configuredEmbedUrl -DefaultPort $embedPortDefault
+$EmbedPort = if ($null -ne $localEmbedPort) { [int]$localEmbedPort } else { $embedPortDefault }
+$embedIsLocal = (-not $configuredEmbedUrl) -or ($null -ne $localEmbedPort)
+if (-not $configuredEmbedUrl) {
+    $env:EMBED_URL = "http://127.0.0.1:$EmbedPort"
+}
+
+Write-Step "Check ports"
+Stop-PortProcess -Port ([int]$ApiPort) -Name "API" -PidFile $ApiPidFile -ProjectRoot $ProjectRoot
+Stop-PortProcess -Port ([int]$WebPort) -Name "Frontend" -PidFile $WebPidFile -ProjectRoot $ProjectRoot
+if ($embedEnabled -and $embedIsLocal) {
+    Stop-PortProcess -Port ([int]$EmbedPort) -Name "Embedding" -PidFile (Join-Path $RunDir "embed-$EmbedPort.pid") -ProjectRoot $ProjectRoot
+}
+
+# -- Storage (Redis or Memory) -------------------------------
+Write-Step "Storage"
+
+$useRedis = -not $Memory
+$startedRedis = $false
+$redisLayout = Resolve-PortableRedisLayout -ProjectRoot $ProjectRoot
+$redisServerPath = $null
+$redisSource = $null
+$redisJob = $null
+$redisLogFile = Join-Path $redisLayout.Logs "redis-$RedisPort.log"
+$redisPidFile = Join-Path $redisLayout.Data "redis-$RedisPort.pid"
+$configuredRedisUrl = if ($env:REDIS_URL) { $env:REDIS_URL.Trim() } else { "" }
+$configuredIsManagedRedis = $configuredRedisUrl -and (Test-LocalRedisUrl -RedisUrl $configuredRedisUrl -RedisPort $RedisPort)
+$useExternalRedis = $useRedis -and $configuredRedisUrl -and -not $configuredIsManagedRedis
+$safeConfiguredRedisUrl = Get-RedactedRedisUrl -RedisUrl $configuredRedisUrl
+
+if ($useRedis) {
+    if ($configuredRedisUrl -and (Test-RedisReachable -RedisUrl $configuredRedisUrl)) {
+        # A configured reachable Redis endpoint can be used without redis-cli.
+        Write-Ok "Redis reachable at $safeConfiguredRedisUrl"
+        $env:REDIS_URL = $configuredRedisUrl
+    } elseif ($useExternalRedis) {
+        Write-Warn "Redis not reachable at $safeConfiguredRedisUrl - falling back to memory storage"
+        Write-Warn "Check your REDIS_URL or use -Memory to skip Redis."
+        $useRedis = $false
+    } else {
+        # No reachable configured Redis endpoint; manage Redis on $RedisPort.
+        $localUrl = "redis://localhost:$RedisPort"
+        if (Test-RedisReachable -RedisUrl $localUrl) {
+            # Redis already listening on our managed port; verify ownership.
+            $redisConnections = Get-NetTCPConnection -LocalPort $RedisPort -State Listen -ErrorAction SilentlyContinue
+            $hasNonAgentStudio = $false
+            if ($redisConnections) {
+                $managedRedisPid = Get-ManagedProcessId -PidFile $redisPidFile
+                foreach ($conn in $redisConnections) {
+                    $isManagedPid = $managedRedisPid -and ($conn.OwningProcess -eq $managedRedisPid)
+                    $isAgentStudioOwned = $isManagedPid -or (Test-AgentStudioOwnedProcess -ProcessId $conn.OwningProcess -ProjectRoot $ProjectRoot)
+                    if (-not $isAgentStudioOwned) {
+                        Write-Err "Redis port $RedisPort is in use by non-Baiyuxi Agent Studio PID $($conn.OwningProcess). Stop it manually or change REDIS_PORT."
+                        $hasNonAgentStudio = $true
+                    }
+                }
+            }
+            if ($hasNonAgentStudio) {
+                throw "Redis port $RedisPort is in use by a non-Baiyuxi Agent Studio process"
+            }
+            Write-Ok "Redis already running on port $RedisPort"
+            if ($configuredRedisUrl) {
+                $env:REDIS_URL = $configuredRedisUrl
+            } else {
+                $env:REDIS_URL = "redis://localhost:$RedisPort"
+            }
+        } else {
+            # Not running; try to start our own Redis.
+            Write-Warn "Redis not running on port $RedisPort"
+            $redisCommands = Resolve-PortableRedisBinaries -ProjectRoot $ProjectRoot
+            if (-not $redisCommands) {
+                $redisCommands = Resolve-GlobalRedisBinaries
+            }
+            if ($redisCommands) {
+                $redisServerPath = $redisCommands.ServerPath
+                $redisSource = $redisCommands.Source
+                Write-Ok "Redis binaries resolved ($redisSource): $($redisCommands.BinDir)"
+            }
+            try {
+                if ($redisServerPath) {
+                    New-Item -Path $redisLayout.Data -ItemType Directory -Force | Out-Null
+                    New-Item -Path $redisLayout.Logs -ItemType Directory -Force | Out-Null
+                    $redisAclFile = Join-Path $redisLayout.Data "redis-$RedisPort.acl"
+                    $redisServerAuthArgs = Get-RedisServerAuthArgs -RedisUrl $configuredRedisUrl -AclFilePath $redisAclFile
+                    $redisArgs = @(
+                        "--port", $RedisPort,
+                        "--bind", "127.0.0.1",
+                        "--dir", (Quote-WindowsProcessArgument -Value $redisLayout.Data),
+                        "--logfile", (Quote-WindowsProcessArgument -Value $redisLogFile),
+                        "--pidfile", (Quote-WindowsProcessArgument -Value $redisPidFile)
+                    ) + $redisServerAuthArgs
+                    Write-Host "  Starting Redis on port $RedisPort ($redisSource)..."
+                    $redisJob = Start-Job -Name "redis-bootstrap" -ScriptBlock {
+                        param($launcherPath, $launcherArgs)
+                        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+                        $OutputEncoding = [System.Text.Encoding]::UTF8
+                        & $launcherPath @launcherArgs 2>&1
+                    } -ArgumentList $redisServerPath, $redisArgs
+                    Start-Sleep -Seconds 2
+                    $managedProbeUrl = if ($configuredRedisUrl) { $configuredRedisUrl } else { $localUrl }
+                    if (Test-RedisReachable -RedisUrl $managedProbeUrl) {
+                        Write-Ok "Redis started on port $RedisPort"
+                        if ($configuredRedisUrl) {
+                            $env:REDIS_URL = $configuredRedisUrl
+                        } else {
+                            $env:REDIS_URL = "redis://localhost:$RedisPort"
+                        }
+                        $startedRedis = $true
+                    } else {
+                        Write-Warn "Redis start failed - falling back to memory storage"
+                        $useRedis = $false
+                    }
+                } else {
+                    Write-Warn "Redis not installed - using memory storage"
+                    Write-Warn "Run .\\scripts\\install.ps1 again to fetch the project-local Redis bundle into .agent-studio/redis/windows."
+                    $useRedis = $false
+                }
+            } catch {
+                if ($_.Exception -and $_.Exception.Message -like "Redis port $RedisPort is in use by a non-Baiyuxi Agent Studio process") {
+                    throw
+                }
+                Write-Warn "Redis start failed - using memory storage"
+                Write-InstallerExceptionDetails -Context "Redis start" -ErrorRecord $_
+                $useRedis = $false
+            }
+        }
+    }
+}
+
+if (-not $useRedis) {
+    Write-Warn "Memory mode - data will be lost on restart"
+    Remove-Item Env:REDIS_URL -ErrorAction SilentlyContinue
+    $env:MEMORY_STORE = "1"
+}
+
+try {
+    # -- Build (unless -Quick) ----------------------------------
+    if (-not $Quick) {
+        Write-Step "Build packages"
+
+        Write-Host "  Building shared..."
+        Push-Location (Join-Path $ProjectRoot "packages/shared")
+        & $pnpmCommand run build
+        if ($LASTEXITCODE -ne 0) { Pop-Location; Write-Err "Build failed: shared"; throw "Build failed: shared" }
+        Pop-Location
+        Write-Ok "shared"
+
+        Write-Host "  Building mcp-server..."
+        Push-Location (Join-Path $ProjectRoot "packages/mcp-server")
+        & $pnpmCommand run build
+        if ($LASTEXITCODE -ne 0) { Pop-Location; Write-Err "Build failed: mcp-server"; throw "Build failed: mcp-server" }
+        Pop-Location
+        Write-Ok "mcp-server"
+
+        Write-Host "  Building api..."
+        Push-Location (Join-Path $ProjectRoot "packages/api")
+        & $pnpmCommand run build
+        if ($LASTEXITCODE -ne 0) { Pop-Location; Write-Err "Build failed: api"; throw "Build failed: api" }
+        Pop-Location
+        Write-Ok "api"
+
+        if (-not $Dev) {
+            Write-Host "  Building web (production)..."
+            Push-Location (Join-Path $ProjectRoot "packages/web")
+            & $pnpmCommand run build
+            if ($LASTEXITCODE -ne 0) { Pop-Location; Write-Err "Build failed: web"; throw "Build failed: web" }
+            Pop-Location
+            Write-Ok "web (production)"
+        }
+    } else {
+        Write-Step "Skip build (-Quick)"
+    }
+
+    # -- Configure MCP server path -------------------------------
+    $mcpPath = Join-Path $ProjectRoot "packages/mcp-server/dist/index.js"
+    if (Test-Path $mcpPath) {
+        $env:AGENT_STUDIO_MCP_SERVER_PATH = $mcpPath
+        Write-Ok "MCP server path: $mcpPath"
+    }
+
+    $apiEntry = Join-Path $ProjectRoot "packages/api/dist/index.js"
+    if (-not (Test-Path $apiEntry)) {
+        Write-Err "API build artifact not found - run without -Quick first to build"
+        throw "API build artifact not found"
+    }
+
+    $nextDir = Join-Path $ProjectRoot "packages/web/.next"
+    if (-not $Dev -and -not (Test-Path $nextDir)) {
+        Write-Err ".next directory not found - run without -Quick first to build"
+        throw ".next directory not found"
+    }
+    $nextCli = Join-Path $ProjectRoot "node_modules/next/dist/bin/next"
+    if (-not (Test-Path $nextCli)) {
+        Write-Err "Next CLI not found at $nextCli - run pnpm install first"
+        throw "Next CLI not found"
+    }
+
+    # -- Start services ------------------------------------------
+    Write-Step "Start services"
+
+    # Track background jobs for cleanup
+    $jobs = @()
+    # NODE_ENV is driven by launch mode (-Dev), not by profile.
+    # Profile controls data isolation (Redis, TTLs, sidecar features);
+    # -Dev controls whether the API runs in development or production mode.
+    $apiNodeEnv = if ($Dev) { 'development' } else { 'production' }
+    $globalSidecarOwner = if ($useRedis -and -not $Dev) { "1" } else { $null }
+    $runtimeRootMarker = if (-not $Dev) { $ProjectRoot } else { $null }
+    $workspaceRoot = if ($env:AGENT_STUDIO_WORKSPACE_ROOT) { $env:AGENT_STUDIO_WORKSPACE_ROOT } else { $ProjectRoot }
+    $runtimeEnvOverrides = @{
+        REDIS_URL = $env:REDIS_URL
+        MEMORY_STORE = $env:MEMORY_STORE
+        AGENT_STUDIO_MCP_SERVER_PATH = $env:AGENT_STUDIO_MCP_SERVER_PATH
+        AGENT_STUDIO_WORKSPACE_ROOT = $workspaceRoot
+        API_SERVER_PORT = $ApiPort
+        FRONTEND_PORT = $WebPort
+        NODE_ENV = $apiNodeEnv
+        EMBED_URL = $env:EMBED_URL
+        EMBED_PORT = $EmbedPort
+        EMBED_ENABLED = $env:EMBED_ENABLED
+        EMBED_MODE = $env:EMBED_MODE
+        AGENT_STUDIO_SERVICE_ASR_ENABLED = $env:AGENT_STUDIO_SERVICE_ASR_ENABLED
+        AGENT_STUDIO_SERVICE_TTS_ENABLED = $env:AGENT_STUDIO_SERVICE_TTS_ENABLED
+        AGENT_STUDIO_SERVICE_LLM_POSTPROCESS_ENABLED = $env:AGENT_STUDIO_SERVICE_LLM_POSTPROCESS_ENABLED
+        AGENT_STUDIO_SERVICE_EMBED_ENABLED = $env:AGENT_STUDIO_SERVICE_EMBED_ENABLED
+        AGENT_STUDIO_SERVICE_AUDIO_ENABLED = $env:AGENT_STUDIO_SERVICE_AUDIO_ENABLED
+        AGENT_STUDIO_PROVISION_GLOBAL_SIDECAR = $globalSidecarOwner
+        AGENT_STUDIO_RUNTIME_ROOT = $runtimeRootMarker
+    }
+
+    # Embedding sidecar (and other Agent Studio ML services) are reconciled by the
+    # API startup lifecycle after it starts, per .agent-studio/services.json. No
+    # manual Start-Job here.
+
+    # API Server
+    # Env vars are loaded into this process (line 42-53) and inherited by Start-Job.
+    # No --env-file needed - avoids depending on Node's --env-file support here.
+    Write-Host "  Starting API Server (port $ApiPort)..."
+    $apiJob = Start-Job -Name "api" -ScriptBlock {
+        param($root, $envFile, $runtimeEnvOverrides, $profileDefaults, $apiEntry, $debugFlag)
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+        $OutputEncoding = [System.Text.Encoding]::UTF8
+        Set-Location (Join-Path $root "packages/api")
+        # Load .env into job process (Start-Job inherits parent env,
+        # but re-load to be safe if process env was not fully propagated)
+        if (Test-Path $envFile) {
+            Get-Content $envFile | ForEach-Object {
+                $line = $_.Trim()
+                if ($line -and -not $line.StartsWith("#")) {
+                    $parts = $line -split "=", 2
+                    if ($parts.Count -eq 2) {
+                        $k = $parts[0].Trim()
+                        $v = $parts[1].Trim().Trim('"').Trim("'")
+                        [System.Environment]::SetEnvironmentVariable($k, $v, "Process")
+                    }
+                }
+            }
+        }
+        foreach ($entry in $runtimeEnvOverrides.GetEnumerator()) {
+            if ($null -eq $entry.Value -or $entry.Value -eq "") {
+                [System.Environment]::SetEnvironmentVariable($entry.Key, $null, "Process")
+            } else {
+                [System.Environment]::SetEnvironmentVariable($entry.Key, [string]$entry.Value, "Process")
+            }
+        }
+        # Reapply profile defaults after .env reload (mirrors start-dev.sh resolve_config:
+        # env override > profile default -- only apply if current value is empty/null)
+        if ($profileDefaults) {
+            foreach ($entry in $profileDefaults.GetEnumerator()) {
+                $current = [System.Environment]::GetEnvironmentVariable($entry.Key, "Process")
+                if (-not $current) {
+                    [System.Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+                }
+            }
+        }
+        if ($debugFlag) {
+            $env:LOG_LEVEL = "debug"
+            & node $apiEntry --debug 2>&1
+        } else {
+            & node $apiEntry 2>&1
+        }
+    } -ArgumentList $ProjectRoot, $envFile, $runtimeEnvOverrides, $profileDefaults, $apiEntry, $Debug.IsPresent
+    $jobs += $apiJob
+
+    Start-Sleep -Seconds 2
+
+    # Frontend
+    if ($Dev) {
+        # Development mode: next dev (hot reload)
+        Write-Host "  Starting Frontend (port $WebPort, dev)..."
+        $webJob = Start-Job -Name "web" -ScriptBlock {
+            param($root, $port, $nextCli)
+            [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+            $OutputEncoding = [System.Text.Encoding]::UTF8
+            Set-Location (Join-Path $root "packages/web")
+            $env:PORT = $port
+            $env:NEXT_IGNORE_INCORRECT_LOCKFILE = "1"
+            & node $nextCli dev -p $port 2>&1
+        } -ArgumentList $ProjectRoot, $WebPort, $nextCli
+    } else {
+        # Production mode: next start (default - avoids #105 issues)
+        Write-Host "  Starting Frontend (port $WebPort, production)..."
+        $webJob = Start-Job -Name "web" -ScriptBlock {
+            param($root, $port, $nextCli)
+            [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+            $OutputEncoding = [System.Text.Encoding]::UTF8
+            Set-Location (Join-Path $root "packages/web")
+            $env:PORT = $port
+            & node $nextCli start -p $port -H 0.0.0.0 2>&1
+        } -ArgumentList $ProjectRoot, $WebPort, $nextCli
+    }
+    $jobs += $webJob
+
+    Start-Sleep -Seconds 3
+    Set-ManagedProcessId -Port ([int]$ApiPort) -PidFile $ApiPidFile
+    Set-ManagedProcessId -Port ([int]$WebPort) -PidFile $WebPidFile
+
+    # -- Status --------------------------------------------------
+    $effectiveRedisUrl = if ($env:REDIS_URL) { $env:REDIS_URL } else { "" }
+    $safeEffectiveRedisUrl = Get-RedactedRedisUrl -RedisUrl $effectiveRedisUrl
+    $storageMode = if ($useRedis -and $safeEffectiveRedisUrl) { "Redis ($safeEffectiveRedisUrl)" } elseif ($useRedis) { "Redis (redis://localhost:$RedisPort)" } else { "Memory (restart loses data)" }
+    $frontendMode = if ($Dev) { "development (hot reload)" } else { "production (PWA enabled)" }
+    $embeddingMode = if ($embedEnabled) {
+        if ($configuredEmbedUrl) { "Remote ($configuredEmbedUrl)" }
+        else { "Local sidecar managed by API autostart (port $EmbedPort)" }
+    } else {
+        "Off"
+    }
+    $logDir = Join-Path $ProjectRoot "data/logs/api"
+
+    Write-Host ""
+    Write-Host "  ========================================" -ForegroundColor Green
+    Write-Host "  Agent Studio started!" -ForegroundColor Green
+    Write-Host "  ========================================" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "  Frontend: http://localhost:$WebPort"
+    Write-Host "  API:      http://localhost:$ApiPort"
+    Write-Host "  Storage:  $storageMode"
+    Write-Host "  Embed:    $embeddingMode"
+    Write-Host "  Frontend: $frontendMode"
+    if ($Debug) {
+        Write-Host "  Debug:    ON (logs: $logDir)" -ForegroundColor Yellow
+    }
+    Write-Host ""
+    Write-Host "  Press Ctrl+C to stop all services" -ForegroundColor Yellow
+    Write-Host ""
+
+    # -- Wait ----------------------------------------------------
+    $serviceFailure = $false
+    while ($true) {
+        # Print any job output
+        foreach ($job in $jobs) {
+            $output = Receive-Job -Job $job -ErrorAction SilentlyContinue
+            if ($output) {
+                foreach ($line in $output) {
+                    Write-Host $line
+                }
+            }
+        }
+
+        $stoppedJobs = $jobs | Where-Object { $_.State -ne "Running" }
+        if ($stoppedJobs.Count -gt 0) {
+            foreach ($job in $stoppedJobs) {
+                Write-Warn "Service job '$($job.Name)' stopped ($($job.State))"
+            }
+            $serviceFailure = $true
+            break
+        }
+
+        Start-Sleep -Seconds 2
+    }
+} finally {
+    Write-Host "`nShutting down..." -ForegroundColor Yellow
+
+    foreach ($job in $jobs) {
+        Stop-Job -Job $job -ErrorAction SilentlyContinue
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    }
+    Clear-ManagedProcessId -PidFile $ApiPidFile
+    Clear-ManagedProcessId -PidFile $WebPidFile
+    Clear-ManagedProcessId -PidFile (Join-Path $RunDir "embed-$EmbedPort.pid")
+
+    if ($startedRedis) {
+        try {
+            $managedShutdownUrl = if ($configuredRedisUrl) { $configuredRedisUrl } else { "redis://localhost:$RedisPort" }
+            Send-RedisShutdown -RedisUrl $managedShutdownUrl
+            Write-Ok "Redis stopped"
+        } catch {
+            Write-Warn "Could not stop Redis gracefully"
+        }
+    }
+    if ($redisJob) {
+        Stop-Job -Job $redisJob -ErrorAction SilentlyContinue
+        Remove-Job -Job $redisJob -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Host "Goodbye!" -ForegroundColor Cyan
+}
+
+if ($serviceFailure) {
+    exit 1
+}

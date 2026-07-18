@@ -1,0 +1,148 @@
+import type { GameView } from '@agent-studio/shared';
+import { useMemo } from 'react';
+import type { SocketCallbacks } from '@/hooks/useSocket';
+import { type Thread, useChatStore } from '@/stores/chatStore';
+import { useGameStore } from '@/stores/gameStore';
+import { type TaskItem, useTaskStore } from '@/stores/taskStore';
+import { apiFetch } from '@/utils/api-client';
+
+interface ExternalDeps {
+  threadId: string;
+  userId: string;
+  handleAgentMessage: SocketCallbacks['onMessage'];
+  resetTimeout: () => void;
+  clearDoneTimeout: (threadId?: string) => void;
+  handleAuthRequest: NonNullable<SocketCallbacks['onAuthorizationRequest']>;
+  handleAuthResponse: NonNullable<SocketCallbacks['onAuthorizationResponse']>;
+  onNavigateToThread?: (threadId: string) => void;
+  onIndexEvent?: SocketCallbacks['onIndexEvent'];
+}
+
+/**
+ * Socket event callbacks for a chat thread.
+ * Extracted from ChatContainer to reduce file size.
+ */
+export function useChatSocketCallbacks({
+  threadId,
+  userId,
+  handleAgentMessage,
+  resetTimeout,
+  clearDoneTimeout,
+  handleAuthRequest,
+  handleAuthResponse,
+  onNavigateToThread,
+  onIndexEvent,
+}: ExternalDeps): SocketCallbacks {
+  const {
+    updateThreadTitle,
+    updateThreadParticipants,
+    setLoading,
+    setHasActiveInvocation,
+    setIntentMode,
+    setTargetAgents,
+    removeThreadMessage,
+    requestStreamCatchUp,
+  } = useChatStore();
+  const { addTask, updateTask } = useTaskStore();
+
+  return useMemo<SocketCallbacks>(
+    () => ({
+      clearDoneTimeout,
+      onMessage: (msg) => {
+        handleAgentMessage(msg);
+        return true;
+      },
+      onThreadUpdated: (data) => {
+        if (data.title !== undefined) updateThreadTitle(data.threadId, data.title);
+        if (data.participants !== undefined) updateThreadParticipants(data.threadId, data.participants);
+        if (data.bootcampState !== undefined) {
+          useChatStore.setState((state) => ({
+            threads: state.threads.map((t) =>
+              t.id === data.threadId ? { ...t, bootcampState: data.bootcampState as Thread['bootcampState'] } : t,
+            ),
+          }));
+        }
+      },
+      onIntentMode: (data) => {
+        // Socket layer (useSocket) already applies dual-pointer guard + background routing.
+        // This callback only fires for the truly active thread.
+        setLoading(true);
+        setHasActiveInvocation(true);
+        setIntentMode(data.mode as 'ideate' | 'execute');
+        setTargetAgents((data as { targetAgents?: string[] }).targetAgents ?? []);
+      },
+      onSpawnStarted: (data) => {
+        // F118 D2: Earliest signal — fires before intent_mode.
+        // Per-agent setAgentStatus('spawning') is handled by the socket layer.
+        setLoading(true);
+        setHasActiveInvocation(true);
+        setTargetAgents(data.targetAgents ?? []);
+      },
+      onTaskCreated: (task) => {
+        const t = task as Record<string, unknown>;
+        if (t.threadId !== threadId || t.kind === 'pr_tracking') return;
+        addTask(task as unknown as TaskItem);
+      },
+      onTaskUpdated: (task) => {
+        const t = task as Record<string, unknown>;
+        if (t.threadId !== threadId || t.kind === 'pr_tracking') return;
+        updateTask(task as unknown as TaskItem);
+      },
+      // onThreadSummary removed (baiyuxi-agent-studio#343): summaries no longer injected into chat flow.
+      onHeartbeat: (data) => {
+        if (data.threadId === threadId) resetTimeout();
+      },
+      onMessageDeleted: (data: { messageId: string; threadId: string }) =>
+        removeThreadMessage(data.threadId, data.messageId),
+      onMessageRestored: (data: { messageId: string; threadId: string }) => {
+        requestStreamCatchUp(data.threadId);
+      },
+      onThreadBranched: () => {
+        void apiFetch('/api/threads')
+          .then((res) => (res.ok ? res.json() : null))
+          .then((data) => {
+            if (data?.threads) useChatStore.getState().setThreads(data.threads);
+          })
+          .catch(() => {});
+      },
+      onAuthorizationRequest: handleAuthRequest,
+      onAuthorizationResponse: handleAuthResponse,
+      onGameStateUpdate: (data) => {
+        const view = data.view as GameView;
+        // P1-3 fix: Only accept updates for the current thread
+        if (view.threadId !== threadId) return;
+        useGameStore.getState().setGameView(view, data.gameId, threadId);
+      },
+      onGameThreadCreated: (data) => {
+        // Only navigate the initiator — other users in the room should not be auto-redirected
+        if (data.initiatorUserId === userId) {
+          onNavigateToThread?.(data.gameThreadId);
+        }
+      },
+      // B-5: Guide events now flow directly from useSocket → guideStore.reduceServerEvent
+      // (CustomEvent bridge removed — no onGuideStart/onGuideControl/onGuideComplete needed)
+      onIndexEvent,
+    }),
+    [
+      handleAgentMessage,
+      updateThreadTitle,
+      updateThreadParticipants,
+      setLoading,
+      setHasActiveInvocation,
+      setIntentMode,
+      setTargetAgents,
+      addTask,
+      updateTask,
+      removeThreadMessage,
+      requestStreamCatchUp,
+      resetTimeout,
+      clearDoneTimeout,
+      handleAuthRequest,
+      handleAuthResponse,
+      onNavigateToThread,
+      onIndexEvent,
+      threadId,
+      userId,
+    ],
+  );
+}

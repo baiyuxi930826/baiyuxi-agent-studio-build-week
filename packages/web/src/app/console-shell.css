@@ -1,0 +1,431 @@
+/*
+ * F056 Phase E — console-shell.css 类规则（.console-* selectors）
+ *
+ * console-* token 定义见 console-tokens.css。本文件只持类规则，
+ * 颜色全部 var(--console-*) / var(--studio-*)，单一真相源 theme-tokens.css。
+ */
+
+.console-shell {
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--console-border-soft) 28%, transparent) 1px, transparent 1px),
+    linear-gradient(180deg, color-mix(in srgb, var(--console-border-soft) 24%, transparent) 1px, transparent 1px),
+    var(--console-shell-bg);
+  background-size:
+    30px 30px,
+    30px 30px,
+    auto;
+  color: var(--studio-text);
+}
+
+.console-topbar {
+  background: color-mix(in oklch, var(--console-shell-bg) 74%, var(--console-panel-bg) 26%);
+  border-bottom: 1px solid var(--console-border-soft);
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--console-card-bg) 56%, transparent);
+}
+
+.console-sidebar {
+  background: var(--console-panel-bg);
+  box-shadow: inset -1px 0 0 color-mix(in srgb, var(--console-border-soft) 58%, transparent);
+}
+
+.console-sidebar-header {
+  border-bottom: 1px solid color-mix(in srgb, var(--console-border-soft) 78%, transparent);
+}
+
+.console-composer {
+  background: color-mix(in oklch, var(--console-shell-bg) 74%, var(--console-panel-bg) 26%);
+  border-top: 1px solid var(--console-border-soft);
+  box-shadow: 0 -1px 0 color-mix(in srgb, var(--console-card-bg) 52%, transparent);
+}
+
+.console-icon-button {
+  inline-size: 2.5rem;
+  block-size: 2.5rem;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0.5rem;
+  color: var(--studio-text-muted);
+  background: transparent;
+  box-shadow: inset 0 0 0 1px transparent;
+}
+
+.console-icon-button:hover {
+  color: var(--studio-accent);
+  background: var(--console-hover-bg);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--studio-accent) 16%, transparent);
+}
+
+.console-icon-button[data-active="true"] {
+  color: var(--studio-accent);
+  background: color-mix(in srgb, var(--studio-accent) 13%, var(--console-card-bg) 87%);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--studio-accent) 22%, transparent);
+}
+
+.console-message-bubble {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--console-border-soft) 44%, transparent);
+}
+
+.console-message-bubble:hover {
+  transform: translateY(-1px);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--studio-accent) 14%, var(--console-border-soft) 86%),
+    var(--console-shadow-soft);
+}
+
+.console-chat-textarea {
+  min-inline-size: 0;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--console-card-bg) 76%, transparent);
+}
+
+.console-composer [data-testid="chat-input-composer-row"] {
+  min-inline-size: 0;
+  max-inline-size: 100%;
+}
+
+.console-chat-textarea:focus {
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--studio-accent) 14%, transparent),
+    0 0 0 2px color-mix(in srgb, var(--studio-accent) 12%, transparent);
+}
+
+.console-empty-state {
+  max-inline-size: min(36rem, 100%);
+  background: color-mix(in oklch, var(--console-card-bg) 82%, transparent);
+  border-radius: 0.625rem;
+  overflow: hidden;
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--console-border-soft) 62%, transparent),
+    var(--console-shadow-soft);
+}
+
+@media (max-width: 640px) {
+  .console-empty-state {
+    max-inline-size: calc(100dvw - 5.25rem);
+  }
+
+  .console-composer [data-testid="chat-input-composer-row"] {
+    inline-size: calc(100dvw - 3.25rem);
+  }
+}
+
+.console-panel,
+.console-shell-panel,
+.console-shell-panel-soft,
+.console-card,
+.console-card-soft,
+.console-list-card,
+.console-section-shell,
+.console-code-pane,
+.console-table-shell,
+.console-search-field,
+.console-status-panel,
+.console-pill,
+.console-status-chip,
+.console-nav-item,
+.console-nav-icon,
+.console-activity-rail,
+.console-activity-button,
+.console-activity-pill {
+  border-color: var(--console-border-soft);
+  transition:
+    background-color 180ms ease,
+    border-color 180ms ease,
+    box-shadow 180ms ease,
+    transform 180ms ease,
+    color 180ms ease,
+    opacity 180ms ease;
+}
+
+.console-panel,
+.console-shell-panel,
+.console-card,
+.console-list-card,
+.console-section-shell,
+.console-table-shell,
+.console-status-panel,
+.console-activity-rail {
+  background: var(--console-panel-bg);
+}
+
+.console-card {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--console-border-soft) 50%, transparent);
+}
+
+.console-list-card {
+  /* no border — hierarchy via background color (Design System §1.1) */
+}
+
+.console-shell-panel,
+.console-status-panel {
+  background: var(--console-panel-bg);
+}
+
+.console-shell-panel-soft,
+.console-card-soft {
+  background: var(--console-card-soft-bg);
+}
+
+.console-card,
+.console-section-shell {
+  background: var(--console-card-bg);
+}
+
+.console-list-card {
+  background: var(--console-card-bg);
+}
+
+.console-list-card[data-active="true"],
+.console-card[data-active="true"] {
+  background: var(--console-active-bg);
+}
+
+.console-list-card[data-guide-id^="connector."][data-active="true"] {
+  background: var(--console-card-bg);
+}
+
+.console-code-pane,
+.console-table-shell {
+  border: 1px solid var(--console-border-soft);
+  background: var(--console-code-bg);
+}
+
+.console-list-card[data-guide-id^="connector."] .console-code-pane {
+  border-width: 0;
+  background: var(--console-card-bg);
+}
+
+.console-pill {
+  background: var(--console-pill-bg);
+  border-radius: 6px;
+}
+
+.console-status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  border: 1px solid var(--console-border-soft);
+  background: color-mix(in srgb, var(--console-pill-bg) 94%, transparent);
+  border-radius: 999px;
+  padding: 0.35rem 0.7rem;
+  color: var(--studio-text-secondary);
+  font-size: var(--console-font-label);
+  font-weight: 600;
+  line-height: 1;
+}
+
+.console-status-chip[data-status="active"] {
+  border-color: var(--conn-emerald-ring);
+  background: var(--conn-emerald-bg);
+  color: var(--conn-emerald-text);
+}
+
+.console-status-chip[data-status="warning"],
+.console-status-chip[data-status="configured"] {
+  border-color: var(--conn-amber-ring);
+  background: var(--conn-amber-bg);
+  color: var(--conn-amber-text);
+}
+
+.console-status-chip[data-status="error"] {
+  border-color: var(--conn-red-ring);
+  background: var(--conn-red-bg);
+  color: var(--conn-red-text);
+}
+
+.console-status-chip[data-status="info"],
+.console-status-chip[data-status="available"] {
+  border-color: var(--conn-sky-ring);
+  background: var(--conn-sky-bg);
+  color: var(--conn-sky-text);
+}
+
+.console-nav-item {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--studio-text);
+}
+
+.console-nav-item[data-active="true"] {
+  background: var(--console-active-bg);
+}
+
+.console-nav-item[data-active="false"]:hover {
+  background: var(--console-hover-bg);
+}
+
+.console-nav-icon {
+  background: color-mix(in srgb, var(--console-pill-bg) 82%, transparent);
+  color: color-mix(in srgb, var(--settings-accent, var(--studio-interactive)) 68%, var(--studio-text) 32%);
+}
+
+.console-nav-item[data-active="true"] .console-nav-icon {
+  background: color-mix(in srgb, var(--settings-accent, var(--studio-accent)) 14%, var(--console-card-bg) 86%);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--settings-accent, var(--studio-accent)) 16%, transparent);
+}
+
+.console-search-field {
+  border: 1px solid var(--console-border-soft);
+  background: var(--console-card-soft-bg);
+}
+
+.console-search-field:focus-within {
+  border-color: color-mix(in srgb, var(--studio-accent) 34%, var(--console-border-soft) 66%);
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--studio-accent) 18%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.16);
+}
+
+.console-activity-rail {
+  background: var(--console-rail-bg);
+  box-shadow: var(--console-rail-shadow);
+  backdrop-filter: none;
+}
+
+.console-activity-button {
+  border: 1px solid transparent;
+  color: color-mix(in srgb, var(--item-accent, var(--studio-interactive)) 62%, var(--studio-text) 38%);
+  background: transparent;
+}
+
+.console-activity-button:hover {
+  background: color-mix(in srgb, var(--item-accent, var(--studio-accent)) 10%, var(--console-card-bg) 90%);
+}
+
+.console-activity-button[data-active="true"] {
+  color: var(--item-accent, var(--studio-accent));
+  background: color-mix(in srgb, var(--item-accent, var(--studio-accent)) 10%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--item-accent, var(--studio-accent)) 18%, transparent);
+}
+
+.console-activity-pill {
+  background: color-mix(in srgb, var(--item-accent, var(--studio-accent)) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--item-accent, var(--studio-accent)) 16%, transparent);
+}
+
+.console-activity-indicator {
+  background: var(--item-accent, var(--studio-accent));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--item-accent, var(--studio-accent)) 30%, transparent);
+}
+
+.session-corner-arcs {
+  position: relative;
+}
+
+.session-corner-arcs::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  border: 2px solid var(--console-card-soft-bg);
+  -webkit-mask-image:
+    radial-gradient(14px 14px at 0% 0%, black 80%, transparent 81%),
+    radial-gradient(14px 14px at 100% 0%, black 80%, transparent 81%),
+    radial-gradient(14px 14px at 0% 100%, black 80%, transparent 81%),
+    radial-gradient(14px 14px at 100% 100%, black 80%, transparent 81%);
+  mask-image:
+    radial-gradient(14px 14px at 0% 0%, black 80%, transparent 81%),
+    radial-gradient(14px 14px at 100% 0%, black 80%, transparent 81%),
+    radial-gradient(14px 14px at 0% 100%, black 80%, transparent 81%),
+    radial-gradient(14px 14px at 100% 100%, black 80%, transparent 81%);
+  pointer-events: none;
+}
+
+.console-inspector-section {
+  background: color-mix(in srgb, var(--console-card-bg) 60%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--console-border-soft) 50%, transparent);
+  padding: 1rem;
+  transition: background-color 180ms ease;
+}
+
+.console-inspector-section:last-child {
+  border-bottom: none;
+}
+
+/* Range slider — filled progress track */
+.console-range-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 6px;
+  border-radius: 3px;
+  background: linear-gradient(
+    to right,
+    var(--studio-accent) 0%,
+    var(--studio-accent) var(--range-fill, 0%),
+    var(--console-border-soft) var(--range-fill, 0%),
+    var(--console-border-soft) 100%
+  );
+  outline: none;
+}
+
+.console-range-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--studio-accent);
+  border: 2px solid var(--console-card-bg);
+  box-shadow: var(--shadow-elevation-1);
+  cursor: pointer;
+}
+
+.console-range-slider::-moz-range-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--console-border-soft);
+  border: none;
+}
+
+.console-range-slider::-moz-range-progress {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--studio-accent);
+}
+
+.console-range-slider::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--studio-accent);
+  border: 2px solid var(--console-card-bg);
+  box-shadow: var(--shadow-elevation-1);
+  cursor: pointer;
+}
+
+/* ── Chat container scrollbar — visible thin scrollbar for position context ── */
+[data-chat-container] {
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--console-card-bg) 20%, transparent), transparent 18rem), transparent;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--studio-text-muted) 72%, transparent) transparent;
+}
+[data-chat-container]::-webkit-scrollbar {
+  width: 10px;
+}
+[data-chat-container]::-webkit-scrollbar-track {
+  background: transparent;
+}
+[data-chat-container]::-webkit-scrollbar-thumb {
+  background-color: color-mix(in srgb, var(--studio-text-muted) 72%, transparent);
+  background-clip: content-box;
+  border: 3px solid transparent;
+  border-radius: 999px;
+}
+[data-chat-container]::-webkit-scrollbar-thumb:hover {
+  background-color: var(--studio-text-muted);
+}
+
+/* ── Divider primitives — single source of truth for section separators ── */
+.console-divider-t {
+  border-top: 1px solid var(--console-border-soft);
+}
+.console-divider-b {
+  border-bottom: 1px solid var(--console-border-soft);
+}
+.console-divider-l {
+  border-left: 1px solid var(--console-border-soft);
+}
+.console-divider-r {
+  border-right: 1px solid var(--console-border-soft);
+}

@@ -1,0 +1,37 @@
+/**
+ * Messages API Schemas
+ * Zod schemas for message-related API validation.
+ * Extracted from parse-multipart.ts for better organization.
+ */
+
+import { agentIdSchema } from '@agent-studio/shared';
+import { z } from 'zod';
+
+/**
+ * Schema for POST /api/messages request body.
+ * Used for both JSON and multipart form data validation.
+ */
+export const sendMessageSchema = z
+  .object({
+    content: z.string().min(1).max(100000),
+    /** Legacy fallback only; preferred identity source is X-Agent-Studio-User header. */
+    userId: z.string().min(1).max(100).optional(),
+    mentions: z.array(agentIdSchema()).optional(),
+    threadId: z.string().min(1).max(100).optional(),
+    /** Client-provided idempotency key (UUID). Optional — server generates one if absent. */
+    idempotencyKey: z.string().uuid().optional(),
+    /** F35: Message visibility. Default 'public'. 'whisper' requires whisperTo. */
+    visibility: z.enum(['public', 'whisper']).optional(),
+    /** F35: Whisper recipients. Required when visibility='whisper'. */
+    whisperTo: z.array(agentIdSchema()).optional(),
+    /** F39: Delivery mode. undefined = smart default (queue when active, immediate otherwise). */
+    deliveryMode: z.enum(['immediate', 'queue', 'force']).optional(),
+    /** #699: ID of message being replied to (quote). */
+    replyTo: z.string().min(1).max(100).optional(),
+  })
+  .refine((data) => data.visibility !== 'whisper' || (data.whisperTo && data.whisperTo.length > 0), {
+    message: 'whisperTo must be non-empty when visibility is whisper',
+    path: ['whisperTo'],
+  });
+
+export type SendMessageInput = z.infer<typeof sendMessageSchema>;

@@ -1,0 +1,158 @@
+import { randomUUID } from 'node:crypto';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import type { FastifyPluginAsync } from 'fastify';
+import { AuditEventTypes, type EventAuditLog, getEventAuditLog } from '../domains/agents/services/index.js';
+import type { PortDiscoveryService } from '../domains/preview/port-discovery.js';
+import { validatePort } from '../domains/preview/port-validator.js';
+import { getDefaultUploadDir } from '../utils/upload-paths.js';
+
+interface PreviewRouteOpts {
+  portDiscovery: PortDiscoveryService;
+  gatewayPort: number;
+  runtimePorts?: number[];
+  /** F120 Phase C: emit socket events to a specific room */
+  socketEmit?: (event: string, data: unknown, room: string) => void;
+  auditLog?: EventAuditLog;
+}
+
+export const previewRoutes: FastifyPluginAsync<PreviewRouteOpts> = async (app, opts) => {
+  const { portDiscovery, gatewayPort, runtimePorts } = opts;
+  const auditLog = opts.auditLog ?? getEventAuditLog();
+  const gatewayAvailable = gatewayPort > 0;
+
+  app.get('/api/preview/status', async () => {
+    return { available: gatewayAvailable, gatewayPort };
+  });
+
+  app.post<{ Body: { port: number; host?: string } }>('/api/preview/validate-port', async (req) => {
+    const { port, host } = req.body;
+    const result = validatePort(port, { host, gatewaySelfPort: gatewayPort, runtimePorts });
+    // Audit: log preview open attempt
+    if (result.allowed) {
+      auditLog
+        .append({
+          type: AuditEventTypes.BROWSER_PREVIEW_OPEN,
+          data: { port, host: host ?? 'localhost', gatewayPort },
+        })
+        .catch(() => {});
+    }
+    return result;
+  });
+
+  app.get<{ Querystring: { worktreeId?: string } }>('/api/preview/discovered', async (req) => {
+    return portDiscovery.getDiscoveredPorts(req.query.worktreeId);
+  });
+
+  // P1-3: Consolidated audit endpoints for preview lifecycle
+  app.post<{ Body: { port: number; host?: string; threadId?: string; agentId?: string } }>(
+    '/api/preview/open',
+    async (req) => {
+      if (!gatewayAvailable) {
+        return { allowed: false, reason: 'Preview gateway unavailable' };
+      }
+      const { port, host, threadId, agentId } = req.body;
+      const result = validatePort(port, { host, gatewaySelfPort: gatewayPort, runtimePorts });
+      if (result.allowed) {
+        auditLog
+          .append({
+            type: AuditEventTypes.BROWSER_PREVIEW_OPEN,
+            threadId,
+            data: { port, host: host ?? 'localhost', gatewayPort, agentId },
+          })
+          .catch(() => {});
+      }
+      return {
+        ...result,
+        gatewayUrl: result.allowed ? `http://localhost:${gatewayPort}/?__preview_port=${port}` : undefined,
+      };
+    },
+  );
+
+  app.post<{ Body: { port: number; threadId?: string; agentId?: string } }>('/api/preview/close', async (req) => {
+    const { port, threadId, agentId } = req.body;
+    auditLog
+      .append({
+        type: AuditEventTypes.BROWSER_PREVIEW_CLOSE,
+        threadId,
+        data: { port, agentId },
+      })
+      .catch(() => {});
+    return { ok: true };
+  });
+
+  app.post<{ Body: { port: number; url: string; threadId?: string; agentId?: string } }>(
+    '/api/preview/navigate',
+    async (req) => {
+      const { port, url, threadId, agentId } = req.body;
+      auditLog
+        .append({
+          type: AuditEventTypes.BROWSER_PREVIEW_NAVIGATE,
+          threadId,
+          data: { port, url, agentId },
+        })
+        .catch(() => {});
+      return { ok: true };
+    },
+  );
+
+  // F120 Phase C: Agent-initiated auto-open — skips toast, directly opens browser panel
+  app.post<{ Body: { port: number; path?: string; threadId?: string; worktreeId?: string; agentId?: string } }>(
+    '/api/preview/auto-open',
+    async (req) => {
+      if (!gatewayAvailable) {
+        return { allowed: false, reason: 'Preview gateway unavailable' };
+      }
+      const { port, path, threadId, worktreeId, agentId } = req.body;
+      const result = validatePort(port, { host: 'localhost', gatewaySelfPort: gatewayPort, runtimePorts });
+      if (!result.allowed) {
+        return result;
+      }
+      // Dual-broadcast: when worktreeId is provided, emit to both the scoped room
+      // AND preview:global so the matching session always receives the event
+      // regardless of frontend room-join timing. The frontend's shouldAcceptAutoOpen
+      // filter (fail-closed) prevents cross-session leakage.
+      const eventData = { port, path, threadId, worktreeId };
+      if (worktreeId) {
+        opts.socketEmit?.('preview:auto-open', eventData, `worktree:${worktreeId}`);
+        opts.socketEmit?.('preview:auto-open', eventData, 'preview:global');
+      } else {
+        opts.socketEmit?.('preview:auto-open', eventData, 'preview:global');
+      }
+      auditLog
+        .append({
+          type: AuditEventTypes.BROWSER_PREVIEW_OPEN,
+          threadId,
+          data: { port, host: 'localhost', gatewayPort, autoOpen: true, worktreeId, agentId },
+        })
+        .catch(() => {});
+      return { allowed: true, port, path };
+    },
+  );
+
+  // F120 Phase C: Screenshot upload — converts data URL to file.
+  // Avatar uploads have moved to /api/uploads/avatar (multipart). This route is
+  // screenshots-only and uses the Fastify default bodyLimit (1 MiB), which is
+  // adequate for in-iframe screenshot data URLs.
+  app.post<{ Body: { dataUrl: string; threadId?: string } }>('/api/preview/screenshot', async (req, reply) => {
+    const { dataUrl, threadId } = req.body;
+    const match = dataUrl?.match(/^data:image\/(png|jpeg|webp);base64,(.+)$/);
+    if (!match) {
+      return reply.status(400).send({ error: 'Invalid data URL — expected data:image/{png|jpeg|webp};base64,...' });
+    }
+    const ext = match[1] === 'jpeg' ? 'jpg' : match[1]!;
+    const buffer = Buffer.from(match[2]!, 'base64');
+    const uploadDir = getDefaultUploadDir(process.env.UPLOAD_DIR);
+    await mkdir(uploadDir, { recursive: true });
+    const filename = `screenshot-${Date.now()}-${randomUUID().slice(0, 8)}.${ext}`;
+    await writeFile(join(uploadDir, filename), buffer);
+    auditLog
+      .append({
+        type: AuditEventTypes.BROWSER_PREVIEW_OPEN,
+        threadId,
+        data: { action: 'screenshot', filename },
+      })
+      .catch(() => {});
+    return { url: `/uploads/${filename}` };
+  });
+};

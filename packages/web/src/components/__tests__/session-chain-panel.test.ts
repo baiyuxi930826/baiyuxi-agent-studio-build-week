@@ -1,0 +1,1303 @@
+/**
+ * F24: SessionChainPanel tests.
+ * Verifies session chain visualization: active sessions with health bar,
+ * sealed sessions with lock icons, post-compact safety alert, re-fetch on seal.
+ */
+import React from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import { act } from 'react-dom/test-utils';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { AgentInvocationInfo } from '@/stores/chat-types';
+import { __resetSessionChainCacheForTest, SessionChainPanel } from '../SessionChainPanel';
+
+beforeAll(() => {
+  (globalThis as { React?: typeof React }).React = React;
+});
+afterAll(() => {
+  delete (globalThis as { React?: typeof React }).React;
+});
+
+let mockApiFetch: ReturnType<typeof vi.fn<(...args: unknown[]) => unknown>>;
+
+vi.mock('@/utils/api-client', () => ({
+  apiFetch: (...args: unknown[]) => mockApiFetch(...args),
+}));
+
+// Stub ContextHealthBar and TokenCacheBar to avoid pulling in their dependencies
+vi.mock('../ContextHealthBar', () => ({
+  ContextHealthBar: (props: { agentId: string }) =>
+    React.createElement('div', { 'data-testid': `health-bar-${props.agentId}` }),
+}));
+
+// useAgentData stub — mirrors agent-config.json so SessionChainPanel can pull
+// border/badge colors from agent.color.primary instead of a hardcoded table.
+const MOCK_CATS: Record<string, { id: string; displayName: string; color: { primary: string; secondary: string } }> = {
+  opus: { id: 'opus', displayName: 'Ethan（任务主控与实现）', color: { primary: '#9B7EBD', secondary: '#E8DFF5' } },
+  codex: { id: 'codex', displayName: 'Owen（验证与审查）', color: { primary: '#5B8C5A', secondary: '#D4E6D3' } },
+  gemini: { id: 'gemini', displayName: 'Andy（界面与视觉）', color: { primary: '#4A90E2', secondary: '#D8E6F8' } },
+  kimi: { id: 'kimi', displayName: 'Nora（研究与上下文）', color: { primary: '#4B5563', secondary: '#E5E7EB' } },
+  dare: { id: 'dare', displayName: 'Ethan（任务主控与实现）', color: { primary: '#FFB300', secondary: '#FFE082' } },
+  gpt52: { id: 'gpt52', displayName: 'Owen（验证与审查）', color: { primary: '#66BB6A', secondary: '#C8E6C9' } },
+  'opus-45': {
+    id: 'opus-45',
+    displayName: 'Ethan（任务主控与实现）',
+    color: { primary: '#7E57C2', secondary: '#E1D5F0' },
+  },
+  'opus-47': {
+    id: 'opus-47',
+    displayName: 'Ethan（任务主控与实现）',
+    color: { primary: '#7B1FA2', secondary: '#E1BEE7' },
+  },
+  sonnet: { id: 'sonnet', displayName: 'Ethan（任务主控与实现）', color: { primary: '#B39DDB', secondary: '#EDE7F6' } },
+};
+
+vi.mock('@/hooks/useAgentData', () => ({
+  useAgentData: () => ({
+    agents: Object.values(MOCK_CATS),
+    isLoading: false,
+    getAgentById: (id: string) => MOCK_CATS[id],
+    getAgentsByRole: () => new Map(),
+  }),
+  formatAgentName: (agent: { displayName: string; variantLabel?: string }) =>
+    agent.variantLabel ? `${agent.displayName}(${agent.variantLabel})` : agent.displayName,
+}));
+
+vi.mock('../status-helpers', () => ({
+  truncateId: (id: string, len: number) => (id.length > len ? `${id.slice(0, len)}…` : id),
+}));
+
+const origCreateElement = document.createElement.bind(document);
+let container: HTMLDivElement;
+let root: Root;
+
+beforeEach(() => {
+  container = origCreateElement('div');
+  document.body.appendChild(container);
+  root = createRoot(container);
+  mockApiFetch = vi.fn();
+  __resetSessionChainCacheForTest();
+});
+
+afterEach(() => {
+  act(() => root.unmount());
+  container.remove();
+});
+
+function renderPanel(threadId: string, agentInvocations: Record<string, AgentInvocationInfo> = {}) {
+  act(() => {
+    root.render(React.createElement(SessionChainPanel, { threadId, agentInvocations }));
+  });
+}
+
+async function flushFetch() {
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 0));
+  });
+}
+
+function mockSessionsResponse(sessions: unknown[]) {
+  mockApiFetch.mockResolvedValue({
+    ok: true,
+    json: async () => ({ sessions }),
+  });
+}
+
+/** Sealed section is default-collapsed; click the toggle to expand it. */
+function expandSealed() {
+  const toggle = container.querySelector('[data-testid="sealed-toggle"]') as HTMLElement | null;
+  if (toggle) {
+    act(() => {
+      toggle.click();
+    });
+  }
+}
+
+describe('F24: SessionChainPanel', () => {
+  it('renders panel with bind section even when API returns empty sessions (F33)', async () => {
+    mockSessionsResponse([]);
+    renderPanel('thread-1');
+    await flushFetch();
+    // Panel should render (F33: always visible for external session binding)
+    expect(container.querySelector('section')).not.toBeNull();
+    // No session cards, but bind section available
+    expect(container.textContent).toContain('0 total');
+    expect(container.textContent).toContain('绑定外部 Session');
+  });
+
+  it('renders session count in header', async () => {
+    mockSessionsResponse([
+      { id: 's1', agentId: 'opus', seq: 0, status: 'active', messageCount: 5, createdAt: Date.now() },
+      {
+        id: 's2',
+        agentId: 'opus',
+        seq: 1,
+        status: 'sealed',
+        messageCount: 12,
+        createdAt: Date.now() - 60000,
+        sealedAt: Date.now() - 30000,
+      },
+    ]);
+    renderPanel('thread-1');
+    await flushFetch();
+    expect(container.textContent).toContain('1 active');
+    expect(container.textContent).toContain('2 total');
+  });
+
+  it('collapses repeated 0-msg tool_conflict retry corpses into one summary (F201-churn)', async () => {
+    const corpse = (seq: number) => ({
+      id: `corpse-${seq}`,
+      agentId: 'antig-opus',
+      seq,
+      status: 'sealed',
+      messageCount: 0,
+      createdAt: Date.now() - (10 - seq) * 1000,
+      sealedAt: Date.now() - (10 - seq) * 1000,
+      sealReason: 'tool_conflict',
+    });
+    mockSessionsResponse([
+      {
+        id: 'real-sealed',
+        agentId: 'antig-opus',
+        seq: 9,
+        status: 'sealed',
+        messageCount: 12,
+        createdAt: Date.now() - 5000,
+        sealedAt: Date.now() - 4000,
+        sealReason: 'runtime_disconnected',
+      },
+      corpse(1),
+      corpse(2),
+      corpse(3),
+      corpse(4),
+    ]);
+    renderPanel('thread-1');
+    await flushFetch();
+    expandSealed();
+    // F201-churn: 4 empty (0-msg) tool_conflict retry corpses collapse into ONE summary,
+    // leaving only the real sealed session as a full card. Transparency preserved via the
+    // summary's visible count; the UI no longer litters one corpse card per F201 retry.
+    const sealedCards = container.querySelectorAll('[data-testid="session-card-sealed"]');
+    expect(sealedCards.length).toBe(1);
+    const summary = container.querySelector('[data-testid="session-card-retry-collapsed"]');
+    expect(summary).not.toBeNull();
+    expect(summary?.textContent).toContain('4');
+    expect(summary?.textContent).toContain('重试残骸');
+  });
+
+  it('collapses repeated runtime-tagged retry fragments without relying on sealReason heuristics', async () => {
+    const fragment = (seq: number) => ({
+      id: `fragment-${seq}`,
+      agentId: 'antig-opus',
+      seq,
+      status: 'sealed',
+      messageCount: 0,
+      createdAt: Date.now() - (10 - seq) * 1000,
+      sealedAt: Date.now() - (10 - seq) * 1000,
+      sealReason: 'model_capacity',
+      runtimeSession: {
+        runtime: 'antigravity-desktop',
+        runtimeSessionId: `cascade-fragment-${seq}`,
+        lifecycleState: 'sealed',
+        lastObservedAt: Date.now() - (10 - seq) * 1000,
+        retryFragment: {
+          kind: 'retry',
+          retryReason: 'model_capacity',
+          nextRuntimeSessionId: `cascade-next-${seq}`,
+          detectedAt: Date.now() - (10 - seq) * 1000,
+        },
+      },
+    });
+    mockSessionsResponse([fragment(1), fragment(2), fragment(3)]);
+    renderPanel('thread-1');
+    await flushFetch();
+    expandSealed();
+    expect(container.querySelectorAll('[data-testid="session-card-sealed"]').length).toBe(0);
+    const summary = container.querySelector('[data-testid="session-card-retry-collapsed"]');
+    expect(summary).not.toBeNull();
+    expect(summary?.textContent).toContain('3');
+    expect(summary?.textContent).toContain('重试片段');
+  });
+
+  it('collapses a single runtime-tagged retry fragment', async () => {
+    mockSessionsResponse([
+      {
+        id: 'fragment-single',
+        agentId: 'antig-opus',
+        seq: 1,
+        status: 'sealed',
+        messageCount: 0,
+        createdAt: Date.now() - 5000,
+        sealedAt: Date.now() - 4000,
+        sealReason: 'model_capacity',
+        runtimeSession: {
+          runtime: 'antigravity-desktop',
+          runtimeSessionId: 'cascade-fragment-single',
+          lifecycleState: 'sealed',
+          lastObservedAt: Date.now() - 4000,
+          retryFragment: {
+            kind: 'retry',
+            retryReason: 'model_capacity',
+            nextRuntimeSessionId: 'cascade-next-single',
+            detectedAt: Date.now() - 4000,
+          },
+        },
+      },
+    ]);
+    renderPanel('thread-1');
+    await flushFetch();
+    expandSealed();
+    expect(container.querySelectorAll('[data-testid="session-card-sealed"]').length).toBe(0);
+    const summary = container.querySelector('[data-testid="session-card-retry-collapsed"]');
+    expect(summary).not.toBeNull();
+    expect(summary?.textContent).toContain('1');
+    expect(summary?.textContent).toContain('重试片段');
+  });
+
+  it('does NOT collapse in-flight sealing 0-msg tool_conflict records (砚砚 review P2)', async () => {
+    // requestSeal() writes sealReason while status is still 'sealing' (async-finalizes to 'sealed'
+    // later) — a sealing record must keep its own card (live status + 查看/解封), NOT be folded.
+    const sealingCorpseLike = (seq: number) => ({
+      id: `sealing-${seq}`,
+      agentId: 'antig-opus',
+      seq,
+      status: 'sealing',
+      messageCount: 0,
+      createdAt: Date.now() - (10 - seq) * 1000,
+      sealReason: 'tool_conflict',
+    });
+    mockSessionsResponse([sealingCorpseLike(1), sealingCorpseLike(2)]);
+    renderPanel('thread-1');
+    await flushFetch();
+    expandSealed();
+    expect(container.querySelector('[data-testid="session-card-retry-collapsed"]')).toBeNull();
+    expect(container.querySelectorAll('[data-testid="session-card-sealed"]').length).toBe(2);
+  });
+
+  it('renders active session with seq number, agent badge, and clickable session ID', async () => {
+    mockSessionsResponse([
+      {
+        id: 'ses_abc12345xyz',
+        agentId: 'opus',
+        seq: 2,
+        status: 'active',
+        messageCount: 8,
+        createdAt: Date.now() - 5000,
+      },
+    ]);
+    renderPanel('thread-1');
+    await flushFetch();
+    expect(container.textContent).toContain('Session #3');
+    expect(container.textContent).toContain('Ethan（任务主控与实现）');
+    expect(container.textContent).toContain('Active');
+    expect(container.textContent).toContain('8 msgs');
+    // Session ID should be visible (truncated) with copy title
+    const idBtn = container.querySelector('button[title*="ses_abc12345xyz"]');
+    expect(idBtn).not.toBeNull();
+    expect(idBtn?.textContent).toContain('ses_abc123');
+  });
+
+  it('renders Antigravity runtime session identity and unexpected switch diagnostics', async () => {
+    mockSessionsResponse([
+      {
+        id: 'session-new',
+        cliSessionId: 'cascade-new-unexpected',
+        agentId: 'opus',
+        seq: 1,
+        status: 'active',
+        messageCount: 1,
+        createdAt: Date.now() - 5000,
+        runtimeSession: {
+          runtime: 'antigravity-desktop',
+          runtimeSessionId: 'cascade-new-unexpected',
+          lifecycleState: 'active',
+          lastObservedAt: Date.now() - 1000,
+          unexpectedRuntimeSessionSwitch: {
+            detectedAt: Date.now() - 1000,
+            previousSessionId: 'session-old',
+            previousRuntimeSessionId: 'cascade-old-unexpected',
+            currentRuntimeSessionId: 'cascade-new-unexpected',
+            reason: 'missing_previous_runtime_session_id',
+          },
+        },
+      },
+    ]);
+
+    renderPanel('thread-1');
+    await flushFetch();
+
+    expect(container.querySelector('[data-testid="runtime-session-summary"]')).not.toBeNull();
+    expect(container.textContent).toContain('runtime');
+    expect(container.textContent).toContain('antigravity-desktop');
+    expect(container.textContent).toContain('unexpected switch');
+    expect(container.querySelector('button[title*="cascade-new-unexpected"]')).not.toBeNull();
+    expect(container.querySelector('button[title*="cascade-old-unexpected"]')).not.toBeNull();
+  });
+
+  it('renders ContextHealthBar for active session with health data', async () => {
+    mockSessionsResponse([
+      {
+        id: 's1',
+        agentId: 'opus',
+        seq: 0,
+        status: 'active',
+        messageCount: 3,
+        createdAt: Date.now(),
+        contextHealth: { usedTokens: 123000, windowTokens: 150000, fillRatio: 0.82, source: 'exact' },
+      },
+    ]);
+    renderPanel('thread-1');
+    await flushFetch();
+    // ContextHealthBar is rendered (mocked as div with data-testid)
+    expect(container.querySelector('[data-testid="health-bar-opus"]')).not.toBeNull();
+  });
+
+  it('prefers invocation contextHealth over session contextHealth', async () => {
+    mockSessionsResponse([
+      {
+        id: 's1',
+        agentId: 'opus',
+        seq: 0,
+        status: 'active',
+        messageCount: 3,
+        createdAt: Date.now(),
+        contextHealth: { usedTokens: 50000, windowTokens: 150000, fillRatio: 0.33, source: 'approx' },
+      },
+    ]);
+    const invocations: Record<string, AgentInvocationInfo> = {
+      opus: {
+        contextHealth: {
+          usedTokens: 120000,
+          windowTokens: 150000,
+          fillRatio: 0.8,
+          source: 'exact',
+          measuredAt: Date.now(),
+        },
+      },
+    };
+    renderPanel('thread-1', invocations);
+    await flushFetch();
+    // ContextHealthBar should be rendered (delegates % display to the component)
+    expect(container.querySelector('[data-testid="health-bar-opus"]')).not.toBeNull();
+  });
+
+  it('renders sealed sessions with seal reason label and clickable IDs', async () => {
+    mockSessionsResponse([
+      {
+        id: 'seal_aaa111',
+        agentId: 'opus',
+        seq: 0,
+        status: 'sealed',
+        messageCount: 20,
+        createdAt: Date.now() - 120000,
+        sealedAt: Date.now() - 60000,
+        sealReason: 'claude-code-compact-auto',
+        contextHealth: { usedTokens: 140000, windowTokens: 150000, fillRatio: 0.93, source: 'exact' },
+      },
+      {
+        id: 'seal_bbb222',
+        agentId: 'opus',
+        seq: 1,
+        status: 'sealed',
+        messageCount: 15,
+        createdAt: Date.now() - 60000,
+        sealedAt: Date.now() - 10000,
+        sealReason: 'threshold',
+      },
+    ]);
+    renderPanel('thread-1');
+    await flushFetch();
+    expect(container.textContent).toContain('Sealed');
+    expandSealed();
+    expect(container.textContent).toContain('Session #1');
+    expect(container.textContent).toContain('Session #2');
+    expect(container.textContent).toContain('compact');
+    expect(container.textContent).toContain('threshold');
+    // Both sealed sessions should have clickable ID buttons
+    expect(container.querySelector('button[title*="seal_aaa111"]')).not.toBeNull();
+    expect(container.querySelector('button[title*="seal_bbb222"]')).not.toBeNull();
+  });
+
+  it('shows sealing text for sessions with status sealing', async () => {
+    mockSessionsResponse([
+      { id: 's1', agentId: 'opus', seq: 0, status: 'sealing', messageCount: 10, createdAt: Date.now() - 5000 },
+    ]);
+    renderPanel('thread-1');
+    await flushFetch();
+    expandSealed();
+    expect(container.textContent).toContain('sealing');
+  });
+
+  it('renders kimi colors from agent.color (border inline style)', async () => {
+    // kimi primary #4B5563 → 75,85,99
+    mockSessionsResponse([
+      { id: 'kimi_s1', agentId: 'kimi', seq: 0, status: 'active', messageCount: 2, createdAt: Date.now() },
+    ]);
+    renderPanel('thread-1');
+    await flushFetch();
+    const card = container.querySelector(
+      '[data-testid="session-card-active"][data-agent-id="kimi"]',
+    ) as HTMLElement | null;
+    expect(card).not.toBeNull();
+    expect(card!.style.boxShadow).toMatch(/rgba?\(75,\s*85,\s*99/);
+  });
+
+  it('renders agent displayName in the active session badge', async () => {
+    mockSessionsResponse([
+      { id: 's1', agentId: 'kimi', seq: 0, status: 'active', messageCount: 2, createdAt: Date.now() },
+    ]);
+    renderPanel('thread-1');
+    await flushFetch();
+    expect(container.textContent).toContain('Nora（研究与上下文）');
+  });
+
+  it('shows post-compact safety alert when sessionSealed is true', async () => {
+    mockSessionsResponse([
+      { id: 's1', agentId: 'opus', seq: 1, status: 'active', messageCount: 3, createdAt: Date.now() },
+    ]);
+    const invocations: Record<string, AgentInvocationInfo> = {
+      opus: { sessionSeq: 1, sessionSealed: true },
+    };
+    renderPanel('thread-1', invocations);
+    await flushFetch();
+    expect(container.textContent).toContain('Post-compact safety active');
+    expect(container.textContent).toContain('High-risk ops may be blocked');
+  });
+
+  it('does not show post-compact alert when no agent has sessionSealed', async () => {
+    mockSessionsResponse([
+      { id: 's1', agentId: 'opus', seq: 0, status: 'active', messageCount: 5, createdAt: Date.now() },
+    ]);
+    renderPanel('thread-1', { opus: { sessionSeq: 0 } });
+    await flushFetch();
+    expect(container.textContent).not.toContain('Post-compact safety active');
+  });
+
+  it('re-fetches when sealSignal changes', async () => {
+    mockSessionsResponse([
+      { id: 's1', agentId: 'opus', seq: 0, status: 'active', messageCount: 3, createdAt: Date.now() },
+    ]);
+    renderPanel('thread-1', { opus: { sessionSeq: 0 } });
+    await flushFetch();
+
+    const callsBefore = mockApiFetch.mock.calls.length;
+
+    // Re-render with sessionSealed changed → triggers sealSignal change
+    mockSessionsResponse([
+      {
+        id: 's1',
+        agentId: 'opus',
+        seq: 0,
+        status: 'sealed',
+        messageCount: 3,
+        createdAt: Date.now(),
+        sealedAt: Date.now(),
+      },
+      { id: 's2', agentId: 'opus', seq: 1, status: 'active', messageCount: 0, createdAt: Date.now() },
+    ]);
+    renderPanel('thread-1', { opus: { sessionSeq: 0, sessionSealed: true } });
+    await flushFetch();
+
+    expect(mockApiFetch.mock.calls.length).toBeGreaterThan(callsBefore);
+  });
+
+  it('renders ContextHealthBar for approx source health', async () => {
+    mockSessionsResponse([
+      {
+        id: 's1',
+        agentId: 'gemini',
+        seq: 0,
+        status: 'active',
+        messageCount: 2,
+        createdAt: Date.now(),
+        contextHealth: { usedTokens: 80000, windowTokens: 150000, fillRatio: 0.53, source: 'approx' },
+      },
+    ]);
+    renderPanel('thread-1');
+    await flushFetch();
+    // ContextHealthBar is rendered (mocked); approx indicator handled internally
+    expect(container.querySelector('[data-testid="health-bar-gemini"]')).not.toBeNull();
+  });
+
+  it('renders ContextHealthBar for high fill ratio', async () => {
+    mockSessionsResponse([
+      {
+        id: 's1',
+        agentId: 'opus',
+        seq: 0,
+        status: 'active',
+        messageCount: 5,
+        createdAt: Date.now(),
+        contextHealth: { usedTokens: 140000, windowTokens: 150000, fillRatio: 0.93, source: 'exact' },
+      },
+    ]);
+    renderPanel('thread-1');
+    await flushFetch();
+    // ContextHealthBar renders (color handling is internal to the component)
+    expect(container.querySelector('[data-testid="health-bar-opus"]')).not.toBeNull();
+  });
+
+  it('shows cached percentage when invocation has cacheReadTokens', async () => {
+    mockSessionsResponse([
+      { id: 's1', agentId: 'opus', seq: 0, status: 'active', messageCount: 5, createdAt: Date.now() },
+    ]);
+    const invocations: Record<string, AgentInvocationInfo> = {
+      opus: {
+        usage: { inputTokens: 100000, outputTokens: 5000, cacheReadTokens: 75000 },
+      },
+    };
+    renderPanel('thread-1', invocations);
+    await flushFetch();
+    expect(container.textContent).toContain('cached');
+  });
+
+  it('hides cached percentage when no cacheReadTokens', async () => {
+    mockSessionsResponse([
+      { id: 's1', agentId: 'opus', seq: 0, status: 'active', messageCount: 5, createdAt: Date.now() },
+    ]);
+    const invocations: Record<string, AgentInvocationInfo> = {
+      opus: {
+        usage: { inputTokens: 100000, outputTokens: 5000 },
+      },
+    };
+    renderPanel('thread-1', invocations);
+    await flushFetch();
+    expect(container.textContent).not.toContain('cached');
+  });
+
+  it('shows token counts from session.lastUsage when no live invocation', async () => {
+    mockSessionsResponse([
+      {
+        id: 's1',
+        agentId: 'opus',
+        seq: 0,
+        status: 'active',
+        messageCount: 5,
+        createdAt: Date.now(),
+        lastUsage: { inputTokens: 120000, outputTokens: 8000, cacheReadTokens: 90000 },
+      },
+    ]);
+    // No agentInvocations — simulates page reload with no live data
+    renderPanel('thread-1');
+    await flushFetch();
+    expect(container.textContent).toContain('120k');
+    expect(container.textContent).toContain('8k');
+    expect(container.textContent).toContain('cached');
+  });
+
+  it('prefers live invocation usage over session.lastUsage', async () => {
+    mockSessionsResponse([
+      {
+        id: 's1',
+        agentId: 'opus',
+        seq: 0,
+        status: 'active',
+        messageCount: 5,
+        createdAt: Date.now(),
+        lastUsage: { inputTokens: 50000, outputTokens: 2000 },
+      },
+    ]);
+    const invocations: Record<string, AgentInvocationInfo> = {
+      opus: {
+        usage: { inputTokens: 150000, outputTokens: 10000 },
+      },
+    };
+    renderPanel('thread-1', invocations);
+    await flushFetch();
+    // Should show live data (150k/10k), not persisted (50k/2k)
+    expect(container.textContent).toContain('150k');
+    expect(container.textContent).toContain('10k');
+    // Persisted outputTokens (2k) should NOT appear
+    expect(container.textContent).not.toContain('2k');
+  });
+
+  it('calls API with correct thread URL', async () => {
+    mockSessionsResponse([]);
+    renderPanel('my-thread-42');
+    await flushFetch();
+    expect(mockApiFetch).toHaveBeenCalledWith('/api/threads/my-thread-42/sessions');
+  });
+
+  it('handles API error gracefully', async () => {
+    mockApiFetch.mockResolvedValue({ ok: false, status: 500 });
+    renderPanel('thread-1');
+    await flushFetch();
+    // Should not crash; panel still renders (F33: bind section always present)
+    expect(container.textContent).toContain('0 total');
+    expect(container.textContent).not.toContain('Session #');
+  });
+
+  it('renders active and total counts in header', async () => {
+    mockSessionsResponse([
+      { id: 's1', agentId: 'opus', seq: 0, status: 'active', messageCount: 1, createdAt: Date.now() },
+    ]);
+    renderPanel('thread-1');
+    await flushFetch();
+    expect(container.textContent).toContain('1 active');
+    expect(container.textContent).toContain('1 total');
+  });
+
+  it('keeps stale data visible on thread switch when fetch fails (stale-while-revalidate)', async () => {
+    // First thread loads successfully
+    mockSessionsResponse([
+      { id: 's1', agentId: 'opus', seq: 0, status: 'active', messageCount: 5, createdAt: Date.now() },
+    ]);
+    renderPanel('thread-1');
+    await flushFetch();
+    expect(container.textContent).toContain('Session #1');
+
+    // Switch to thread-2, but fetch fails — stale data stays visible
+    mockApiFetch.mockResolvedValue({ ok: false, status: 500 });
+    renderPanel('thread-2');
+    await flushFetch();
+
+    // Stale-while-revalidate: old data remains visible on transient error
+    expect(container.textContent).toContain('Session #1');
+  });
+
+  it('keeps stale data visible on thread switch when fetch throws (stale-while-revalidate)', async () => {
+    mockSessionsResponse([
+      {
+        id: 's1',
+        agentId: 'opus',
+        seq: 0,
+        status: 'sealed',
+        messageCount: 12,
+        createdAt: Date.now() - 60000,
+        sealedAt: Date.now(),
+      },
+    ]);
+    renderPanel('thread-A');
+    await flushFetch();
+    expandSealed();
+    expect(container.textContent).toContain('Session #1');
+
+    // Switch to thread-B, but fetch throws — stale data stays visible
+    mockApiFetch.mockRejectedValue(new Error('network error'));
+    renderPanel('thread-B');
+    await flushFetch();
+
+    // Stale-while-revalidate: old data remains visible on transient error
+    expect(container.textContent).toContain('Session #1');
+  });
+
+  it('disables unseal button on stale data during AND after failed refetch (stale barrier)', async () => {
+    // Load sealed session for thread-1
+    mockSessionsResponse([
+      {
+        id: 's1',
+        agentId: 'opus',
+        seq: 0,
+        status: 'sealed',
+        messageCount: 5,
+        createdAt: Date.now() - 60000,
+        sealedAt: Date.now(),
+      },
+    ]);
+    renderPanel('thread-1');
+    await flushFetch();
+    expandSealed();
+
+    const findUnsealBtn = () => {
+      const buttons = Array.from(container.querySelectorAll('button'));
+      return buttons.find((b) => b.textContent?.includes('解封')) as HTMLButtonElement | undefined;
+    };
+
+    // Unseal button should be enabled for fresh data
+    expect(findUnsealBtn()!.disabled).toBe(false);
+
+    // Switch to thread-2, fetch fails — stale data from thread-1 stays visible
+    mockApiFetch.mockRejectedValue(new Error('network error'));
+    renderPanel('thread-2');
+    await flushFetch();
+
+    // Unseal button must stay DISABLED even after loading finishes,
+    // because data belongs to thread-1 not thread-2 (entity mismatch)
+    const staleBtn = findUnsealBtn();
+    expect(staleBtn).toBeDefined();
+    expect(staleBtn!.disabled).toBe(true);
+
+    // Also verify stale indicator is shown
+    expect(container.textContent).toContain('Refreshing...');
+  });
+
+  it('replaces stale data when new thread fetch succeeds (stale-while-revalidate)', async () => {
+    // First thread loads
+    mockSessionsResponse([
+      { id: 's1', agentId: 'opus', seq: 0, status: 'active', messageCount: 5, createdAt: Date.now() },
+    ]);
+    renderPanel('thread-1');
+    await flushFetch();
+    expect(container.textContent).toContain('Session #1');
+
+    // Switch to thread-2 with different data — old data replaced
+    mockSessionsResponse([
+      { id: 's2', agentId: 'codex', seq: 0, status: 'active', messageCount: 3, createdAt: Date.now() },
+    ]);
+    renderPanel('thread-2');
+    await flushFetch();
+
+    // New data visible, old data gone
+    expect(container.textContent).toContain('Owen（验证与审查）');
+    expect(container.textContent).toContain('1 total');
+  });
+
+  it('reuses per-thread session cache immediately when revisiting a thread during revalidate', async () => {
+    let resolveThread1Revisit!: (value: unknown) => void;
+    const thread1Revisit = new Promise((resolve) => {
+      resolveThread1Revisit = resolve;
+    });
+
+    mockApiFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          sessions: [{ id: 's1', agentId: 'opus', seq: 0, status: 'active', messageCount: 5, createdAt: Date.now() }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          sessions: [{ id: 's2', agentId: 'codex', seq: 5, status: 'active', messageCount: 3, createdAt: Date.now() }],
+        }),
+      })
+      .mockImplementationOnce(() => thread1Revisit);
+
+    renderPanel('thread-1');
+    await flushFetch();
+    expect(container.textContent).toContain('Session #1');
+
+    renderPanel('thread-2');
+    await flushFetch();
+    expect(container.textContent).toContain('Session #6');
+    expect(container.textContent).toContain('Owen（验证与审查）');
+
+    renderPanel('thread-1');
+    await flushFetch();
+
+    // Cache should win immediately while revalidate is still in flight.
+    expect(container.textContent).toContain('Session #1');
+    expect(container.textContent).not.toContain('Session #6');
+
+    resolveThread1Revisit({
+      ok: true,
+      json: async () => ({
+        sessions: [{ id: 's1b', agentId: 'opus', seq: 1, status: 'active', messageCount: 6, createdAt: Date.now() }],
+      }),
+    });
+    await flushFetch();
+
+    expect(container.textContent).toContain('Session #2');
+    expect(container.textContent).not.toContain('Session #6');
+  });
+
+  it('applies codex green colors from agent.color (border + badge inline style)', async () => {
+    // codex primary #5B8C5A → 91,140,90
+    // F056: badge bg/text derived via OKLCH badgeBackground()/contrastingText()
+    mockSessionsResponse([
+      { id: 's1', agentId: 'codex', seq: 0, status: 'active', messageCount: 3, createdAt: Date.now() },
+    ]);
+    renderPanel('thread-1');
+    await flushFetch();
+    const card = container.querySelector(
+      '[data-testid="session-card-active"][data-agent-id="codex"]',
+    ) as HTMLElement | null;
+    expect(card).not.toBeNull();
+    expect(card!.style.boxShadow).toMatch(/rgba?\(91,\s*140,\s*90/);
+    const badge = container.querySelector(
+      '[data-testid="session-badge-active"][data-agent-id="codex"]',
+    ) as HTMLElement | null;
+    expect(badge?.textContent).toContain('Owen（验证与审查）');
+    // F056: badge colors are oklch-derived from primary hex (secondary removed)
+    expect(badge!.style.backgroundColor).toMatch(/oklch\(/);
+    expect(badge!.style.color).toMatch(/oklch\(/);
+  });
+
+  it('applies gemini colors from agent.color', async () => {
+    // gemini primary #4A90E2 → 74,144,226
+    mockSessionsResponse([
+      { id: 's1', agentId: 'gemini', seq: 0, status: 'active', messageCount: 2, createdAt: Date.now() },
+    ]);
+    renderPanel('thread-1');
+    await flushFetch();
+    const card = container.querySelector(
+      '[data-testid="session-card-active"][data-agent-id="gemini"]',
+    ) as HTMLElement | null;
+    expect(card).not.toBeNull();
+    expect(card!.style.boxShadow).toMatch(/rgba?\(74,\s*144,\s*226/);
+  });
+
+  it('applies dare colors from agent.color', async () => {
+    // dare primary #FFB300 → 255,179,0
+    mockSessionsResponse([
+      { id: 's1', agentId: 'dare', seq: 0, status: 'active', messageCount: 2, createdAt: Date.now() },
+    ]);
+    renderPanel('thread-1');
+    await flushFetch();
+    const card = container.querySelector(
+      '[data-testid="session-card-active"][data-agent-id="dare"]',
+    ) as HTMLElement | null;
+    expect(card).not.toBeNull();
+    expect(card!.style.boxShadow).toMatch(/rgba?\(255,\s*179,\s*0/);
+  });
+
+  it('applies gpt52 (code-reviewer variant) colors from agent.color', async () => {
+    // gpt52 primary #66BB6A → 102,187,106
+    mockSessionsResponse([
+      { id: 's1', agentId: 'gpt52', seq: 0, status: 'active', messageCount: 2, createdAt: Date.now() },
+    ]);
+    renderPanel('thread-1');
+    await flushFetch();
+    const card = container.querySelector(
+      '[data-testid="session-card-active"][data-agent-id="gpt52"]',
+    ) as HTMLElement | null;
+    expect(card).not.toBeNull();
+    expect(card!.style.boxShadow).toMatch(/rgba?\(102,\s*187,\s*106/);
+  });
+
+  it('applies opus-45 and sonnet (lead-architect variant) distinct colors from agent.color', async () => {
+    // opus-45 primary #7E57C2 → 126,87,194; sonnet primary #B39DDB → 179,157,219
+    mockSessionsResponse([
+      { id: 's1', agentId: 'opus-45', seq: 0, status: 'active', messageCount: 2, createdAt: Date.now() },
+      { id: 's2', agentId: 'sonnet', seq: 1, status: 'active', messageCount: 2, createdAt: Date.now() },
+    ]);
+    renderPanel('thread-1');
+    await flushFetch();
+    const opus45 = container.querySelector(
+      '[data-testid="session-card-active"][data-agent-id="opus-45"]',
+    ) as HTMLElement | null;
+    const sonnet = container.querySelector(
+      '[data-testid="session-card-active"][data-agent-id="sonnet"]',
+    ) as HTMLElement | null;
+    expect(opus45).not.toBeNull();
+    expect(sonnet).not.toBeNull();
+    expect(opus45!.style.boxShadow).toMatch(/rgba?\(126,\s*87,\s*194/);
+    expect(sonnet!.style.boxShadow).toMatch(/rgba?\(179,\s*157,\s*219/);
+  });
+
+  it('falls back to neutral gray when agent is missing from agent-config (badge background)', async () => {
+    // Fallback: primary #9CA3AF. F056: badge bg/text derived via OKLCH.
+    mockSessionsResponse([
+      { id: 's1', agentId: 'unknown-agent', seq: 0, status: 'active', messageCount: 1, createdAt: Date.now() },
+    ]);
+    renderPanel('thread-1');
+    await flushFetch();
+    const badge = container.querySelector(
+      '[data-testid="session-badge-active"][data-agent-id="unknown-agent"]',
+    ) as HTMLElement | null;
+    expect(badge).not.toBeNull();
+    expect(badge!.textContent).toContain('unknown-agent');
+    // F056: badge colors are oklch-derived from fallback #9CA3AF (secondary removed)
+    expect(badge!.style.backgroundColor).toMatch(/oklch\(/);
+    expect(badge!.style.color).toMatch(/oklch\(/);
+  });
+
+  it('discards stale response when slow thread-1 fetch resolves after thread-2 (P1 race condition)', async () => {
+    // Deferred promises to control resolution order
+    let resolveThread1!: (v: unknown) => void;
+    let resolveThread2!: (v: unknown) => void;
+
+    const thread1Promise = new Promise((r) => {
+      resolveThread1 = r;
+    });
+    const thread2Promise = new Promise((r) => {
+      resolveThread2 = r;
+    });
+
+    // First render: thread-1 (slow)
+    mockApiFetch.mockImplementation((...args: unknown[]) => {
+      const url = args[0] as string;
+      if (url.includes('thread-1')) return thread1Promise;
+      if (url.includes('thread-2')) return thread2Promise;
+      return Promise.resolve({ ok: false });
+    });
+
+    renderPanel('thread-1');
+    await flushFetch();
+
+    // Switch to thread-2 before thread-1 resolves
+    renderPanel('thread-2');
+    await flushFetch();
+
+    // thread-2 resolves first
+    resolveThread2({
+      ok: true,
+      json: async () => ({
+        sessions: [{ id: 's2', agentId: 'opus', seq: 5, status: 'active', messageCount: 3, createdAt: Date.now() }],
+      }),
+    });
+    await flushFetch();
+
+    expect(container.textContent).toContain('Session #6'); // seq 5 → display #6
+
+    // Now thread-1 (stale) resolves late
+    resolveThread1({
+      ok: true,
+      json: async () => ({
+        sessions: [{ id: 's1', agentId: 'opus', seq: 0, status: 'active', messageCount: 10, createdAt: Date.now() }],
+      }),
+    });
+    await flushFetch();
+
+    // Stale thread-1 data must NOT overwrite thread-2
+    expect(container.textContent).toContain('Session #6');
+    expect(container.textContent).not.toContain('Session #1');
+  });
+
+  describe('agent color rendering — driven by agent-config.json (no hardcoded table)', () => {
+    // Helper: extract numeric RGB triple from any inline color value.
+    function rgbTripleOf(value: string): [number, number, number] | null {
+      // Accepts "rgb(r, g, b)", "rgba(r, g, b, a)" — jsdom always serialises as rgb/rgba.
+      const m = value.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+      return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+    }
+
+    it('opus-47 active session uses agent.color.primary (#7B1FA2 → 123,31,162) for border, not gray fallback', async () => {
+      // opus-47 was missing from the legacy hardcoded AGENT_SESSION_COLORS table,
+      // so before the fix it fell through to the gray DEFAULT_SESSION_COLORS.
+      mockSessionsResponse([
+        { id: 's_47', agentId: 'opus-47', seq: 0, status: 'active', messageCount: 1, createdAt: Date.now() },
+      ]);
+      renderPanel('thread-1');
+      await flushFetch();
+      const card = container.querySelector(
+        '[data-testid="session-card-active"][data-agent-id="opus-47"]',
+      ) as HTMLElement | null;
+      expect(card).not.toBeNull();
+      const triple = rgbTripleOf(card!.style.boxShadow);
+      expect(triple).toEqual([123, 31, 162]);
+    });
+
+    it('opus-47 active session badge uses oklch-derived colors from agent.color.primary', async () => {
+      // F056: secondary removed — badge bg/text derived via OKLCH from primary
+      mockSessionsResponse([
+        { id: 's_47', agentId: 'opus-47', seq: 0, status: 'active', messageCount: 1, createdAt: Date.now() },
+      ]);
+      renderPanel('thread-1');
+      await flushFetch();
+      const badge = container.querySelector(
+        '[data-testid="session-badge-active"][data-agent-id="opus-47"]',
+      ) as HTMLElement | null;
+      expect(badge).not.toBeNull();
+      // F056: badge colors are oklch-derived from primary #7B1FA2 (secondary removed)
+      expect(badge!.style.backgroundColor).toMatch(/oklch\(/);
+      expect(badge!.style.color).toMatch(/oklch\(/);
+    });
+
+    it('sealed session for opus-47 also uses agent.color (parity with active card)', async () => {
+      mockSessionsResponse([
+        {
+          id: 'seal_47',
+          agentId: 'opus-47',
+          seq: 0,
+          status: 'sealed',
+          messageCount: 5,
+          createdAt: Date.now() - 60000,
+          sealedAt: Date.now(),
+        },
+      ]);
+      renderPanel('thread-1');
+      await flushFetch();
+      expandSealed();
+      const card = container.querySelector(
+        '[data-testid="session-card-sealed"][data-agent-id="opus-47"]',
+      ) as HTMLElement | null;
+      expect(card).not.toBeNull();
+      expect(rgbTripleOf(card!.style.boxShadow)).toEqual([123, 31, 162]);
+    });
+
+    it('falls back to neutral gray (#9CA3AF → 156,163,175) for unknown agentId', async () => {
+      mockSessionsResponse([
+        { id: 's_x', agentId: 'unknown-agent', seq: 0, status: 'active', messageCount: 1, createdAt: Date.now() },
+      ]);
+      renderPanel('thread-1');
+      await flushFetch();
+      const card = container.querySelector(
+        '[data-testid="session-card-active"][data-agent-id="unknown-agent"]',
+      ) as HTMLElement | null;
+      expect(card).not.toBeNull();
+      expect(rgbTripleOf(card!.style.boxShadow)).toEqual([156, 163, 175]);
+    });
+
+    it('does not emit any of the legacy hardcoded color tokens', async () => {
+      mockSessionsResponse([
+        { id: 's1', agentId: 'codex', seq: 0, status: 'active', messageCount: 1, createdAt: Date.now() },
+        { id: 's2', agentId: 'gemini', seq: 1, status: 'active', messageCount: 1, createdAt: Date.now() },
+        { id: 's3', agentId: 'opus-45', seq: 2, status: 'active', messageCount: 1, createdAt: Date.now() },
+        { id: 's4', agentId: 'gpt52', seq: 3, status: 'active', messageCount: 1, createdAt: Date.now() },
+      ]);
+      renderPanel('thread-1');
+      await flushFetch();
+      const html = container.innerHTML;
+      // Legacy semantic tokens
+      expect(html).not.toContain('border-codex-primary');
+      expect(html).not.toContain('bg-codex-light');
+      expect(html).not.toContain('text-codex-dark');
+      expect(html).not.toContain('border-gemini-primary');
+      expect(html).not.toContain('border-dare-primary');
+      expect(html).not.toContain('border-kimi-primary');
+      expect(html).not.toContain('border-opus-primary');
+      // Legacy arbitrary hex tokens for gpt52 / opus-45 / sonnet
+      expect(html).not.toContain('border-[#66BB6A66]');
+      expect(html).not.toContain('border-[#7E57C266]');
+      expect(html).not.toContain('border-[#B39DDB66]');
+      // Legacy gray fallback class
+      expect(html).not.toContain('border-studio/40');
+      expect(html).not.toContain('bg-studio-surface-elevated');
+    });
+  });
+
+  describe('F33: bind new external session', () => {
+    it('hides bind UI for default thread (system-owned, bind returns 403)', async () => {
+      mockSessionsResponse([
+        { id: 's1', agentId: 'opus', seq: 0, status: 'active', messageCount: 3, createdAt: Date.now() },
+      ]);
+      renderPanel('default');
+      await flushFetch();
+      // Neither the per-session "bind..." nor the "绑定外部 Session" should appear
+      expect(container.textContent).not.toContain('bind...');
+      expect(container.textContent).not.toContain('绑定外部 Session');
+    });
+
+    it('shows bind-new-session button even when no sessions exist', async () => {
+      mockSessionsResponse([]);
+      renderPanel('thread-1');
+      await flushFetch();
+      expect(container.textContent).toContain('绑定外部 Session');
+    });
+
+    it('shows bind-new-session button alongside active sessions', async () => {
+      mockSessionsResponse([
+        { id: 's1', agentId: 'opus', seq: 0, status: 'active', messageCount: 3, createdAt: Date.now() },
+      ]);
+      renderPanel('thread-1');
+      await flushFetch();
+      expect(container.textContent).toContain('Session #1');
+      expect(container.textContent).toContain('绑定外部 Session');
+    });
+
+    it('filters out agents that already have active sessions from dropdown', async () => {
+      mockSessionsResponse([
+        { id: 's1', agentId: 'opus', seq: 0, status: 'active', messageCount: 3, createdAt: Date.now() },
+      ]);
+      renderPanel('thread-1');
+      await flushFetch();
+
+      // Click to expand bind section
+      const bindBtn = Array.from(container.querySelectorAll('button')).find((btn) =>
+        btn.textContent?.includes('绑定外部 Session'),
+      );
+      expect(bindBtn).not.toBeUndefined();
+      act(() => {
+        bindBtn?.click();
+      });
+
+      // Should show codex (no active session) but not opus (has active session).
+      // Asserting on option value (agentId) instead of displayName so that other
+      // lead-architect-family variants (sonnet/opus-45/opus-47) don't accidentally match.
+      const select = container.querySelector('select');
+      expect(select).not.toBeNull();
+      const optionValues = Array.from(select!.querySelectorAll('option')).map((o) => (o as HTMLOptionElement).value);
+      expect(optionValues).toContain('codex');
+      expect(optionValues).not.toContain('opus');
+    });
+  });
+
+  describe('bind UI', () => {
+    it('renders bind button for active sessions', async () => {
+      mockSessionsResponse([
+        { id: 's1', agentId: 'opus', seq: 0, status: 'active', messageCount: 3, createdAt: Date.now() },
+      ]);
+      renderPanel('thread-1');
+      await flushFetch();
+      expect(container.textContent).toContain('bind...');
+    });
+
+    it('does not render bind button for sealed sessions', async () => {
+      mockSessionsResponse([
+        {
+          id: 's1',
+          agentId: 'opus',
+          seq: 0,
+          status: 'sealed',
+          messageCount: 10,
+          createdAt: Date.now(),
+          sealedAt: Date.now(),
+        },
+      ]);
+      renderPanel('thread-1');
+      await flushFetch();
+      expect(container.textContent).not.toContain('bind...');
+    });
+
+    it('shows input after clicking bind button', async () => {
+      mockSessionsResponse([
+        { id: 's1', agentId: 'opus', seq: 0, status: 'active', messageCount: 3, createdAt: Date.now() },
+      ]);
+      renderPanel('thread-1');
+      await flushFetch();
+
+      const bindBtn = Array.from(container.querySelectorAll('button')).find((btn) => btn.textContent === 'bind...');
+      expect(bindBtn).not.toBeUndefined();
+
+      act(() => {
+        bindBtn?.click();
+      });
+
+      const input = container.querySelector('input[placeholder="CLI session ID"]');
+      expect(input).not.toBeNull();
+    });
+
+    it('calls PATCH bind API on submit and re-fetches sessions', async () => {
+      mockSessionsResponse([
+        { id: 's1', agentId: 'opus', seq: 0, status: 'active', messageCount: 3, createdAt: Date.now() },
+      ]);
+      renderPanel('thread-1');
+      await flushFetch();
+
+      // Click bind button to open input
+      const bindBtn = Array.from(container.querySelectorAll('button')).find((btn) => btn.textContent === 'bind...');
+      act(() => {
+        bindBtn?.click();
+      });
+
+      // Type session ID
+      const input = container.querySelector('input[placeholder="CLI session ID"]') as HTMLInputElement;
+      act(() => {
+        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')!
+          .set!;
+        nativeInputValueSetter.call(input, 'ses_test_123');
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+
+      // Mock successful bind response
+      mockApiFetch.mockResolvedValue({ ok: true, json: async () => ({}) });
+
+      // Click bind submit button
+      const submitBtn = Array.from(container.querySelectorAll('button')).find((btn) => btn.textContent === 'bind');
+      act(() => {
+        submitBtn?.click();
+      });
+
+      await flushFetch();
+
+      // Verify PATCH was called with correct URL and body
+      const patchCall = mockApiFetch.mock.calls.find(
+        (call: unknown[]) => typeof call[0] === 'string' && (call[0] as string).includes('/bind'),
+      );
+      expect(patchCall).toBeDefined();
+      expect(patchCall?.[0]).toBe('/api/threads/thread-1/sessions/opus/bind');
+      expect(patchCall?.[1]).toMatchObject({
+        method: 'PATCH',
+        body: JSON.stringify({ cliSessionId: 'ses_test_123' }),
+      });
+    });
+
+    it('shows error status on failed bind', async () => {
+      mockSessionsResponse([
+        { id: 's1', agentId: 'opus', seq: 0, status: 'active', messageCount: 3, createdAt: Date.now() },
+      ]);
+      renderPanel('thread-1');
+      await flushFetch();
+
+      // Open bind input
+      const bindBtn = Array.from(container.querySelectorAll('button')).find((btn) => btn.textContent === 'bind...');
+      act(() => {
+        bindBtn?.click();
+      });
+
+      // Type value
+      const input = container.querySelector('input[placeholder="CLI session ID"]') as HTMLInputElement;
+      act(() => {
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')!.set!;
+        setter.call(input, 'bad_session');
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+
+      // Mock failed bind
+      mockApiFetch.mockResolvedValue({ ok: false, status: 404 });
+
+      const submitBtn = Array.from(container.querySelectorAll('button')).find((btn) => btn.textContent === 'bind');
+      act(() => {
+        submitBtn?.click();
+      });
+
+      await flushFetch();
+
+      expect(container.textContent).toContain('err');
+    });
+  });
+
+  describe('collapse toggle', () => {
+    it('active Session Chain: click header hides active cards, click again restores', async () => {
+      mockSessionsResponse([
+        { id: 's1', agentId: 'opus', seq: 0, status: 'active', messageCount: 5, createdAt: Date.now() },
+      ]);
+      renderPanel('thread-1');
+      await flushFetch();
+
+      // Default: expanded — active card visible
+      expect(container.querySelector('[data-testid="session-card-active"]')).not.toBeNull();
+      expect(container.textContent).toContain('Session #1');
+      // Header shows counts
+      expect(container.textContent).toContain('1 active');
+
+      // Click Session Chain header to collapse
+      const chainHeader = Array.from(container.querySelectorAll('button')).find((b) =>
+        b.textContent?.includes('Session Chain'),
+      );
+      expect(chainHeader).toBeTruthy();
+      act(() => {
+        chainHeader?.click();
+      });
+
+      // Collapsed: active card hidden, but header/count still visible
+      expect(container.querySelector('[data-testid="session-card-active"]')).toBeNull();
+      expect(container.textContent).toContain('1 active');
+      expect(container.textContent).toContain('Session Chain');
+
+      // Click again to expand
+      act(() => {
+        chainHeader?.click();
+      });
+
+      // Restored: active card visible again
+      expect(container.querySelector('[data-testid="session-card-active"]')).not.toBeNull();
+      expect(container.textContent).toContain('Session #1');
+    });
+
+    it('Sealed section: default collapsed, click expands, click collapses', async () => {
+      mockSessionsResponse([
+        {
+          id: 'seal1',
+          agentId: 'opus',
+          seq: 0,
+          status: 'sealed',
+          messageCount: 10,
+          createdAt: Date.now() - 60000,
+          sealedAt: Date.now(),
+          sealReason: 'compact',
+        },
+      ]);
+      renderPanel('thread-1');
+      await flushFetch();
+
+      // Default: collapsed — sealed card hidden, but toggle visible
+      expect(container.querySelector('[data-testid="session-card-sealed"]')).toBeNull();
+      expect(container.textContent).toContain('Sealed');
+
+      // Click to expand
+      expandSealed();
+
+      // Expanded: sealed card visible
+      expect(container.querySelector('[data-testid="session-card-sealed"]')).not.toBeNull();
+      expect(container.textContent).toContain('Session #1');
+      expect(container.textContent).toContain('compact');
+
+      // Click to collapse again
+      expandSealed(); // toggles back
+
+      // Collapsed again
+      expect(container.querySelector('[data-testid="session-card-sealed"]')).toBeNull();
+    });
+  });
+});

@@ -1,0 +1,3007 @@
+/**
+ * Callback API Routes — MCP 回传端点
+ * 安全: 每个请求都需要 invocationId + callbackToken 验证。
+ */
+
+import { createHash } from 'node:crypto';
+import type {
+  AgentId,
+  AgentRoutingError,
+  AutomationState,
+  RichBlock,
+  SuggestedCrossPostAction,
+} from '@agent-studio/shared';
+import {
+  agentRegistry,
+  createAgentId,
+  isTrackingKind,
+  normalizeRichBlock,
+  normalizeSopDefinitionId,
+  resolveWorkflowSopSkill,
+} from '@agent-studio/shared';
+import type { FastifyBaseLogger, FastifyPluginAsync } from 'fastify';
+import { z } from 'zod';
+import { resolveFrontendBaseUrl } from '../config/frontend-origin.js';
+import type { InvocationQueue } from '../domains/agents/services/agents/invocation/InvocationQueue.js';
+import type { InvocationRegistry } from '../domains/agents/services/agents/invocation/InvocationRegistry.js';
+import type { InvocationTracker } from '../domains/agents/services/agents/invocation/InvocationTracker.js';
+import { MessageDeliveryService } from '../domains/agents/services/agents/invocation/MessageDeliveryService.js';
+import { getRichBlockBuffer } from '../domains/agents/services/agents/invocation/RichBlockBuffer.js';
+import { stampVisibleTurn } from '../domains/agents/services/agents/invocation/visible-turn.js';
+import { extractImagePaths, extractImageUrls } from '../domains/agents/services/agents/providers/image-paths.js';
+import { analyzeA2AMentions } from '../domains/agents/services/agents/routing/a2a-mentions.js';
+import { resolveAgentTarget } from '../domains/agents/services/agents/routing/agent-target-resolver.js';
+import { extractRichFromText } from '../domains/agents/services/agents/routing/rich-block-extract.js';
+import { buildVoteNotification } from '../domains/agents/services/agents/routing/vote-intercept.js';
+import type { AgentRouter } from '../domains/agents/services/index.js';
+import type { EventAuditLog } from '../domains/agents/services/orchestration/EventAuditLog.js';
+import type { IRuntimeSessionStore } from '../domains/agents/services/runtime-session/RuntimeSessionStore.js';
+import type { IBacklogStore } from '../domains/agents/services/stores/ports/BacklogStore.js';
+import type { DeliveryCursorStore } from '../domains/agents/services/stores/ports/DeliveryCursorStore.js';
+import type { IInvocationRecordStore } from '../domains/agents/services/stores/ports/InvocationRecordStore.js';
+import {
+  hydrateReplyPreview,
+  type IMessageStore,
+  isDelivered,
+  type StoredMessage,
+} from '../domains/agents/services/stores/ports/MessageStore.js';
+import { type ITaskStore, isSubjectOwnershipConflictError } from '../domains/agents/services/stores/ports/TaskStore.js';
+import type { IThreadStore, VotingStateV1 } from '../domains/agents/services/stores/ports/ThreadStore.js';
+import {
+  canViewMessage,
+  isInternalNonQuotableParent,
+  isSystemUserMessage,
+  resolveVisibleReplyParent,
+  type Viewer,
+} from '../domains/agents/services/stores/visibility.js';
+import { getVoiceBlockSynthesizer } from '../domains/agents/services/tts/VoiceBlockSynthesizer.js';
+import type { IEvidenceStore, IMarkerQueue, IReflectionService } from '../domains/memory/interfaces.js';
+import { buildThreadDeepLink } from '../infrastructure/connectors/connector-command-helpers.js';
+import { createModuleLogger } from '../infrastructure/logger.js';
+import type { SocketManager } from '../infrastructure/websocket/index.js';
+import { scoreKeywordRelevance, tokenizeKeyword } from '../utils/keyword-relevance.js';
+import { getDefaultUploadDir } from '../utils/upload-paths.js';
+import { getFeatureTagId } from './backlog-doc-import.js';
+import { enqueueA2ATargets, triggerA2AInvocation } from './callback-a2a-trigger.js';
+import {
+  extractCallbackCredentials,
+  registerCallbackAuthHook,
+  requireCallbackAuth,
+  requireCallbackPrincipal,
+} from './callback-auth-prehandler.js';
+import { CallbackAuthSystemMessageNotifier } from './callback-auth-system-message.js';
+import { recordCallbackAuthFailure } from './callback-auth-telemetry.js';
+import { registerCallbackBootcampRoutes } from './callback-bootcamp-routes.js';
+import { registerCallbackDocumentRoutes } from './callback-document-routes.js';
+import { registerCallbackGameRoutes } from './callback-game-routes.js';
+import { registerCallbackGuideRoutes } from './callback-guide-routes.js';
+import { type HoldBallRouteDeps, registerCallbackHoldBallRoutes } from './callback-hold-ball-routes.js';
+import { registerCallbackLarkActionRoutes } from './callback-lark-action-routes.js';
+import { registerCallbackLimbRoutes } from './callback-limb-routes.js';
+import { registerCallbackMemoryRoutes } from './callback-memory-routes.js';
+import { getMultiMentionOrchestrator, registerMultiMentionRoutes } from './callback-multi-mention-routes.js';
+import { registerCallbackProposeProfileUpdateRoutes } from './callback-propose-profile-update-routes.js';
+import { registerCallbackProposeSessionHandoffRoutes } from './callback-propose-session-handoff-routes.js';
+import { registerCallbackProposeThreadRoutes } from './callback-propose-thread-routes.js';
+import { registerCallbackQuestRoutes } from './callback-quest-routes.js';
+import { registerCallbackRuntimeSessionRoutes } from './callback-runtime-session-routes.js';
+import {
+  deriveCallbackActor,
+  effectiveInvocationId,
+  resolvePrincipalThread,
+  resolveScopedThreadId,
+} from './callback-scope-helpers.js';
+import { registerCallbackTaskRoutes } from './callback-task-routes.js';
+import { registerCallbackThreadAgentsRoutes } from './callback-thread-agents-routes.js';
+import { registerCallbackWeComActionRoutes } from './callback-wecom-action-routes.js';
+import { registerCallbackWorkflowSopRoutes } from './callback-workflow-sop-routes.js';
+import { type FeatIndexEntry, readFeatIndexEntries } from './feat-index-doc-import.js';
+import { detectUserMention } from './user-mention.js';
+import { clearVoteTimer, closeVoteInternal, voteTimers } from './votes.js';
+
+const log = createModuleLogger('routes/callbacks');
+const CALLBACK_EXACT_DUPLICATE_WINDOW_MS = 5_000;
+
+/**
+ * F193 AC-A4 raw line-start @ detector.
+ * Mirrors authoritative server parser at a2a-mentions.ts:86-114
+ * (strip code fences, trimStart, strip markdown prefix, startsWith('@')).
+ *
+ * Used by AC-A4 fail-closed gate which MUST run BEFORE
+ * registry.claimClientMessageId (Codex review P1 round 2 close — otherwise
+ * malformed retries permanently consume idempotency keys).
+ *
+ * Local mirror (no cross-package dep) — server parser remains authoritative;
+ * this is just a raw caller-input signal: did the caller TRY to provide
+ * line-start @ routing? Disabled/unknown handles still fall through to the
+ * existing routing_warnings/allExplicitFailed path (Codex review P2 close).
+ */
+const LEADING_MARKDOWN_MENTION_PREFIX_RE_F193 = /^(?:(?:>\s*)|(?:[-*+]\s+)|(?:\d+[.)]\s+))+/;
+
+function hasPlausibleLineStartMention(content: string): boolean {
+  const stripped = content.replace(/```[\s\S]*?```/g, '');
+  for (const rawLine of stripped.split(/\r?\n/)) {
+    const leadingWs = rawLine.match(/^\s*/)?.[0].length ?? 0;
+    const normalized = rawLine.slice(leadingWs).replace(LEADING_MARKDOWN_MENTION_PREFIX_RE_F193, '');
+    if (normalized.startsWith('@') && normalized.length > 1) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function resolveSlashSeparatedOwnerAgentId(ownerWithoutAnnotations: string): AgentId | undefined {
+  const segments = ownerWithoutAnnotations
+    .split(/[/／]/)
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length > 0);
+  if (segments.length < 2) return undefined;
+
+  const firstResolved = resolveAgentTarget(segments[0]);
+  if (!('ok' in firstResolved)) return undefined;
+
+  const resolved = new Set<AgentId>();
+  const unresolved: string[] = [];
+  for (const segment of segments) {
+    const result = resolveAgentTarget(segment);
+    if ('ok' in result) {
+      resolved.add(result.ok);
+    } else {
+      unresolved.push(segment);
+    }
+  }
+
+  if (resolved.size !== 1) return undefined;
+  if (unresolved.some((segment) => /[@\u4E00-\u9FFF]/.test(segment))) return undefined;
+  return firstResolved.ok;
+}
+
+function resolveFeatureOwnerAgentId(owner: string | undefined): string | undefined {
+  if (!owner) return undefined;
+  const trimmed = owner.trim();
+  if (!trimmed) return undefined;
+  const ownerWithoutAnnotations = trimmed
+    .replace(/\s*[（(][^()（）]*[）)]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (/[+＋、，,；;]/.test(ownerWithoutAnnotations)) return undefined;
+  const slashSeparatedOwnerAgentId = resolveSlashSeparatedOwnerAgentId(ownerWithoutAnnotations);
+  if (slashSeparatedOwnerAgentId) return slashSeparatedOwnerAgentId;
+
+  const candidates = [
+    trimmed,
+    trimmed.match(/@[^\s,，、/+()（）]+/)?.[0],
+    ownerWithoutAnnotations,
+    ownerWithoutAnnotations.split(/\s+/)[0],
+  ].filter((value): value is string => Boolean(value && value.trim().length > 0));
+
+  for (const candidate of candidates) {
+    const resolved = resolveAgentTarget(candidate);
+    if ('ok' in resolved) return resolved.ok;
+  }
+  return undefined;
+}
+
+function buildFeatIndexQueryHaystack(item: FeatIndexEntry): string {
+  const ownerAgentId = resolveFeatureOwnerAgentId(item.owner);
+  return [item.featId, item.name, item.status, item.owner, ownerAgentId].filter(Boolean).join(' ').toLowerCase();
+}
+
+function buildFeatIndexSuggestedAction(
+  item: FeatIndexEntry,
+  threadId: string | undefined,
+  ownerAgentId: string | undefined,
+  currentThreadId: string | undefined,
+): SuggestedCrossPostAction | undefined {
+  const targetThreadId = threadId?.trim();
+  const current = currentThreadId?.trim();
+  const owner = ownerAgentId?.trim();
+  if (targetThreadId && current && targetThreadId === current) return undefined;
+  if (!targetThreadId && !owner) return undefined;
+  return {
+    type: 'cross_post',
+    ...(targetThreadId ? { threadId: targetThreadId } : {}),
+    featureId: item.featId,
+    ...(owner ? { ownerAgentId: owner, targetAgents: [owner] } : {}),
+    reason: targetThreadId
+      ? owner
+        ? `${item.featId} is owned by ${owner}; dispatch findings to the owning thread.`
+        : `${item.featId} has an owning thread; dispatch findings there if relevant.`
+      : `${item.featId} is owned by ${owner}; find the feature thread before dispatching findings.`,
+    source: 'feat_index',
+  };
+}
+
+function buildPostMessageRoutingMessage(
+  routedIds: string[],
+  warnings: AgentRoutingError[],
+  notEnqueuedIds: string[] = [],
+): string {
+  const parts: string[] = [];
+  if (routedIds.length > 0) parts.push(`消息已路由给 ${routedIds.map((id) => `@${id}`).join('、')}。`);
+  if (notEnqueuedIds.length > 0) {
+    parts.push(`${notEnqueuedIds.map((id) => `@${id}`).join('、')} 未新增唤醒（可能已有待处理队列或当前不可调度）。`);
+  }
+  for (const w of warnings) {
+    if (w.kind === 'agent_disabled') {
+      const alts = w.alternatives
+        .slice(0, 2)
+        .map((a) => a.mention)
+        .join('、');
+      parts.push(`@${w.agentId} 已停用，已跳过${alts ? `（可用替代：${alts}）` : ''}。`);
+    } else {
+      parts.push(`${w.mention} 不存在，已跳过。`);
+    }
+  }
+  return parts.length > 0 ? parts.join(' ') : '消息已存储。';
+}
+
+function buildRoutingOutcome(requestedIds: string[], enqueuedIds: readonly string[], enqueueAttempted: boolean) {
+  if (!enqueueAttempted) {
+    return { routed: [], notEnqueued: requestedIds };
+  }
+  const enqueuedSet = new Set(enqueuedIds);
+  return {
+    routed: [...enqueuedIds],
+    notEnqueued: requestedIds.filter((id) => !enqueuedSet.has(id)),
+  };
+}
+
+function sameStringArray(left: readonly string[] | undefined, right: readonly string[] | undefined): boolean {
+  const a = left ?? [];
+  const b = right ?? [];
+  if (a.length !== b.length) return false;
+  return a.every((value, index) => value === b[index]);
+}
+
+function richBlocksFingerprintPart(blocks: readonly RichBlock[] | undefined): string {
+  return blocks && blocks.length > 0 ? JSON.stringify(blocks) : '';
+}
+
+function sameRichBlocks(left: readonly RichBlock[] | undefined, right: readonly RichBlock[] | undefined): boolean {
+  return richBlocksFingerprintPart(left) === richBlocksFingerprintPart(right);
+}
+
+type CallbackDuplicateCandidateStore = IMessageStore & {
+  getByThreadIncludingQueued?: (
+    threadId: string,
+    limit?: number,
+    userId?: string,
+  ) => StoredMessage[] | Promise<StoredMessage[]>;
+};
+
+async function getRecentCallbackDuplicateCandidates(
+  messageStore: IMessageStore,
+  threadId: string,
+  userId: string,
+): Promise<StoredMessage[]> {
+  const store = messageStore as CallbackDuplicateCandidateStore;
+  if (typeof store.getByThreadIncludingQueued === 'function') {
+    return store.getByThreadIncludingQueued(threadId, 20, userId);
+  }
+  return messageStore.getByThread(threadId, 20, userId);
+}
+
+async function findRecentExactCallbackDuplicate(
+  messageStore: IMessageStore,
+  input: {
+    threadId: string;
+    userId: string;
+    agentId: string;
+    content: string;
+    richBlocks?: readonly RichBlock[] | undefined;
+    mentions: readonly AgentId[];
+    mentionsUser?: boolean | undefined;
+    replyTo?: string | undefined;
+    now: number;
+  },
+): Promise<StoredMessage | undefined> {
+  const recent = await getRecentCallbackDuplicateCandidates(messageStore, input.threadId, input.userId);
+  for (let i = recent.length - 1; i >= 0; i -= 1) {
+    const msg = recent[i]!;
+    const ts = msg.deliveredAt ?? msg.timestamp;
+    if (input.now - ts > CALLBACK_EXACT_DUPLICATE_WINDOW_MS) continue;
+    if (msg.origin !== 'callback') continue;
+    if (msg.agentId !== input.agentId) continue;
+    if (msg.content !== input.content) continue;
+    if (!sameRichBlocks(msg.extra?.rich?.blocks, input.richBlocks)) continue;
+    if ((msg.replyTo ?? undefined) !== (input.replyTo ?? undefined)) continue;
+    if (Boolean(msg.mentionsUser) !== Boolean(input.mentionsUser)) continue;
+    if (!sameStringArray(msg.mentions, input.mentions)) continue;
+    return msg;
+  }
+  return undefined;
+}
+
+/**
+ * Stable fingerprint over the exact dimensions findRecentExactCallbackDuplicate compares
+ * (thread/user/agent/content/richBlocks/replyTo/mentionsUser/mentions). Used as the key for the atomic
+ * content-dedup claim that closes the check-then-act race in the duplicate scan. Hashed so
+ * the key stays bounded regardless of message length.
+ */
+function buildCallbackContentDedupFingerprint(input: {
+  threadId: string;
+  userId: string;
+  agentId: string;
+  content: string;
+  richBlocks?: readonly RichBlock[] | undefined;
+  mentions: readonly AgentId[];
+  mentionsUser?: boolean | undefined;
+  replyTo?: string | undefined;
+}): string {
+  const parts = [
+    input.threadId,
+    input.userId,
+    input.agentId,
+    input.replyTo ?? '',
+    input.mentionsUser ? '1' : '0',
+    [...input.mentions].join(','),
+    input.content,
+    richBlocksFingerprintPart(input.richBlocks),
+  ].join('\u0000');
+  return createHash('sha256').update(parts).digest('hex');
+}
+
+type CallbackDuplicateResponse = {
+  status: 'duplicate';
+  threadId: string;
+  messageId?: string;
+  replyTo?: string;
+  clientMessageId?: string;
+};
+
+/**
+ * Atomic content-dedup gate shared by the invocation-auth and agent-key post-message paths.
+ * findRecentExactCallbackDuplicate is check-then-act (read recent → append later), so two
+ * concurrent byte-identical deliveries can both pass it before either appends. This claims the
+ * content fingerprint atomically: the winner gets null (proceed to append); a loser (or any
+ * recent identical post within the window) gets a 'duplicate' response without a second append —
+ * closing the byte-identical duplicate-message race. Returns null when routing warnings are
+ * present, matching the existing scan's gate.
+ */
+async function claimCallbackContentOrDuplicate(
+  messageStore: IMessageStore,
+  input: {
+    threadId: string;
+    userId: string;
+    agentId: string;
+    content: string;
+    richBlocks?: readonly RichBlock[] | undefined;
+    mentions: readonly AgentId[];
+    mentionsUser?: boolean | undefined;
+    replyTo?: string | undefined;
+    clientMessageId?: string | undefined;
+    now: number;
+    hasRoutingWarnings: boolean;
+  },
+): Promise<CallbackDuplicateResponse | null> {
+  if (input.hasRoutingWarnings) return null;
+  const fingerprint = buildCallbackContentDedupFingerprint({
+    threadId: input.threadId,
+    userId: input.userId,
+    agentId: input.agentId,
+    content: input.content,
+    ...(input.richBlocks && input.richBlocks.length > 0 ? { richBlocks: input.richBlocks } : {}),
+    mentions: input.mentions,
+    ...(input.mentionsUser ? { mentionsUser: input.mentionsUser } : {}),
+    ...(input.replyTo ? { replyTo: input.replyTo } : {}),
+  });
+  const claimed = await messageStore.claimContentDedupKey(fingerprint, CALLBACK_EXACT_DUPLICATE_WINDOW_MS);
+  if (claimed) return null;
+  const raced = await findRecentExactCallbackDuplicate(messageStore, {
+    threadId: input.threadId,
+    userId: input.userId,
+    agentId: input.agentId,
+    content: input.content,
+    ...(input.richBlocks && input.richBlocks.length > 0 ? { richBlocks: input.richBlocks } : {}),
+    mentions: input.mentions,
+    ...(input.mentionsUser ? { mentionsUser: input.mentionsUser } : {}),
+    ...(input.replyTo ? { replyTo: input.replyTo } : {}),
+    now: input.now,
+  });
+  return {
+    status: 'duplicate',
+    threadId: input.threadId,
+    ...(raced ? { messageId: raced.id } : {}),
+    ...(input.replyTo ? { replyTo: input.replyTo } : {}),
+    ...(input.clientMessageId ? { clientMessageId: input.clientMessageId } : {}),
+  };
+}
+
+function hasQueuedA2AEntryForMessage(
+  invocationQueue: InvocationQueue | undefined,
+  threadId: string,
+  messageId: string,
+): boolean {
+  return invocationQueue?.hasEntryWithMessageId(threadId, messageId) ?? false;
+}
+
+async function recoverQueuedDuplicateCallbackMessage(input: {
+  duplicateMsg: StoredMessage;
+  willEnqueueToQueue: boolean;
+  invocationQueue?: InvocationQueue;
+  threadId: string;
+  log: Pick<FastifyBaseLogger, 'error' | 'warn'>;
+  enqueueA2A: () => Promise<{ enqueued: readonly AgentId[] }>;
+  markDelivered?: (deliveredAt: number) => Promise<unknown> | unknown;
+  zeroEnqueuedWarnMessage: string;
+  enqueueFailureMessage: string;
+  broadcastNow: () => Promise<void> | void;
+}): Promise<void> {
+  if (input.duplicateMsg.deliveryStatus !== 'queued') return;
+  if (!input.willEnqueueToQueue) return;
+  if (hasQueuedA2AEntryForMessage(input.invocationQueue, input.threadId, input.duplicateMsg.id)) return;
+
+  const deliveryDecision = await MessageDeliveryService.resolveCallbackDeliveryDecision({
+    canEnqueueA2A: true,
+    willEnqueueToQueue: input.willEnqueueToQueue,
+    messageId: input.duplicateMsg.id,
+    threadId: input.threadId,
+    log: input.log,
+    enqueueA2A: input.enqueueA2A,
+    markDelivered: input.markDelivered,
+    zeroEnqueuedWarnMessage: input.zeroEnqueuedWarnMessage,
+    enqueueFailureMessage: input.enqueueFailureMessage,
+  });
+
+  if (
+    deliveryDecision.shouldBroadcastNow &&
+    !hasQueuedA2AEntryForMessage(input.invocationQueue, input.threadId, input.duplicateMsg.id)
+  ) {
+    await input.broadcastNow();
+  }
+}
+
+export interface CallbackRoutesOptions {
+  registry: InvocationRegistry;
+  agentKeyRegistry?: import('../domains/agents/services/agents/agent-key/AgentKeyRegistry.js').AgentKeyRegistry;
+  messageStore: IMessageStore;
+  socketManager: SocketManager;
+  /** F174 D2b-1: in-context surface for callback auth failures (optional — back-compat). */
+  callbackAuthNotifier?: CallbackAuthSystemMessageNotifier;
+  /** F155 review fix: allow tests to inject a failing guide flow loader. */
+  loadGuideFlow?: (guideId: string) => unknown;
+  /** F155 review fix: allow tests to inject guide availability prerequisites. */
+  getGuideAvailabilityContext?: (
+    threadId: string,
+  ) => Promise<{ memberCardCount: number }> | { memberCardCount: number };
+  taskStore?: ITaskStore;
+  backlogStore?: IBacklogStore;
+  /** For thinking mode filtering in thread-context + thread-agents discovery */
+  threadStore?: IThreadStore;
+  /** F211 Phase B: external IDE-direct runtime session registration. */
+  sessionChainStore?: import('../domains/agents/services/stores/ports/SessionChainStore.js').ISessionChainStore;
+  runtimeSessionStore?: IRuntimeSessionStore;
+  eventAuditLog?: Pick<EventAuditLog, 'append'>;
+  /** F128: agent-side thread proposals (propose endpoint) */
+  proposalStore?: import('../domains/agents/services/stores/ports/ProposalStore.js').IProposalStore;
+  /** F225: agent-initiated session handoff proposals (propose endpoint) */
+  handoffProposalStore?: import('../domains/agents/services/stores/ports/SessionHandoffProposalStore.js').ISessionHandoffProposalStore;
+  /** F231 Phase C: agent-side profile-update proposals (propose endpoint) */
+  profileUpdateProposalStore?: import('../domains/agents/services/stores/ports/ProfileUpdateProposalStore.js').IProfileUpdateProposalStore;
+  /** F231 Phase C: profile data dir — propose route reads the current primer to pin beforeContent/baseContentHash */
+  profileDir?: string;
+  /** F155 B-4: Independent guide session store */
+  guideSessionStore?: import('../domains/guides/GuideSessionRepository.js').IGuideSessionStore;
+  /** AgentRegistry for thread-agents MCP callback */
+  agentRegistry?: { getAllEntries(): Map<string, unknown> };
+  /** For post_message @mention → invocation triggering */
+  router?: AgentRouter;
+  invocationRecordStore?: IInvocationRecordStore;
+  invocationTracker?: InvocationTracker;
+  /** For mention ack cursor tracking (#77) */
+  deliveryCursorStore?: DeliveryCursorStore;
+  /** Phase D: validates GitHub repo exists before PR tracking registration */
+  validateRepo?: (repoFullName: string) => Promise<boolean>;
+  /** Read-only GitHub permission lookup for callback tools. Must not expose tokens. */
+  getGitHubPermission?: (repoFullName: string) => Promise<{
+    repoFullName: string;
+    accessible: boolean;
+    viewerPermission: string | null;
+    login?: string;
+    url?: string;
+    source: string;
+    error?: string;
+  }>;
+  /** F202 Phase 2 follow-up: validates specific PR exists (number-level validation) */
+  validatePr?: (repoFullName: string, prNumber: number) => Promise<boolean>;
+  /** F202 Phase 2 follow-up: validates specific issue exists (number-level validation) */
+  validateIssue?: (repoFullName: string, issueNumber: number) => Promise<boolean>;
+  /** F202 Phase 2 PR tracking: seeds review/CI boundaries so registration starts from current GitHub state. */
+  fetchPrTrackingBoundary?: (repoFullName: string, prNumber: number) => Promise<Pick<AutomationState, 'review' | 'ci'>>;
+  /** F202-2D: seeds issue tracking from the current highest issue comment ID. */
+  fetchIssueCommentCursor?: (repoFullName: string, issueNumber: number) => Promise<number>;
+  /** F043 P1: feat_index provider override for tests */
+  featIndexProvider?: () => Promise<FeatIndexEntry[]>;
+  /** F073 P1: workflow SOP store for bulletin board */
+  workflowSopStore?: import('../domains/agents/services/stores/ports/WorkflowSopStore.js').IWorkflowSopStore;
+  /** F102: DI memory services — SQLite-backed evidence store */
+  evidenceStore: IEvidenceStore;
+  markerQueue: IMarkerQueue;
+  reflectionService: IReflectionService;
+  holdBallDeps?: HoldBallRouteDeps;
+  /** Queue auto-dequeue on A2A invocation completion */
+  queueProcessor?: {
+    onInvocationComplete(
+      threadId: string,
+      agentId: string,
+      status: 'succeeded' | 'failed' | 'canceled' | 'canceled_by_user',
+    ): Promise<void>;
+    tryAutoExecute(threadId: string): Promise<void>;
+    registerEntryCompleteHook(
+      entryId: string,
+      hook: (
+        entryId: string,
+        status: 'succeeded' | 'failed' | 'canceled' | 'canceled_by_user',
+        responseText: string,
+      ) => void,
+    ): void;
+    unregisterEntryCompleteHook(entryId: string): void;
+  };
+  /** F122B: InvocationQueue for agent-sourced A2A entries */
+  invocationQueue?: import('../domains/agents/services/agents/invocation/InvocationQueue.js').InvocationQueue;
+  /** F126: Limb node registry for device/hardware capability management */
+  limbRegistry?: import('../domains/limb/LimbRegistry.js').LimbRegistry;
+  /** F126 Phase C: Limb pairing store for remote device approval */
+  limbPairingStore?: import('../domains/limb/LimbPairingStore.js').LimbPairingStore;
+  /** F187 Phase C: Label store for list-labels callback. */
+  labelStore?: import('../domains/agents/services/stores/ports/ThreadStore.js').ILabelStore;
+  /** F088: Outbound delivery hook for connector-bound threads (late-bound after gateway bootstrap). */
+  outboundHook?: {
+    deliver(
+      threadId: string,
+      content: string,
+      agentId?: string,
+      richBlocks?: RichBlock[],
+      threadMeta?: { threadShortId: string; threadTitle?: string; deepLinkUrl?: string },
+      origin?: 'callback' | 'agent' | 'system',
+      triggerMessageId?: string,
+    ): Promise<void>;
+  };
+}
+
+const postMessageSchema = z.object({
+  content: z.string().min(1).max(50000),
+  threadId: z.string().min(1).optional(),
+  replyTo: z.string().optional(),
+  clientMessageId: z.string().min(1).max(200).optional(),
+  targetAgents: z.array(z.string().min(1)).optional(),
+});
+
+const threadContextQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+  threadId: z.string().min(1).optional(), // F-Swarm-6: optional cross-thread read
+  messageId: z.string().min(1).optional(),
+  before: z.coerce.number().int().min(0).max(50).optional(),
+  after: z.coerce.number().int().min(0).max(50).optional(),
+  agentId: z.string().min(1).optional(),
+  keyword: z.string().min(1).optional(),
+});
+
+const listThreadsQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+  activeSince: z.coerce.number().int().min(0).optional(),
+  keyword: z.string().trim().min(1).max(200).optional(),
+});
+
+const listLabelsQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(50).optional(),
+});
+
+const featIndexQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+  featId: z.string().min(1).optional(),
+  query: z.string().min(1).optional(),
+});
+
+const pendingMentionsQuerySchema = z.object({
+  // Accept both scalar and repeated query params (Fastify may surface string[]).
+  includeAcked: z.union([z.string(), z.array(z.string())]).optional(),
+});
+
+const ackMentionsSchema = z.object({
+  upToMessageId: z.string().min(1),
+});
+
+/** F22: Rich block creation schema — validates shape + kind-specific fields (cloud Codex P1) */
+const richChecklistItemSchema = z.object({ id: z.string(), text: z.string(), checked: z.boolean().optional() });
+const richMediaItemSchema = z.object({ url: z.string(), alt: z.string().optional(), caption: z.string().optional() });
+const richBlockSchema = z.discriminatedUnion('kind', [
+  z.object({
+    id: z.string().min(1),
+    kind: z.literal('card'),
+    v: z.literal(1),
+    title: z.string(),
+    bodyMarkdown: z.string().optional(),
+    tone: z.enum(['info', 'success', 'warning', 'danger']).optional(),
+    fields: z.array(z.object({ label: z.string(), value: z.string() })).optional(),
+  }),
+  z.object({
+    id: z.string().min(1),
+    kind: z.literal('diff'),
+    v: z.literal(1),
+    filePath: z.string(),
+    diff: z.string(),
+    languageHint: z.string().optional(),
+  }),
+  z.object({
+    id: z.string().min(1),
+    kind: z.literal('checklist'),
+    v: z.literal(1),
+    title: z.string().optional(),
+    items: z.array(richChecklistItemSchema).min(1),
+  }),
+  z.object({
+    id: z.string().min(1),
+    kind: z.literal('media_gallery'),
+    v: z.literal(1),
+    title: z.string().optional(),
+    items: z.array(richMediaItemSchema).min(1),
+  }),
+  z.object({
+    id: z.string().min(1),
+    kind: z.literal('audio'),
+    v: z.literal(1),
+    url: z.string().optional().default(''),
+    text: z.string().optional(),
+    title: z.string().optional(),
+    durationSec: z.number().optional(),
+    mimeType: z.string().optional(),
+  }),
+  z.object({
+    id: z.string().min(1),
+    kind: z.literal('interactive'),
+    v: z.literal(1),
+    interactiveType: z.enum(['select', 'multi-select', 'card-grid', 'confirm']),
+    title: z.string().optional(),
+    description: z.string().optional(),
+    options: z
+      .array(
+        z.object({
+          id: z.string().min(1),
+          label: z.string().min(1),
+          emoji: z.string().optional(),
+          icon: z.string().optional(),
+          description: z.string().optional(),
+          level: z.number().optional(),
+          group: z.string().optional(),
+          customInput: z.boolean().optional(),
+          customInputPlaceholder: z.string().optional(),
+          action: z
+            .object({
+              type: z.literal('callback'),
+              endpoint: z.string().min(1),
+              payload: z.record(z.unknown()).optional(),
+            })
+            .optional(),
+        }),
+      )
+      .min(1),
+    maxSelect: z.number().int().min(1).optional(),
+    allowRandom: z.boolean().optional(),
+    messageTemplate: z.string().optional(),
+    disabled: z.boolean().optional(),
+    selectedIds: z.array(z.string()).optional(),
+    groupId: z.string().min(1).optional(),
+  }),
+  // F088 Phase J: file attachment block
+  z.object({
+    id: z.string().min(1),
+    kind: z.literal('file'),
+    v: z.literal(1),
+    url: z
+      .string()
+      .min(1)
+      .refine(
+        (u) => !u.includes('..') && (/^\/uploads\//.test(u) || /^\/api\//.test(u) || /^https:\/\//.test(u)),
+        'file url must start with /uploads/, /api/, or https://',
+      ),
+    fileName: z.string().min(1),
+    mimeType: z.string().optional(),
+    fileSize: z.number().int().min(0).optional(),
+  }),
+  // F120 Phase C: html_widget — inline sandboxed HTML/JS visualization
+  z.object({
+    id: z.string().min(1),
+    kind: z.literal('html_widget'),
+    v: z.literal(1),
+    html: z.string().min(1).max(500_000),
+    title: z.string().optional(),
+    height: z.number().int().min(50).max(2000).optional(),
+  }),
+]);
+const createRichBlockSchema = z.object({
+  block: richBlockSchema,
+});
+
+function normalizeFeatId(value: string): string {
+  return value.trim().toUpperCase();
+}
+
+async function buildThreadIdsByFeatId(
+  threadStore: IThreadStore | undefined,
+  backlogStore: IBacklogStore | undefined,
+  userId: string,
+  logger: { warn: (obj: unknown, msg?: string) => void },
+): Promise<Map<string, string[]>> {
+  const mapped = new Map<string, string[]>();
+  if (!threadStore || !backlogStore) return mapped;
+
+  try {
+    const threads = await threadStore.list(userId);
+    for (const thread of threads) {
+      if (!thread.backlogItemId) continue;
+      const backlogItem = await backlogStore.get(thread.backlogItemId, userId);
+      if (!backlogItem) continue;
+      const featureTagId = getFeatureTagId(backlogItem.tags);
+      if (!featureTagId) continue;
+      const featId = normalizeFeatId(featureTagId);
+      if (featId.length === 0) continue;
+      const existing = mapped.get(featId);
+      if (!existing) {
+        mapped.set(featId, [thread.id]);
+        continue;
+      }
+      if (!existing.includes(thread.id)) existing.push(thread.id);
+    }
+  } catch (err) {
+    logger.warn({ err, userId }, '[callbacks/feat-index] threadIds enrichment degraded');
+  }
+
+  return mapped;
+}
+
+function canUnregisterTrackingTask(
+  task: { readonly userId?: string; readonly threadId: string },
+  record: { readonly userId?: string; readonly threadId?: string },
+): boolean {
+  if (task.userId) {
+    return Boolean(record.userId && task.userId === record.userId);
+  }
+  return Boolean(record.threadId && task.threadId === record.threadId);
+}
+
+export const callbacksRoutes: FastifyPluginAsync<CallbackRoutesOptions> = async (app, opts) => {
+  const {
+    registry,
+    agentKeyRegistry,
+    messageStore,
+    socketManager,
+    callbackAuthNotifier,
+    taskStore,
+    backlogStore,
+    threadStore,
+    router,
+    invocationRecordStore,
+    invocationTracker,
+    deliveryCursorStore,
+    validateRepo,
+    getGitHubPermission,
+    validatePr,
+    validateIssue,
+    fetchPrTrackingBoundary,
+    fetchIssueCommentCursor,
+    featIndexProvider,
+    queueProcessor,
+  } = opts;
+
+  registerCallbackAuthHook(app, registry, {
+    ...(callbackAuthNotifier ? { notifier: callbackAuthNotifier } : {}),
+    ...(agentKeyRegistry ? { agentKeyRegistry } : {}),
+  });
+  if (threadStore && opts.sessionChainStore && opts.runtimeSessionStore) {
+    registerCallbackRuntimeSessionRoutes(app, {
+      threadStore,
+      sessionChainStore: opts.sessionChainStore,
+      runtimeSessionStore: opts.runtimeSessionStore,
+      ...(opts.eventAuditLog ? { eventAuditLog: opts.eventAuditLog } : {}),
+    });
+  }
+
+  app.post('/api/callbacks/post-message', async (request, reply) => {
+    const principal = requireCallbackPrincipal(request, reply);
+    if (!principal) return;
+
+    if (principal.kind === 'agent_key') {
+      const parsed = postMessageSchema.safeParse(request.body);
+      if (!parsed.success) {
+        reply.status(400);
+        return { error: 'Invalid request body', details: parsed.error.issues };
+      }
+      const threadResult = await resolvePrincipalThread(principal, parsed.data.threadId, { threadStore });
+      if (!threadResult.ok) {
+        reply.status(threadResult.statusCode);
+        return { error: threadResult.error };
+      }
+      const effectiveThreadId = threadResult.threadId;
+      const { content, replyTo, clientMessageId, targetAgents: explicitTargetAgents } = parsed.data;
+
+      if (clientMessageId && agentKeyRegistry) {
+        const isFirst = await agentKeyRegistry.claimClientMessageId(principal.agentKeyId, clientMessageId);
+        if (!isFirst) {
+          return { status: 'duplicate', replyTo, clientMessageId };
+        }
+      }
+
+      const { cleanText: storedContent, blocks: extractedBlocks } = extractRichFromText(content);
+      let richBlocks = extractedBlocks;
+      const synthesizer = getVoiceBlockSynthesizer();
+      if (synthesizer && richBlocks.some((b) => b.kind === 'audio' && 'text' in b)) {
+        try {
+          richBlocks = await synthesizer.resolveVoiceBlocks(richBlocks, principal.agentId);
+        } catch (err) {
+          app.log.error({ err }, '[agent-key/post-message] Voice block synthesis failed');
+        }
+      }
+
+      const senderAgentId = createAgentId(principal.agentId);
+      // F182 AC-C1: use analyzeA2AMentions (captures routing_warnings for disabled agents)
+      const contentAnalysis = analyzeA2AMentions(storedContent, senderAgentId);
+      const contentTargets = contentAnalysis.mentions;
+      const validExplicitTargets: AgentId[] = [];
+      const routing_warnings: AgentRoutingError[] = [...contentAnalysis.routing_warnings];
+      for (const id of explicitTargetAgents ?? []) {
+        const resolved = resolveAgentTarget(id);
+        if ('ok' in resolved) {
+          validExplicitTargets.push(createAgentId(resolved.ok));
+        } else {
+          routing_warnings.push(resolved.error);
+        }
+      }
+      const mergedTargets = new Set<AgentId>([...contentTargets, ...validExplicitTargets]);
+      if (contentTargets.length === 1 && mergedTargets.size > 1) {
+        const [primaryTarget] = contentTargets;
+        if (primaryTarget) {
+          mergedTargets.clear();
+          mergedTargets.add(primaryTarget);
+        }
+      }
+      const mentions: AgentId[] = [...mergedTargets];
+      const mentionsUser = detectUserMention(storedContent);
+
+      let validatedReplyTo: string | undefined;
+      if (replyTo) {
+        // #699: atomic fetch + visibility gate — callback replies are always public.
+        const senderViewer: Viewer = { type: 'agent', agentId: createAgentId(principal.agentId) };
+        const parent = await resolveVisibleReplyParent(messageStore, replyTo, {
+          threadId: effectiveThreadId,
+          viewer: senderViewer,
+          publicReply: true,
+        });
+        if (parent) validatedReplyTo = replyTo;
+      }
+
+      const richExtra = richBlocks.length > 0 ? { rich: { v: 1 as const, blocks: richBlocks } } : {};
+      const targetAgentsExtra = validExplicitTargets.length ? { targetAgents: validExplicitTargets } : {};
+      // #814: Mark as explicit post_message so frontend TD112 dedup does not
+      // merge this into the agent's CLI stream bubble.
+      const extraParts = { isExplicitPost: true as const, ...richExtra, ...targetAgentsExtra };
+      const extra = Object.keys(extraParts).length > 0 ? extraParts : undefined;
+
+      const hasA2AMentions = !!(mentions.length > 0 && router && invocationRecordStore && effectiveThreadId);
+      const willEnqueueToQueue = !!(hasA2AMentions && opts.invocationQueue);
+      const now = Date.now();
+      const duplicateMsg =
+        routing_warnings.length === 0
+          ? await findRecentExactCallbackDuplicate(messageStore, {
+              threadId: effectiveThreadId,
+              userId: principal.userId,
+              agentId: principal.agentId,
+              content: storedContent,
+              ...(richBlocks.length > 0 ? { richBlocks } : {}),
+              mentions,
+              ...(mentionsUser ? { mentionsUser } : {}),
+              ...(validatedReplyTo ? { replyTo: validatedReplyTo } : {}),
+              now,
+            })
+          : undefined;
+      if (duplicateMsg) {
+        await recoverQueuedDuplicateCallbackMessage({
+          duplicateMsg,
+          willEnqueueToQueue,
+          ...(opts.invocationQueue ? { invocationQueue: opts.invocationQueue } : {}),
+          threadId: effectiveThreadId,
+          log: app.log,
+          enqueueA2A: () =>
+            enqueueA2ATargets(
+              {
+                router: router!,
+                invocationRecordStore: invocationRecordStore!,
+                socketManager,
+                messageStore,
+                ...(invocationTracker ? { invocationTracker } : {}),
+                ...(deliveryCursorStore ? { deliveryCursorStore } : {}),
+                ...(queueProcessor ? { queueProcessor } : {}),
+                ...(opts.invocationQueue ? { invocationQueue: opts.invocationQueue } : {}),
+                log: app.log,
+              },
+              {
+                targetAgents: mentions,
+                content: storedContent,
+                userId: principal.userId,
+                threadId: effectiveThreadId,
+                triggerMessage: duplicateMsg,
+                callerAgentId: senderAgentId,
+              },
+            ),
+          markDelivered: (deliveredAt) => messageStore.markDelivered?.(duplicateMsg.id, deliveredAt),
+          zeroEnqueuedWarnMessage: '[agent-key/post-message] queued duplicate had no A2A entry — broadcasting anyway',
+          enqueueFailureMessage: '[agent-key/post-message] queued duplicate recovery failed — broadcasting anyway',
+          broadcastNow: async () => {
+            const replyPreview = validatedReplyTo
+              ? await hydrateReplyPreview(messageStore, validatedReplyTo)
+              : undefined;
+            socketManager.broadcastAgentMessage(
+              {
+                type: 'text',
+                agentId: principal.agentId,
+                content: duplicateMsg.content,
+                origin: 'callback',
+                messageId: duplicateMsg.id,
+                invocationId: duplicateMsg.id,
+                // #814: Always include isExplicitPost in broadcast so frontend TD112 dedup skips merge
+                extra: {
+                  isExplicitPost: true,
+                  ...(validExplicitTargets.length ? { targetAgents: validExplicitTargets } : {}),
+                },
+                ...(duplicateMsg.mentionsUser ? { mentionsUser: true } : {}),
+                ...(validatedReplyTo ? { replyTo: validatedReplyTo } : {}),
+                ...(replyPreview ? { replyPreview } : {}),
+                timestamp: Date.now(),
+              },
+              effectiveThreadId,
+            );
+          },
+        });
+        return {
+          status: 'duplicate',
+          threadId: effectiveThreadId,
+          messageId: duplicateMsg.id,
+          ...(validatedReplyTo ? { replyTo: validatedReplyTo } : {}),
+          ...(clientMessageId ? { clientMessageId } : {}),
+        };
+      }
+
+      // Race-safe backstop (agent-key path, e.g. shared Antigravity MCP): the exact-duplicate scan
+      // above is check-then-act, so an atomic content claim makes the at-most-once decision.
+      const agentKeyContentDuplicate = await claimCallbackContentOrDuplicate(messageStore, {
+        threadId: effectiveThreadId,
+        userId: principal.userId,
+        agentId: principal.agentId,
+        content: storedContent,
+        ...(richBlocks.length > 0 ? { richBlocks } : {}),
+        mentions,
+        ...(mentionsUser ? { mentionsUser } : {}),
+        ...(validatedReplyTo ? { replyTo: validatedReplyTo } : {}),
+        ...(clientMessageId ? { clientMessageId } : {}),
+        now,
+        hasRoutingWarnings: routing_warnings.length > 0,
+      });
+      if (agentKeyContentDuplicate) return agentKeyContentDuplicate;
+
+      const storedMsg = await messageStore.append({
+        threadId: effectiveThreadId,
+        userId: principal.userId,
+        agentId: principal.agentId,
+        content: storedContent,
+        mentions,
+        ...(mentionsUser ? { mentionsUser } : {}),
+        origin: 'callback',
+        timestamp: now,
+        ...(extra ? { extra } : {}),
+        ...(validatedReplyTo ? { replyTo: validatedReplyTo } : {}),
+        ...(willEnqueueToQueue ? { deliveryStatus: 'queued' as const } : {}),
+      });
+
+      const replyPreview = validatedReplyTo ? await hydrateReplyPreview(messageStore, validatedReplyTo) : undefined;
+
+      const deliveryDecision = await MessageDeliveryService.resolveCallbackDeliveryDecision({
+        canEnqueueA2A: hasA2AMentions,
+        willEnqueueToQueue,
+        messageId: storedMsg.id,
+        threadId: effectiveThreadId,
+        log: app.log,
+        enqueueA2A: () =>
+          enqueueA2ATargets(
+            {
+              router: router!,
+              invocationRecordStore: invocationRecordStore!,
+              socketManager,
+              messageStore,
+              ...(invocationTracker ? { invocationTracker } : {}),
+              ...(deliveryCursorStore ? { deliveryCursorStore } : {}),
+              ...(queueProcessor ? { queueProcessor } : {}),
+              ...(opts.invocationQueue ? { invocationQueue: opts.invocationQueue } : {}),
+              log: app.log,
+            },
+            {
+              targetAgents: mentions,
+              content: storedContent,
+              userId: principal.userId,
+              threadId: effectiveThreadId,
+              triggerMessage: storedMsg,
+              callerAgentId: senderAgentId,
+            },
+          ),
+        markDelivered: (deliveredAt) => messageStore.markDelivered?.(storedMsg.id, deliveredAt),
+        zeroEnqueuedWarnMessage: '[agent-key/post-message] Failed to recover ghost message — broadcasting anyway',
+        enqueueFailureMessage: '[agent-key/post-message] enqueueA2ATargets failed — falling back to broadcast',
+      });
+
+      // #607: Only broadcast when message is not queued — queued messages are
+      // broadcast later via messages_delivered when QueueProcessor delivers them.
+      if (deliveryDecision.shouldBroadcastNow) {
+        socketManager.broadcastAgentMessage(
+          {
+            type: 'text',
+            agentId: principal.agentId,
+            content: storedContent,
+            origin: 'callback',
+            messageId: storedMsg.id,
+            invocationId: storedMsg.id,
+            // #814: Always include isExplicitPost in broadcast so frontend TD112 dedup skips merge
+            extra: {
+              isExplicitPost: true,
+              ...(validExplicitTargets.length ? { targetAgents: validExplicitTargets } : {}),
+            },
+            ...(mentionsUser ? { mentionsUser } : {}),
+            ...(validatedReplyTo ? { replyTo: validatedReplyTo } : {}),
+            ...(replyPreview ? { replyPreview } : {}),
+            timestamp: Date.now(),
+          },
+          effectiveThreadId,
+        );
+
+        for (const block of richBlocks) {
+          socketManager.broadcastAgentMessage(
+            {
+              type: 'system_info' as const,
+              agentId: principal.agentId,
+              content: JSON.stringify({ type: 'rich_block', block, messageId: storedMsg.id }),
+              invocationId: storedMsg.id,
+              timestamp: Date.now(),
+            },
+            effectiveThreadId,
+          );
+        }
+      }
+
+      if (opts.outboundHook) {
+        const frontendBase = resolveFrontendBaseUrl(process.env);
+        const thread = await threadStore?.get(effectiveThreadId);
+        const threadMeta = {
+          threadShortId: effectiveThreadId.slice(0, 15),
+          threadTitle: thread?.title ?? undefined,
+          deepLinkUrl: buildThreadDeepLink(frontendBase, effectiveThreadId),
+        };
+        opts.outboundHook
+          .deliver(
+            effectiveThreadId,
+            storedContent,
+            principal.agentId,
+            richBlocks.length > 0 ? richBlocks : undefined,
+            threadMeta,
+            'callback',
+            validatedReplyTo,
+          )
+          .catch((err: unknown) => {
+            app.log.error({ err, threadId: effectiveThreadId }, '[agent-key/post-message] Outbound delivery failed');
+          });
+      }
+
+      // F182 AC-C1: soft degradation — routing_warnings + KD-7 message field
+      // If caller specified explicit targets and ALL were unavailable → signal routing failure
+      const allExplicitFailed =
+        (explicitTargetAgents?.length ?? 0) > 0 && validExplicitTargets.length === 0 && contentTargets.length === 0;
+      if (allExplicitFailed) {
+        return {
+          isError: true,
+          routed: [],
+          routing_warnings,
+          message: buildPostMessageRoutingMessage([], routing_warnings),
+          threadId: effectiveThreadId,
+          messageId: storedMsg.id,
+          ...(validatedReplyTo ? { replyTo: validatedReplyTo } : {}),
+          ...(clientMessageId ? { clientMessageId } : {}),
+        };
+      }
+
+      const routingOutcome = buildRoutingOutcome(
+        [...mentions],
+        deliveryDecision.enqueued,
+        deliveryDecision.enqueueAttempted,
+      );
+      return {
+        status: 'ok',
+        threadId: effectiveThreadId,
+        messageId: storedMsg.id,
+        routed: routingOutcome.routed,
+        ...(validatedReplyTo ? { replyTo: validatedReplyTo } : {}),
+        ...(clientMessageId ? { clientMessageId } : {}),
+        ...(routing_warnings.length > 0 ? { routing_warnings } : {}),
+        message: buildPostMessageRoutingMessage(routingOutcome.routed, routing_warnings, routingOutcome.notEnqueued),
+      };
+    }
+
+    const record = request.callbackAuth!;
+    const actor = deriveCallbackActor(record);
+
+    const parsed = postMessageSchema.safeParse(request.body);
+    if (!parsed.success) {
+      reply.status(400);
+      return { error: 'Invalid request body', details: parsed.error.issues };
+    }
+
+    const { content, threadId, replyTo, clientMessageId, targetAgents: explicitTargetAgents } = parsed.data;
+    const { invocationId } = actor;
+    // #573: identity for cross-handler dedup. stream + callback for same logical
+    // response must broadcast/persist with the same id; QueueProcessor + route-serial
+    // use the parent (outer) id, so callback aligns to it.
+    const effectiveInvId = effectiveInvocationId(actor);
+
+    // Stale callback guard (cloud Codex P1 + Owen（验证与审查） R3): reject callbacks from
+    // preempted invocations. A newer invocation for the same thread+agent supersedes.
+    // Return 200 + stale_ignored to avoid retry storms from the dying CLI process.
+    if (!(await registry.isLatest(invocationId))) {
+      return { status: 'stale_ignored', replyTo, ...(clientMessageId ? { clientMessageId } : {}) };
+    }
+
+    let effectiveThreadId = actor.threadId;
+    if (threadId && threadId !== actor.threadId) {
+      // DIAG: Cross-thread routing debug (ghost-thread bug — opus session responding in wrong thread)
+      app.log.info(
+        {
+          invocationId,
+          agentId: actor.agentId,
+          recordThreadId: actor.threadId,
+          requestedThreadId: threadId,
+        },
+        '[DIAG/ghost-thread] post-message: cross-thread detected',
+      );
+      const scoped = await resolveScopedThreadId(actor, threadId, {
+        threadStore,
+        threadStoreMissingError: 'Thread store not configured for cross-thread posting',
+        accessDeniedError: 'Thread access denied',
+      });
+      if (!scoped.ok) {
+        reply.status(scoped.statusCode);
+        return { error: scoped.error };
+      }
+      effectiveThreadId = scoped.threadId;
+    }
+
+    // F193 AC-A4: cross-post fail-closed BEFORE idempotency claim.
+    // Closes Codex review P1 round 2 (2026-05-08): if AC-A4 reject runs AFTER
+    // claimClientMessageId, a malformed first attempt permanently consumes
+    // the idempotency key — corrected retry with the same key is then
+    // treated as `duplicate` and silently dropped. Validation errors must
+    // not be terminal for clients that correctly reuse the same key.
+    //
+    // Raw caller-input check (does NOT depend on contentAnalysis which runs
+    // later) — see hasPlausibleLineStartMention() docstring. Server-side
+    // analyzeA2AMentions remains the authoritative parser; disabled/unknown
+    // handles still fall through to the existing routing_warnings /
+    // allExplicitFailed path (Codex P2 round 1 close).
+    const isCrossThread = effectiveThreadId !== actor.threadId;
+    if (isCrossThread) {
+      const hasRawLineStartMention = hasPlausibleLineStartMention(content);
+      const hasRawTargetAgents = (explicitTargetAgents?.length ?? 0) > 0;
+      if (!hasRawLineStartMention && !hasRawTargetAgents) {
+        reply.status(400);
+        return {
+          kind: 'cross_post_no_routing',
+          message: 'Cross-thread post requires routing credentials (F193 KD-1 / AC-A4).',
+          alternatives: [
+            'Pass targetAgents: ["agentHandle"] to route to specific agent(s) in the target thread',
+            'Add a line-start @agentHandle in content (must be at start of line, not mid-sentence)',
+          ],
+        };
+      }
+    }
+
+    // At-least-once de-duplication: retries with same clientMessageId are treated as duplicate.
+    if (clientMessageId) {
+      const isFirstSeen = await registry.claimClientMessageId(invocationId, clientMessageId);
+      if (!isFirstSeen) {
+        return { status: 'duplicate', replyTo, clientMessageId };
+      }
+    }
+
+    // #83: Extract cc_rich blocks from post_message content (Route B for callback path)
+    const { cleanText: storedContent, blocks: extractedBlocks } = extractRichFromText(content);
+
+    // F088-J hotfix: Consume any buffered rich blocks (e.g. file blocks from generate_document).
+    // CLI agents don't go through route-serial, so the buffer must be consumed here.
+    // For route-serial agents, the buffer is already consumed before post_message — this is a no-op.
+    const bufferedBlocks = getRichBlockBuffer().consume(effectiveThreadId, actor.agentId as string, invocationId);
+
+    // F34-b: Resolve voice blocks (audio with text, no url) before storing
+    const synthesizer = getVoiceBlockSynthesizer();
+    let richBlocks = [...extractedBlocks, ...bufferedBlocks];
+    if (synthesizer && richBlocks.some((b) => b.kind === 'audio' && 'text' in b)) {
+      try {
+        richBlocks = await synthesizer.resolveVoiceBlocks(richBlocks, actor.agentId as string);
+      } catch (err) {
+        app.log.error({ err }, '[callbacks/post-message] Voice block synthesis failed');
+      }
+    }
+
+    // F52: isCrossThread already computed above (before idempotency claim, F193 AC-A4 gate).
+
+    // Parse line-start @mentions (A2A rule: only line-start, strip code blocks, single target)
+    // Uses analyzeA2AMentions to capture routing_warnings for disabled agents (F182 KD-10).
+    // F52: Cross-thread posts skip self-reference filter so @codex can trigger target thread's codex
+    const senderAgentId = createAgentId(actor.agentId);
+    const contentAnalysis = analyzeA2AMentions(storedContent, isCrossThread ? undefined : senderAgentId);
+    const contentTargets = contentAnalysis.mentions;
+    // F098-C1: Merge explicit targetAgents with content-parsed mentions (deduped)
+    // F182: use resolveAgentTarget to distinguish disabled vs unknown — collect routing_warnings
+    const validExplicitTargets: AgentId[] = [];
+    const routing_warnings: AgentRoutingError[] = [...contentAnalysis.routing_warnings];
+    for (const id of explicitTargetAgents ?? []) {
+      const resolved = resolveAgentTarget(id);
+      if ('ok' in resolved) {
+        validExplicitTargets.push(createAgentId(resolved.ok));
+      } else {
+        routing_warnings.push(resolved.error);
+        app.log.warn(
+          { droppedId: id, agentId: actor.agentId, invocationId, reason: resolved.error.kind },
+          '[callbacks/post-message] Dropped unavailable agentId from targetAgents',
+        );
+      }
+    }
+    const mergedTargets = new Set<AgentId>([...contentTargets, ...validExplicitTargets]);
+
+    if (contentTargets.length === 1 && mergedTargets.size > 1) {
+      const [primaryTarget] = contentTargets;
+      if (!primaryTarget) {
+        app.log.warn(
+          { invocationId, threadId: effectiveThreadId, senderAgentId, contentTargets, validExplicitTargets },
+          '[A2A/fail-closed] Unexpected empty primary target; skip fail-closed pruning',
+        );
+      } else {
+        const droppedTargets = [...mergedTargets].filter((agentId) => agentId !== primaryTarget);
+        mergedTargets.clear();
+        mergedTargets.add(primaryTarget);
+        app.log.warn(
+          {
+            invocationId,
+            threadId: effectiveThreadId,
+            senderAgentId,
+            contentTargets,
+            validExplicitTargets,
+            droppedTargets,
+            retainedTarget: primaryTarget,
+          },
+          '[A2A/fail-closed] Single line-start mention detected; dropped extra merged targets',
+        );
+      }
+    }
+    const mentions: AgentId[] = [...mergedTargets];
+    if (contentTargets.length > 0 || validExplicitTargets.length > 0) {
+      app.log.info(
+        {
+          invocationId,
+          threadId: effectiveThreadId,
+          senderAgentId,
+          contentTargets,
+          validExplicitTargets,
+          mergedTargets: mentions,
+        },
+        '[DIAG/a2a] post-message target merge',
+      );
+    }
+    const mentionsUser = detectUserMention(storedContent);
+    const crossPostExtra = isCrossThread
+      ? { crossPost: { sourceThreadId: actor.threadId, sourceInvocationId: invocationId } }
+      : {};
+    const richExtra = richBlocks.length > 0 ? { rich: { v: 1 as const, blocks: richBlocks } } : {};
+    const targetAgentsExtra = validExplicitTargets.length ? { targetAgents: validExplicitTargets } : {};
+    // #814: Mark as explicit post_message so frontend TD112 dedup does not
+    // merge this into the agent's CLI stream bubble.
+    const extraParts = { isExplicitPost: true as const, ...richExtra, ...crossPostExtra, ...targetAgentsExtra };
+    const extra = Object.keys(extraParts).length > 0 ? extraParts : undefined;
+
+    // F121: Validate replyTo — must exist in the same thread
+    let validatedReplyTo: string | undefined;
+    // F121 enhancement: Auto-fill replyTo for A2A-triggered invocations.
+    // Priority: 1) explicit replyTo  2) a2aTriggerMessageId (worklist path)  3) InvocationRecordStore fallback
+    let autoFilledReplyTo: string | undefined;
+    if (!replyTo) {
+      // Worklist path: a2aTriggerMessageId is set by route-serial from WorklistEntry
+      if (record.a2aTriggerMessageId) {
+        autoFilledReplyTo = record.a2aTriggerMessageId;
+      } else if (record.parentInvocationId && invocationRecordStore) {
+        // Fallback path (standalone invocation): look up InvocationRecordStore
+        const parentRecord = (await invocationRecordStore.get(record.parentInvocationId)) as {
+          userMessageId?: string | null;
+          threadId?: string | null;
+        } | null;
+        // P3-2 hardening: only trust userMessageId if parentRecord's threadId matches
+        if (parentRecord?.userMessageId && (!parentRecord.threadId || parentRecord.threadId === effectiveThreadId)) {
+          autoFilledReplyTo = parentRecord.userMessageId;
+        }
+      }
+    }
+    const effectiveReplyTo = replyTo ?? autoFilledReplyTo;
+    if (effectiveReplyTo) {
+      // #699: atomic fetch + visibility gate — A2A replies are always public.
+      const actorViewer: Viewer = { type: 'agent', agentId: createAgentId(actor.agentId) };
+      const parent = await resolveVisibleReplyParent(messageStore, effectiveReplyTo, {
+        threadId: effectiveThreadId,
+        viewer: actorViewer,
+        publicReply: true,
+      });
+      if (parent) {
+        validatedReplyTo = effectiveReplyTo;
+      } else if (replyTo) {
+        // Only warn for explicit replyTo failures — auto-fill mismatches are expected
+        // (e.g. cross-thread A2A where trigger is in a different thread)
+        app.log.warn(
+          { replyTo, effectiveThreadId },
+          '[callbacks/post-message] replyTo rejected: not found or not eligible',
+        );
+      }
+    }
+
+    // Store the message (scoped to the effective thread)
+    // AC-B6-P1: When A2A mentions will be enqueued (invocationQueue available),
+    // store with deliveryStatus:'queued' so ContextAssembler excludes this message
+    // from other invocations' context until QueueProcessor.executeEntry marks it delivered.
+    const hasA2AMentions = !!(mentions.length > 0 && router && invocationRecordStore && effectiveThreadId);
+    const willEnqueueToQueue = !!(hasA2AMentions && opts.invocationQueue);
+    // #573: persisted record's extra.stream.invocationId aligned to effectiveInvId
+    // (parent/outer) so F5/hydration broadcasts match what live broadcasts use.
+    // Merge with any existing extra (cross-post / explicit targets) without losing it.
+    // F194 Phase Z9 AC-Z25 (KD-28): always stamp turnInvocationId. When first-in-chain
+    // (invocationId === effectiveInvId), still stamp explicitly so frontend bubble
+    // identity never falls back to parent (which would collapse multi-turn same-agent).
+    const persistedExtra = {
+      ...(extra ?? {}),
+      stream: {
+        invocationId: effectiveInvId,
+        turnInvocationId: invocationId ?? effectiveInvId,
+      },
+    };
+    const now = Date.now();
+    const duplicateMsg =
+      routing_warnings.length === 0
+        ? await findRecentExactCallbackDuplicate(messageStore, {
+            threadId: effectiveThreadId,
+            userId: actor.userId,
+            agentId: actor.agentId,
+            content: storedContent,
+            ...(richBlocks.length > 0 ? { richBlocks } : {}),
+            mentions,
+            ...(mentionsUser ? { mentionsUser } : {}),
+            ...(validatedReplyTo ? { replyTo: validatedReplyTo } : {}),
+            now,
+          })
+        : undefined;
+    if (duplicateMsg) {
+      await recoverQueuedDuplicateCallbackMessage({
+        duplicateMsg,
+        willEnqueueToQueue,
+        ...(opts.invocationQueue ? { invocationQueue: opts.invocationQueue } : {}),
+        threadId: effectiveThreadId,
+        log: app.log,
+        enqueueA2A: () =>
+          enqueueA2ATargets(
+            {
+              router: router!,
+              invocationRecordStore: invocationRecordStore!,
+              socketManager,
+              messageStore,
+              ...(invocationTracker ? { invocationTracker } : {}),
+              ...(deliveryCursorStore ? { deliveryCursorStore } : {}),
+              ...(queueProcessor ? { queueProcessor } : {}),
+              ...(opts.invocationQueue ? { invocationQueue: opts.invocationQueue } : {}),
+              log: app.log,
+            },
+            {
+              targetAgents: mentions,
+              content: storedContent,
+              userId: actor.userId,
+              threadId: effectiveThreadId,
+              triggerMessage: duplicateMsg,
+              callerAgentId: senderAgentId,
+              parentInvocationId: record.parentInvocationId,
+              callerTraceContext: record.traceContext,
+            },
+          ),
+        markDelivered: (deliveredAt) => messageStore.markDelivered?.(duplicateMsg.id, deliveredAt),
+        zeroEnqueuedWarnMessage: '[callbacks/post-message] queued duplicate had no A2A entry — broadcasting anyway',
+        enqueueFailureMessage: '[callbacks/post-message] queued duplicate recovery failed — broadcasting anyway',
+        broadcastNow: async () => {
+          const replyPreview = validatedReplyTo ? await hydrateReplyPreview(messageStore, validatedReplyTo) : undefined;
+          socketManager.broadcastAgentMessage(
+            {
+              type: 'text',
+              agentId: actor.agentId,
+              content: duplicateMsg.content,
+              origin: 'callback',
+              messageId: duplicateMsg.id,
+              ...stampVisibleTurn(effectiveInvId, invocationId),
+              // #814: Always include isExplicitPost so frontend TD112 dedup skips merge
+              extra: {
+                isExplicitPost: true,
+                ...(isCrossThread
+                  ? { crossPost: { sourceThreadId: actor.threadId, sourceInvocationId: effectiveInvId } }
+                  : {}),
+                ...(validExplicitTargets.length ? { targetAgents: validExplicitTargets } : {}),
+              },
+              ...(duplicateMsg.mentionsUser ? { mentionsUser: true } : {}),
+              ...(validatedReplyTo ? { replyTo: validatedReplyTo } : {}),
+              ...(replyPreview ? { replyPreview } : {}),
+              timestamp: Date.now(),
+            },
+            effectiveThreadId,
+          );
+        },
+      });
+      return {
+        status: 'duplicate',
+        threadId: effectiveThreadId,
+        messageId: duplicateMsg.id,
+        ...(validatedReplyTo ? { replyTo: validatedReplyTo } : {}),
+        ...(clientMessageId ? { clientMessageId } : {}),
+      };
+    }
+    // Race-safe backstop: the exact-duplicate scan above is check-then-act, so an atomic content
+    // claim makes the at-most-once decision (root cause of the byte-identical duplicate bug).
+    const contentDuplicate = await claimCallbackContentOrDuplicate(messageStore, {
+      threadId: effectiveThreadId,
+      userId: actor.userId,
+      agentId: actor.agentId,
+      content: storedContent,
+      ...(richBlocks.length > 0 ? { richBlocks } : {}),
+      mentions,
+      ...(mentionsUser ? { mentionsUser } : {}),
+      ...(validatedReplyTo ? { replyTo: validatedReplyTo } : {}),
+      ...(clientMessageId ? { clientMessageId } : {}),
+      now,
+      hasRoutingWarnings: routing_warnings.length > 0,
+    });
+    if (contentDuplicate) return contentDuplicate;
+    const storedMsg = await messageStore.append({
+      userId: actor.userId,
+      agentId: actor.agentId,
+      content: storedContent,
+      mentions,
+      ...(mentionsUser ? { mentionsUser } : {}),
+      origin: 'callback',
+      timestamp: now,
+      threadId: effectiveThreadId,
+      extra: persistedExtra,
+      ...(validatedReplyTo ? { replyTo: validatedReplyTo } : {}),
+      ...(willEnqueueToQueue ? { deliveryStatus: 'queued' as const } : {}),
+    });
+
+    // F121: Hydrate reply preview for broadcast
+    const replyPreview = validatedReplyTo ? await hydrateReplyPreview(messageStore, validatedReplyTo) : undefined;
+
+    // F27: Enqueue @mentioned agents into parent worklist (unified A2A path)
+    const deliveryDecision = await MessageDeliveryService.resolveCallbackDeliveryDecision({
+      canEnqueueA2A: hasA2AMentions,
+      willEnqueueToQueue,
+      messageId: storedMsg.id,
+      threadId: effectiveThreadId,
+      log: app.log,
+      enqueueA2A: () =>
+        enqueueA2ATargets(
+          {
+            router: router!,
+            invocationRecordStore: invocationRecordStore!,
+            socketManager,
+            messageStore,
+            ...(invocationTracker ? { invocationTracker } : {}),
+            ...(deliveryCursorStore ? { deliveryCursorStore } : {}),
+            ...(queueProcessor ? { queueProcessor } : {}),
+            ...(opts.invocationQueue ? { invocationQueue: opts.invocationQueue } : {}),
+            log: app.log,
+          },
+          {
+            targetAgents: mentions,
+            content: storedContent,
+            userId: actor.userId,
+            threadId: effectiveThreadId,
+            triggerMessage: storedMsg,
+            callerAgentId: senderAgentId,
+            parentInvocationId: record.parentInvocationId,
+            callerTraceContext: record.traceContext,
+          },
+        ),
+      markDelivered: (deliveredAt) => messageStore.markDelivered?.(storedMsg.id, deliveredAt),
+      zeroEnqueuedWarnMessage: '[AC-B6-P1] Failed to recover ghost message — broadcasting anyway',
+      enqueueFailureMessage: '[invocation-callback] enqueueA2ATargets failed — falling back to broadcast',
+    });
+
+    // #607: Only broadcast when message is not queued — queued messages are
+    // broadcast later via messages_delivered when QueueProcessor delivers them.
+    if (deliveryDecision.shouldBroadcastNow) {
+      socketManager.broadcastAgentMessage(
+        {
+          type: 'text',
+          agentId: actor.agentId,
+          content: storedContent,
+          origin: 'callback',
+          messageId: storedMsg.id,
+          // F194 Phase Z9 (砚砚 R1 P1-2): unified visible turn stamp via helper.
+          ...stampVisibleTurn(effectiveInvId, invocationId),
+          // F52+F098-C1: Include crossPost + targetAgents in real-time broadcast
+          // #814: Always include isExplicitPost so frontend TD112 dedup skips merge
+          extra: {
+            isExplicitPost: true,
+            ...(isCrossThread
+              ? { crossPost: { sourceThreadId: actor.threadId, sourceInvocationId: effectiveInvId } }
+              : {}),
+            ...(validExplicitTargets.length ? { targetAgents: validExplicitTargets } : {}),
+          },
+          ...(mentionsUser ? { mentionsUser } : {}),
+          ...(validatedReplyTo ? { replyTo: validatedReplyTo } : {}),
+          ...(replyPreview ? { replyPreview } : {}),
+          timestamp: Date.now(),
+        },
+        effectiveThreadId,
+      );
+
+      // #83: Broadcast each extracted rich block as SSE event for live rendering
+      // P2 cloud-review: include messageId for frontend correlation
+      // #454/573: include effectiveInvId (parent/outer) so frontend can exact-match
+      // callback to stream bubble.
+      // F194 Phase Z9 (砚砚 R1 P1-2): rich_block broadcast — unified stamp via helper.
+      for (const block of richBlocks) {
+        socketManager.broadcastAgentMessage(
+          {
+            type: 'system_info' as const,
+            agentId: actor.agentId,
+            content: JSON.stringify({ type: 'rich_block', block, messageId: storedMsg.id }),
+            ...stampVisibleTurn(effectiveInvId, invocationId),
+            timestamp: Date.now(),
+          },
+          effectiveThreadId,
+        );
+      }
+    }
+
+    if (opts.outboundHook) {
+      const frontendBase = resolveFrontendBaseUrl(process.env);
+      const thread = await opts.threadStore?.get(effectiveThreadId);
+      const threadMeta = {
+        threadShortId: effectiveThreadId.slice(0, 15),
+        threadTitle: thread?.title ?? undefined,
+        deepLinkUrl: buildThreadDeepLink(frontendBase, effectiveThreadId),
+      };
+      opts.outboundHook
+        .deliver(
+          effectiveThreadId,
+          storedContent,
+          actor.agentId,
+          richBlocks.length > 0 ? richBlocks : undefined,
+          threadMeta,
+          'callback',
+          validatedReplyTo,
+        )
+        .catch((err: unknown) => {
+          app.log.error({ err, threadId: effectiveThreadId }, '[callbacks/post-message] Outbound delivery failed');
+        });
+    }
+
+    // F182 AC-C1: soft degradation — include routing_warnings + KD-7 message field
+    // If caller specified explicit targets and ALL were unavailable → signal routing failure
+    const allExplicitFailed =
+      (explicitTargetAgents?.length ?? 0) > 0 && validExplicitTargets.length === 0 && contentTargets.length === 0;
+    if (allExplicitFailed) {
+      return {
+        isError: true,
+        routed: [],
+        routing_warnings,
+        message: buildPostMessageRoutingMessage([], routing_warnings),
+        threadId: effectiveThreadId,
+        messageId: storedMsg.id,
+        ...(validatedReplyTo ? { replyTo: validatedReplyTo } : {}),
+        ...(clientMessageId ? { clientMessageId } : {}),
+      };
+    }
+
+    const routingOutcome = buildRoutingOutcome(
+      [...mentions],
+      deliveryDecision.enqueued,
+      deliveryDecision.enqueueAttempted,
+    );
+    return {
+      status: 'ok',
+      threadId: effectiveThreadId,
+      messageId: storedMsg.id,
+      routed: routingOutcome.routed,
+      ...(validatedReplyTo ? { replyTo: validatedReplyTo } : {}),
+      ...(clientMessageId ? { clientMessageId } : {}),
+      ...(routing_warnings.length > 0 ? { routing_warnings } : {}),
+      message: buildPostMessageRoutingMessage(routingOutcome.routed, routing_warnings, routingOutcome.notEnqueued),
+    };
+  });
+
+  app.get('/api/callbacks/pending-mentions', async (request, reply) => {
+    const record = requireCallbackAuth(request, reply);
+    if (!record) return;
+
+    const parsed = pendingMentionsQuerySchema.safeParse(request.query);
+    if (!parsed.success) {
+      reply.status(400);
+      return { error: 'Invalid query parameters' };
+    }
+
+    const { includeAcked } = parsed.data;
+
+    const includeAckedValues = Array.isArray(includeAcked) ? includeAcked : includeAcked ? [includeAcked] : [];
+    const shouldIncludeAcked = includeAckedValues.some((v) => v === '1' || v.toLowerCase() === 'true');
+
+    // DIAG: ghost-thread bug — log which thread this invocation thinks it owns
+    app.log.debug(
+      {
+        invocationId: record.invocationId,
+        agentId: record.agentId,
+        threadId: record.threadId,
+      },
+      '[DIAG/ghost-thread] pending-mentions: polling',
+    );
+
+    // #77: Use mention ack cursor to filter already-processed mentions
+    const agentId = createAgentId(record.agentId);
+    const lastAckId = deliveryCursorStore
+      ? await deliveryCursorStore.getMentionAckCursor(record.userId, agentId, record.threadId)
+      : undefined;
+
+    const rawMentions = shouldIncludeAcked
+      ? await messageStore.getRecentMentionsFor(record.agentId, 20, record.userId, record.threadId)
+      : await messageStore.getMentionsFor(record.agentId, 20, record.userId, record.threadId, lastAckId);
+    // F35: Filter out whispers not intended for this agent
+    const mentionViewer = { type: 'agent' as const, agentId };
+    const mentions = rawMentions.filter((m) => canViewMessage(m, mentionViewer));
+    return {
+      mentions: mentions.map((item) => ({
+        id: item.id,
+        from: item.agentId ?? item.userId,
+        message: item.content,
+        timestamp: item.timestamp,
+        ...(shouldIncludeAcked ? { acked: Boolean(lastAckId && item.id <= lastAckId) } : {}),
+      })),
+    };
+  });
+
+  // #77: POST /api/callbacks/ack-mentions — explicit ack with 4-way validation
+  app.post('/api/callbacks/ack-mentions', async (request, reply) => {
+    const record = requireCallbackAuth(request, reply);
+    if (!record) return;
+
+    const parsed = ackMentionsSchema.safeParse(request.body);
+    if (!parsed.success) {
+      reply.status(400);
+      return { error: 'Invalid request body', details: parsed.error.issues };
+    }
+
+    const { upToMessageId } = parsed.data;
+
+    if (!deliveryCursorStore) {
+      reply.status(501);
+      return { error: 'Mention ack not available (no cursor store)' };
+    }
+
+    const agentId = createAgentId(record.agentId);
+
+    // Validation 1: existence
+    const targetMsg = await messageStore.getById(upToMessageId);
+    if (!targetMsg) {
+      reply.status(400);
+      return { error: 'upToMessageId does not exist' };
+    }
+
+    // Validation 2: ownership (userId + threadId + mentions agentId)
+    if (targetMsg.userId !== record.userId) {
+      reply.status(400);
+      return { error: 'upToMessageId does not belong to current user session' };
+    }
+    if (targetMsg.threadId !== record.threadId) {
+      reply.status(400);
+      return { error: 'upToMessageId does not belong to current thread' };
+    }
+    if (!targetMsg.mentions.includes(agentId)) {
+      reply.status(400);
+      return { error: 'upToMessageId does not mention current agent' };
+    }
+
+    // Validation 3: monotonic (noop if backwards)
+    const currentCursor = await deliveryCursorStore.getMentionAckCursor(record.userId, agentId, record.threadId);
+    if (currentCursor && upToMessageId <= currentCursor) {
+      return { status: 'noop', reason: 'already acknowledged' };
+    }
+
+    // Validation 4: window — upToMessageId must be within current pending window
+    const pendingWindow = await messageStore.getMentionsFor(
+      record.agentId,
+      20,
+      record.userId,
+      record.threadId,
+      currentCursor,
+    );
+    if (pendingWindow.length > 0) {
+      const windowLastId = pendingWindow[pendingWindow.length - 1]?.id;
+      if (upToMessageId > windowLastId) {
+        reply.status(400);
+        return {
+          error: 'upToMessageId exceeds current pending window, ack only within fetched batch',
+          windowLastId,
+        };
+      }
+    }
+
+    await deliveryCursorStore.ackMentionCursor(record.userId, agentId, record.threadId, upToMessageId);
+    return { status: 'ok', ackedUpTo: upToMessageId };
+  });
+
+  app.get('/api/callbacks/thread-context', async (request, reply) => {
+    const principal = requireCallbackPrincipal(request, reply);
+    if (!principal) return;
+
+    const parsed = threadContextQuerySchema.safeParse(request.query);
+    if (!parsed.success) {
+      reply.status(400);
+      return { error: 'Invalid query parameters' };
+    }
+
+    const {
+      limit,
+      threadId: overrideThreadId,
+      messageId,
+      before: beforeWindow,
+      after: afterWindow,
+      agentId: filterAgentId,
+      keyword,
+    } = parsed.data;
+
+    if (filterAgentId && filterAgentId !== 'user' && !agentRegistry.has(filterAgentId)) {
+      reply.status(400);
+      return { error: `Unknown agentId filter: ${filterAgentId}` };
+    }
+
+    let effectiveThreadId: string;
+    if (principal.kind === 'agent_key') {
+      const threadResult = await resolvePrincipalThread(principal, overrideThreadId, { threadStore });
+      if (!threadResult.ok) {
+        reply.status(threadResult.statusCode);
+        return { error: threadResult.error };
+      }
+      effectiveThreadId = threadResult.threadId;
+    } else {
+      effectiveThreadId = overrideThreadId ?? principal.threadId;
+    }
+    const principalAgentId = principal.kind === 'invocation' ? principal.agentId : principal.agentId;
+    const principalUserId = principal.userId;
+    // F148 Phase B (AC-B2): tokenize keyword for relevance scoring
+    const keywordTerms = keyword ? tokenizeKeyword(keyword) : [];
+
+    const requestedLimit = limit ?? 20;
+    let needsPlayFilter = false;
+    if (effectiveThreadId && threadStore) {
+      const thread = await threadStore.get(effectiveThreadId);
+      needsPlayFilter = !!thread && (thread.thinkingMode ?? 'debug') === 'play';
+    }
+
+    let filtered: Awaited<ReturnType<typeof messageStore.getByThread>>;
+
+    // F35: Viewer for whisper filtering.
+    // Debug mode: agents see everything (like co-creator) — full transparency for debugging.
+    // Play mode: agents only see whispers addressed to them — game privacy.
+    const viewer = needsPlayFilter
+      ? { type: 'agent' as const, agentId: createAgentId(principalAgentId) }
+      : { type: 'user' as const };
+    const matchesExtraFilters = (item: Awaited<ReturnType<typeof messageStore.getByThread>>[number]): boolean => {
+      // F148 Phase E (AC-E2): briefing messages are non-routing, never enter agent context
+      if (item.origin === 'briefing') return false;
+      if (filterAgentId) {
+        if (filterAgentId === 'user') {
+          if (item.agentId !== null) return false;
+        } else if (item.agentId !== filterAgentId) {
+          return false;
+        }
+      }
+      // F148 Phase B (AC-B2): tokenized keyword relevance (replaces substring .includes())
+      if (keywordTerms.length > 0 && scoreKeywordRelevance(item.content, keywordTerms) === 0) {
+        return false;
+      }
+      return true;
+    };
+    const canIncludeContextItem = (item: Awaited<ReturnType<typeof messageStore.getByThread>>[number]): boolean => {
+      if (item.deletedAt) return false;
+      if (!isDelivered(item)) return false;
+      if (item.userId !== principalUserId && !isSystemUserMessage(item)) return false;
+      if (!canViewMessage(item, viewer)) return false;
+      if (needsPlayFilter) {
+        const isOtherAgent = item.agentId && item.agentId !== principalAgentId;
+        if (isOtherAgent && item.origin === 'stream') return false;
+      }
+      return matchesExtraFilters(item);
+    };
+
+    if (messageId) {
+      const target = await messageStore.getById(messageId);
+      if (!target || target.threadId !== effectiveThreadId || !canIncludeContextItem(target)) {
+        reply.status(404);
+        return { error: 'Message not found in thread context' };
+      }
+
+      const beforeCount = beforeWindow ?? 3;
+      const afterCount = afterWindow ?? 3;
+      const beforeMessages =
+        beforeCount > 0
+          ? await messageStore.getByThreadBefore(
+              effectiveThreadId,
+              target.timestamp,
+              beforeCount,
+              target.id,
+              principalUserId,
+            )
+          : [];
+      const afterMessages =
+        afterCount > 0
+          ? await messageStore.getByThreadAfter(effectiveThreadId, target.id, afterCount, principalUserId)
+          : [];
+      filtered = [...beforeMessages, target, ...afterMessages]
+        .filter(canIncludeContextItem)
+        .sort((a, b) => a.timestamp - b.timestamp || a.id.localeCompare(b.id));
+    } else if (!needsPlayFilter) {
+      // Normal mode: paginate backwards collecting visible messages until we
+      // have enough or data is exhausted. This ensures whisper filtering
+      // doesn't silently shrink the result set.
+      const visible: Awaited<ReturnType<typeof messageStore.getByThread>> = [];
+      const pageSize = Math.max(requestedLimit * 2, 50);
+      let cursorTimestamp = Number.MAX_SAFE_INTEGER;
+      let cursorId: string | undefined;
+
+      while (visible.length < requestedLimit) {
+        const batch = effectiveThreadId
+          ? await messageStore.getByThreadBefore(
+              effectiveThreadId,
+              cursorTimestamp,
+              pageSize,
+              cursorId,
+              principalUserId,
+            )
+          : await messageStore.getBefore(cursorTimestamp, pageSize, principalUserId, cursorId);
+
+        if (batch.length === 0) break;
+
+        for (const item of batch) {
+          if (!canViewMessage(item, viewer)) continue;
+          if (!matchesExtraFilters(item)) continue;
+          visible.push(item);
+        }
+
+        const oldest = batch[0]!;
+        cursorTimestamp = oldest.timestamp;
+        cursorId = oldest.id;
+      }
+
+      // F148 Phase B (AC-B2): sort by keyword relevance when searching, chronological otherwise
+      if (keywordTerms.length > 0) {
+        visible.sort((a, b) => {
+          const sa = scoreKeywordRelevance(a.content, keywordTerms);
+          const sb = scoreKeywordRelevance(b.content, keywordTerms);
+          return sb - sa || b.timestamp - a.timestamp; // higher relevance first, then newest first
+        });
+        filtered = visible.slice(0, requestedLimit); // P1-1 fix: take HEAD (highest relevance)
+      } else {
+        visible.sort((a, b) => a.timestamp - b.timestamp || a.id.localeCompare(b.id));
+        filtered = visible.slice(-requestedLimit); // take TAIL (most recent)
+      }
+    } else {
+      // Play mode: paginate backwards collecting visible messages until we have enough
+      // or data is exhausted. No fixed page cap — correctness over latency.
+      const visible: Awaited<ReturnType<typeof messageStore.getByThread>> = [];
+      const pageSize = Math.max(requestedLimit * 2, 50); // fetch in chunks, min 50
+      let cursorTimestamp = Number.MAX_SAFE_INTEGER;
+      let cursorId: string | undefined;
+
+      while (visible.length < requestedLimit) {
+        const batch = effectiveThreadId
+          ? await messageStore.getByThreadBefore(
+              effectiveThreadId,
+              cursorTimestamp,
+              pageSize,
+              cursorId,
+              principalUserId,
+            )
+          : await messageStore.getBefore(cursorTimestamp, pageSize, principalUserId, cursorId);
+
+        if (batch.length === 0) break; // no more messages
+
+        for (const item of batch) {
+          // F35: Skip whispers not intended for this agent
+          if (!canViewMessage(item, viewer)) continue;
+          // Visible in play mode: user messages, own agent's messages,
+          // or other agents' messages that are NOT explicitly stream.
+          // Legacy messages (no origin) are treated as visible for backward
+          // compatibility — all new writes are tagged, so untagged = legacy callback.
+          const isOtherAgent = item.agentId && item.agentId !== principalAgentId;
+          if (!isOtherAgent || item.origin !== 'stream') {
+            if (!matchesExtraFilters(item)) continue;
+            visible.push(item);
+          }
+        }
+
+        // Move cursor to oldest message in batch (batch is ascending, first is oldest)
+        const oldest = batch[0]!;
+        cursorTimestamp = oldest.timestamp;
+        cursorId = oldest.id;
+      }
+
+      // visible is accumulated in reverse-chronological page order but each page is ascending.
+      // P2-1 fix: play mode also sorts by keyword relevance when keyword is active
+      if (keywordTerms.length > 0) {
+        visible.sort((a, b) => {
+          const sa = scoreKeywordRelevance(a.content, keywordTerms);
+          const sb = scoreKeywordRelevance(b.content, keywordTerms);
+          return sb - sa || b.timestamp - a.timestamp;
+        });
+        filtered = visible.slice(0, requestedLimit);
+      } else {
+        visible.sort((a, b) => a.timestamp - b.timestamp || a.id.localeCompare(b.id));
+        filtered = visible.slice(-requestedLimit);
+      }
+    }
+
+    // F073 P1: Look up workflow SOP for resume capsule if thread has linked backlog item
+    // P1-3: Only expose workflowSop when the thread belongs to this user
+    let workflowSop: Record<string, unknown> | undefined;
+    if (effectiveThreadId && threadStore && opts.workflowSopStore) {
+      const thread = await threadStore.get(effectiveThreadId);
+      const isOwnThread = thread && (thread.createdBy === principalUserId || !overrideThreadId);
+      if (isOwnThread && thread?.backlogItemId) {
+        const sop = await opts.workflowSopStore.get(thread.backlogItemId);
+        if (sop) {
+          try {
+            const skill = resolveWorkflowSopSkill(sop);
+            workflowSop = {
+              featureId: sop.featureId,
+              sopDefinitionId: normalizeSopDefinitionId(sop.sopDefinitionId),
+              stage: sop.stage,
+              batonHolder: sop.batonHolder,
+              nextSkill: sop.nextSkill,
+              suggestedSkill: skill.skill,
+              suggestedSkillSource: skill.source,
+              resumeCapsule: sop.resumeCapsule,
+              checks: sop.checks,
+            };
+          } catch (err) {
+            log.warn(
+              { err, backlogItemId: thread.backlogItemId, sopDefinitionId: sop.sopDefinitionId, stage: sop.stage },
+              'Skipping invalid workflowSop in thread-context',
+            );
+          }
+        }
+      }
+    }
+
+    // F211 BUG1 fix: resolve /uploads/ relative image URLs to absolute paths
+    // so external runtimes (Antigravity/Andy) can access image files.
+    const uploadDir = getDefaultUploadDir(process.env.UPLOAD_DIR);
+
+    return {
+      // TD091: echo threadId so agents know which thread they're in
+      threadId: effectiveThreadId,
+      messages: filtered.map((item) => {
+        const imagePaths = extractImagePaths(item.contentBlocks, uploadDir);
+        const imageUrls = extractImageUrls(item.contentBlocks);
+        return {
+          id: item.id,
+          userId: item.userId,
+          agentId: item.agentId,
+          content: item.content,
+          ...(item.contentBlocks ? { contentBlocks: item.contentBlocks } : {}),
+          ...(imagePaths.length > 0 ? { imagePaths } : {}),
+          ...(imageUrls.length > 0 ? { imageUrls } : {}),
+          timestamp: item.timestamp,
+          // F148 Phase B (AC-B2): include relevance score when keyword search is active
+          ...(keywordTerms.length > 0 ? { relevanceScore: scoreKeywordRelevance(item.content, keywordTerms) } : {}),
+        };
+      }),
+      ...(workflowSop ? { workflowSop } : {}),
+    };
+  });
+
+  // #699: Look up a single message by ID with optional surrounding context
+  const getMessageQuerySchema = z.object({
+    messageId: z.string().min(1),
+    contextCount: z.coerce.number().int().min(0).max(10).optional(),
+  });
+
+  app.get('/api/callbacks/get-message', async (request, reply) => {
+    const principal = requireCallbackPrincipal(request, reply);
+    if (!principal) return;
+
+    const parsed = getMessageQuerySchema.safeParse(request.query);
+    if (!parsed.success) {
+      reply.status(400);
+      return { error: 'Invalid query parameters', details: parsed.error.issues };
+    }
+
+    const { messageId, contextCount } = parsed.data;
+    const message = await messageStore.getById(messageId);
+    if (!message || message.deletedAt) {
+      reply.status(404);
+      return { error: 'Message not found' };
+    }
+
+    // #699 P1 (gpt52 intake review): align get-message with isEligibleReplyParent —
+    // system/briefing are internal, non-routable content, never retrievable here (no info leak).
+    if (isInternalNonQuotableParent(message)) {
+      reply.status(404);
+      return { error: 'Message not found' };
+    }
+
+    // #699 P1-1: Enforce visibility — userId scope, delivery status, whisper filtering
+    if (!isDelivered(message)) {
+      reply.status(404);
+      return { error: 'Message not found' };
+    }
+    if (message.userId !== principal.userId && !isSystemUserMessage(message)) {
+      reply.status(404);
+      return { error: 'Message not found' };
+    }
+    // Align with thread-context: debug = agents see all (user viewer), play = agents see own (agent viewer)
+    let needsPlayFilter = false;
+    if (message.threadId && threadStore) {
+      const thread = await threadStore.get(message.threadId);
+      needsPlayFilter = !!thread && (thread.thinkingMode ?? 'debug') === 'play';
+    }
+    const viewer: Viewer = needsPlayFilter ? { type: 'agent', agentId: principal.agentId } : { type: 'user' };
+    if (!canViewMessage(message, viewer)) {
+      reply.status(404);
+      return { error: 'Message not found' };
+    }
+    // Play mode: hide other agents' stream messages (cross-agent thinking isolation)
+    if (needsPlayFilter && message.origin === 'stream' && message.agentId && message.agentId !== principal.agentId) {
+      reply.status(404);
+      return { error: 'Message not found' };
+    }
+
+    const uploadDir = getDefaultUploadDir(process.env.UPLOAD_DIR);
+    const projectMsg = (m: typeof message) => {
+      const imagePaths = extractImagePaths(m.contentBlocks, uploadDir);
+      const imageUrls = extractImageUrls(m.contentBlocks);
+      return {
+        id: m.id,
+        userId: m.userId,
+        agentId: m.agentId,
+        content: m.content,
+        ...(m.contentBlocks ? { contentBlocks: m.contentBlocks } : {}),
+        ...(imagePaths.length > 0 ? { imagePaths } : {}),
+        ...(imageUrls.length > 0 ? { imageUrls } : {}),
+        ...(m.replyTo ? { replyTo: m.replyTo } : {}),
+        timestamp: m.timestamp,
+        threadId: m.threadId,
+      };
+    };
+
+    const result: { message: ReturnType<typeof projectMsg>; context?: ReturnType<typeof projectMsg>[] } = {
+      message: projectMsg(message),
+    };
+
+    const effectiveContextCount = contextCount ?? 0;
+    if (effectiveContextCount > 0 && message.threadId) {
+      const principalUserId = principal.userId;
+      const before = await messageStore.getByThreadBefore(
+        message.threadId,
+        message.timestamp,
+        effectiveContextCount,
+        message.id,
+        principalUserId,
+      );
+      const after = await messageStore.getByThreadAfter(
+        message.threadId,
+        message.id,
+        effectiveContextCount,
+        principalUserId,
+      );
+      // #699 P1-1b: Apply same visibility predicate to context items as target
+      const contextMsgs = [...before, ...after]
+        .filter((m) => {
+          if (m.id === messageId) return false;
+          if (m.deletedAt) return false;
+          // #699 P1 (gpt52 intake review): exclude internal/non-routable (system/briefing) from context too
+          if (isInternalNonQuotableParent(m)) return false;
+          if (!isDelivered(m)) return false;
+          if (m.userId !== principalUserId && !isSystemUserMessage(m)) return false;
+          if (!canViewMessage(m, viewer)) return false;
+          if (needsPlayFilter && m.origin === 'stream' && m.agentId && m.agentId !== principal.agentId) return false;
+          return true;
+        })
+        .sort((a, b) => a.timestamp - b.timestamp || a.id.localeCompare(b.id));
+      result.context = contextMsgs.map(projectMsg);
+    }
+
+    return result;
+  });
+
+  app.get('/api/callbacks/list-threads', async (request, reply) => {
+    const principal = requireCallbackPrincipal(request, reply);
+    if (!principal) return;
+
+    const parsed = listThreadsQuerySchema.safeParse(request.query);
+    if (!parsed.success) {
+      reply.status(400);
+      return { error: 'Invalid request query', details: parsed.error.issues };
+    }
+
+    const { limit, activeSince, keyword } = parsed.data;
+
+    if (!threadStore) {
+      reply.status(503);
+      return { error: 'Thread store not configured' };
+    }
+
+    const requestedLimit = limit ?? 20;
+    let threads = await threadStore.list(principal.userId);
+    if (activeSince !== undefined) {
+      threads = threads.filter((thread) => thread.lastActiveAt >= activeSince);
+    }
+    if (keyword) {
+      const needle = keyword.toLowerCase();
+      threads = threads.filter((thread) => {
+        const title = (thread.title ?? '').toLowerCase();
+        return title.includes(needle) || thread.id.toLowerCase().includes(needle);
+      });
+    }
+
+    threads.sort((a, b) => b.lastActiveAt - a.lastActiveAt);
+    const summaries = threads.slice(0, requestedLimit).map((thread) => ({
+      threadId: thread.id,
+      ...(thread.title ? { title: thread.title } : {}),
+      lastActiveAt: thread.lastActiveAt,
+      pinned: thread.pinned ?? false,
+      messageCount: null,
+      participants: thread.participants,
+      labels: thread.labels ?? [],
+    }));
+
+    return { threads: summaries };
+  });
+
+  app.get('/api/callbacks/list-labels', async (request, reply) => {
+    const principal = requireCallbackPrincipal(request, reply);
+    if (!principal) return;
+
+    const parsed = listLabelsQuerySchema.safeParse(request.query);
+    if (!parsed.success) {
+      reply.status(400);
+      return { error: 'Invalid request query', details: parsed.error.issues };
+    }
+
+    const { labelStore } = opts;
+    if (!labelStore) {
+      reply.status(503);
+      return { error: 'Label store not configured' };
+    }
+
+    const requestedLimit = parsed.data.limit ?? 50;
+    const labels = await labelStore.list(principal.userId);
+    const result = labels.slice(0, requestedLimit).map((l) => ({
+      id: l.id,
+      name: l.name,
+      color: l.color,
+      sortOrder: l.sortOrder,
+    }));
+
+    return { labels: result };
+  });
+
+  app.get('/api/callbacks/feat-index', async (request, reply) => {
+    const record = requireCallbackAuth(request, reply);
+    if (!record) return;
+
+    const parsed = featIndexQuerySchema.safeParse(request.query);
+    if (!parsed.success) {
+      reply.status(400);
+      return { error: 'Invalid request query', details: parsed.error.issues };
+    }
+
+    const { featId, query, limit } = parsed.data;
+
+    const normalizedFeatId = featId ? normalizeFeatId(featId) : undefined;
+    const normalizedQuery = query?.trim().toLowerCase();
+    const threadIdsByFeatId = await buildThreadIdsByFeatId(threadStore, backlogStore, record.userId, app.log);
+
+    let items = await (featIndexProvider ? featIndexProvider() : readFeatIndexEntries());
+    if (normalizedFeatId) {
+      items = items.filter((item) => normalizeFeatId(item.featId) === normalizedFeatId);
+    }
+    if (normalizedQuery) {
+      items = items.filter((item) => {
+        const haystack = buildFeatIndexQueryHaystack(item);
+        return haystack.includes(normalizedQuery);
+      });
+    }
+
+    const requestedLimit = limit ?? 20;
+    const sliced = items.slice(0, requestedLimit);
+    return {
+      items: sliced.map((item) => {
+        const threadIds = threadIdsByFeatId.get(normalizeFeatId(item.featId)) ?? [];
+        const ownerAgentId = resolveFeatureOwnerAgentId(item.owner);
+        const suggestedAction = buildFeatIndexSuggestedAction(item, threadIds[0], ownerAgentId, record.threadId);
+        return {
+          featId: item.featId,
+          name: item.name,
+          status: item.status,
+          ...(item.owner ? { owner: item.owner } : {}),
+          ...(ownerAgentId ? { ownerAgentId } : {}),
+          ...(item.keyDecisions ? { keyDecisions: item.keyDecisions } : {}),
+          threadIds,
+          ...(suggestedAction ? { suggestedAction } : {}),
+        };
+      }),
+    };
+  });
+
+  const githubPermissionQuerySchema = z.object({
+    repoFullName: z
+      .string()
+      .min(1)
+      .regex(/^[^/]+\/[^/]+$/, 'Must be owner/repo format'),
+  });
+
+  app.get('/api/callbacks/github-permission', async (request, reply) => {
+    const parsed = githubPermissionQuerySchema.safeParse(request.query);
+    if (!parsed.success) {
+      reply.status(400);
+      return { error: 'Invalid query', details: parsed.error.issues };
+    }
+
+    const principal = requireCallbackPrincipal(request, reply);
+    if (!principal) return;
+
+    if (!getGitHubPermission) {
+      reply.status(503);
+      return { error: 'GitHub permission query not configured' };
+    }
+
+    try {
+      const permission = await getGitHubPermission(parsed.data.repoFullName);
+      return { status: 'ok', ...permission };
+    } catch (err) {
+      log.warn({ err, repoFullName: parsed.data.repoFullName }, 'GitHub permission query failed');
+      reply.status(503);
+      return { error: 'GitHub permission query unavailable - try again later' };
+    }
+  });
+
+  // TD091: PR tracking registration via MCP callback
+  // Agents call this after `gh pr create` to register the PR for Layer 1 routing.
+  // Server resolves threadId from invocation record — agent doesn't need to know it.
+  const registerPrTrackingSchema = z.object({
+    repoFullName: z
+      .string()
+      .min(1)
+      .regex(/^[^/]+\/[^/]+$/, 'Must be owner/repo format'),
+    prNumber: z.number().int().positive(),
+    // F202 Phase 2C (AC-C1): tracking instructions appended to trigger messages
+    instructions: z.string().max(2000).optional(),
+    agentId: z.string().min(1).optional(), // ignored — server uses record.agentId
+    // F140: wake intent. 'review' (default) = waiting on review feedback → CI-pass stays silent.
+    // 'merge' = waiting on CI-green to merge → CI-pass wakes. Re-register (upsert) to flip it.
+    intent: z.enum(['review', 'merge']).optional(),
+  });
+
+  app.post('/api/callbacks/register-pr-tracking', async (request, reply) => {
+    // #320: Unified model — write to TaskStore instead of PrTrackingStore
+    if (!taskStore) {
+      reply.status(503);
+      return { error: 'Task store not configured' };
+    }
+
+    const parsed = registerPrTrackingSchema.safeParse(request.body);
+    if (!parsed.success) {
+      reply.status(400);
+      return { error: 'Invalid request body', details: parsed.error.issues };
+    }
+
+    const record = requireCallbackAuth(request, reply);
+    if (!record) return;
+
+    const { repoFullName, prNumber, instructions } = parsed.data;
+
+    // Use authoritative agentId from invocation record, not caller payload.
+    const agentId = record.agentId;
+
+    // Phase D: validate repo exists and is accessible (AC-D1)
+    if (validateRepo) {
+      let repoOk: boolean;
+      try {
+        repoOk = await validateRepo(repoFullName);
+      } catch {
+        reply.status(503);
+        return { error: 'Repository validation unavailable — try again later' };
+      }
+      if (!repoOk) {
+        reply.status(422);
+        return { error: `Repository ${repoFullName} does not exist or is not accessible` };
+      }
+    }
+
+    // F202 Phase 2 follow-up: validate specific PR exists (number-level, not just repo)
+    if (validatePr) {
+      let prOk: boolean;
+      try {
+        prOk = await validatePr(repoFullName, prNumber);
+      } catch {
+        reply.status(503);
+        return { error: 'PR validation unavailable — try again later' };
+      }
+      if (!prOk) {
+        reply.status(422);
+        return { error: `PR ${repoFullName}#${prNumber} does not exist or is not accessible` };
+      }
+    }
+
+    const subjectKey = `pr:${repoFullName}#${prNumber}`;
+    try {
+      // F140: resolve wake intent. Explicit wins; otherwise preserve an already-set intent (so an
+      // incidental re-register doesn't silently downgrade a deliberate 'merge'); default 'review'.
+      const existing = await taskStore.getBySubject(subjectKey);
+      const intent = parsed.data.intent ?? existing?.automationState?.intent ?? 'review';
+      const shouldSeedPrBoundary = !existing || existing.status === 'done';
+      let seededPrBoundary: Pick<AutomationState, 'review' | 'ci'> | undefined;
+      if (shouldSeedPrBoundary) {
+        if (!fetchPrTrackingBoundary) {
+          reply.status(503);
+          return { error: 'PR tracking boundary fetcher not configured' };
+        }
+        try {
+          seededPrBoundary = await fetchPrTrackingBoundary(repoFullName, prNumber);
+        } catch {
+          reply.status(503);
+          return { error: 'PR tracking boundary unavailable — try again later' };
+        }
+        if (!seededPrBoundary.review || !seededPrBoundary.ci?.headSha) {
+          reply.status(503);
+          return { error: 'PR tracking boundary unavailable — try again later' };
+        }
+      }
+
+      const automationState = {
+        ...(instructions !== undefined ? { trackingInstructions: instructions } : {}),
+        ...(seededPrBoundary ?? {}),
+      };
+
+      const task = await taskStore.upsertBySubject({
+        kind: 'pr_tracking',
+        subjectKey,
+        threadId: record.threadId,
+        title: `PR tracking: ${repoFullName}#${prNumber}`,
+        ownerAgentId: agentId,
+        why: `Tracking PR ${repoFullName}#${prNumber} (intent=${intent}): review feedback + conflicts always wake; CI-pass wakes only when intent=merge`,
+        createdBy: agentId,
+        userId: record.userId,
+        // F202 Phase 2C (AC-C1): store user-provided tracking instructions
+        automationState: Object.keys(automationState).length > 0 ? automationState : undefined,
+      });
+
+      // Persist intent structurally (deep-merged — preserves ci/review/conflict cursors on re-register).
+      const withIntent = await taskStore.patchAutomationState(task.id, { intent });
+
+      return { status: 'ok', threadId: record.threadId, task: withIntent ?? task };
+    } catch (error) {
+      if (isSubjectOwnershipConflictError(error)) {
+        reply.status(409);
+        return { error: `PR ${repoFullName}#${prNumber} already registered by another user` };
+      }
+      throw error;
+    }
+  });
+
+  // F202 Phase 2D (AC-D3): Register issue tracking
+  const registerIssueTrackingSchema = z.object({
+    repoFullName: z
+      .string()
+      .min(1)
+      .regex(/^[^/]+\/[^/]+$/, 'Must be owner/repo format'),
+    issueNumber: z.number().int().positive(),
+    instructions: z.string().max(2000).optional(),
+  });
+
+  app.post('/api/callbacks/register-issue-tracking', async (request, reply) => {
+    if (!taskStore) {
+      reply.status(503);
+      return { error: 'Task store not configured' };
+    }
+
+    const parsed = registerIssueTrackingSchema.safeParse(request.body);
+    if (!parsed.success) {
+      reply.status(400);
+      return { error: 'Invalid request body', details: parsed.error.issues };
+    }
+
+    const record = requireCallbackAuth(request, reply);
+    if (!record) return;
+
+    const { repoFullName, issueNumber, instructions } = parsed.data;
+    const agentId = record.agentId;
+
+    // F202 Phase 2D P2-fix: validate repo exists and is accessible (mirrors PR tracking at L1975)
+    if (validateRepo) {
+      let repoOk: boolean;
+      try {
+        repoOk = await validateRepo(repoFullName);
+      } catch {
+        reply.status(503);
+        return { error: 'Repository validation unavailable — try again later' };
+      }
+      if (!repoOk) {
+        reply.status(422);
+        return { error: `Repository ${repoFullName} does not exist or is not accessible` };
+      }
+    }
+
+    // F202 Phase 2 follow-up: validate specific issue exists (number-level, not just repo)
+    if (validateIssue) {
+      let issueOk: boolean;
+      try {
+        issueOk = await validateIssue(repoFullName, issueNumber);
+      } catch {
+        reply.status(503);
+        return { error: 'Issue validation unavailable — try again later' };
+      }
+      if (!issueOk) {
+        reply.status(422);
+        return { error: `Issue ${repoFullName}#${issueNumber} does not exist or is not accessible` };
+      }
+    }
+
+    const subjectKey = `issue:${repoFullName}#${issueNumber}`;
+    const existingTask = await taskStore.getBySubject(subjectKey);
+    const existingIssueCursor = existingTask?.automationState?.issue?.lastCommentCursor;
+    const shouldSeedIssueCursor = existingIssueCursor === undefined || existingTask?.status === 'done';
+    let seededIssueCursor: number | undefined;
+    if (shouldSeedIssueCursor) {
+      if (!fetchIssueCommentCursor) {
+        reply.status(503);
+        return { error: 'Issue comment cursor fetcher not configured' };
+      }
+      try {
+        seededIssueCursor = await fetchIssueCommentCursor(repoFullName, issueNumber);
+      } catch {
+        reply.status(503);
+        return { error: 'Issue comment cursor unavailable — try again later' };
+      }
+    }
+
+    const automationState = {
+      ...(instructions !== undefined ? { trackingInstructions: instructions } : {}),
+      // Cloud R17 P1: seed both cursors together. Without lastDeliveredCursor, the gate's
+      // fallback (lastDeliveredCursor ?? collectionCursor) uses the post-advance collection
+      // cursor if a crash occurs between collection advance and delivery cursor persist,
+      // silently losing the undelivered comment on the next poll. Seeding both to the same
+      // value mirrors the R14 fix in registerRoutingTracking (community-auto-tracking.ts).
+      ...(seededIssueCursor !== undefined
+        ? { issue: { lastCommentCursor: seededIssueCursor, lastDeliveredCursor: seededIssueCursor } }
+        : {}),
+    };
+    try {
+      const task = await taskStore.upsertBySubject({
+        kind: 'issue_tracking',
+        subjectKey,
+        threadId: record.threadId,
+        title: `Issue tracking: ${repoFullName}#${issueNumber}`,
+        ownerAgentId: agentId,
+        why: `Tracking issue ${repoFullName}#${issueNumber} for comment notifications`,
+        createdBy: agentId,
+        userId: record.userId,
+        automationState: Object.keys(automationState).length > 0 ? automationState : undefined,
+      });
+
+      return { status: 'ok', threadId: record.threadId, task };
+    } catch (error) {
+      if (isSubjectOwnershipConflictError(error)) {
+        reply.status(409);
+        return { error: `Issue ${repoFullName}#${issueNumber} already registered by another user` };
+      }
+      throw error;
+    }
+  });
+
+  // F202 Phase 2C (AC-C3): Unregister tracking task by subjectKey
+  const unregisterTrackingSchema = z.object({
+    subjectKey: z.string().min(1),
+  });
+
+  app.post('/api/callbacks/unregister-tracking', async (request, reply) => {
+    if (!taskStore) {
+      reply.status(503);
+      return { error: 'Task store not configured' };
+    }
+
+    const parsed = unregisterTrackingSchema.safeParse(request.body);
+    if (!parsed.success) {
+      reply.status(400);
+      return { error: 'Invalid request body', details: parsed.error.issues };
+    }
+
+    const record = requireCallbackAuth(request, reply);
+    if (!record) return;
+
+    const task = await taskStore.getBySubject(parsed.data.subjectKey);
+    if (!task) {
+      reply.status(404);
+      return { error: `No tracking task for subject: ${parsed.data.subjectKey}` };
+    }
+
+    // Kind guard: only tracking tasks can be unregistered via this endpoint
+    if (!isTrackingKind(task.kind)) {
+      reply.status(400);
+      return { error: `Task is not a tracking task (kind: ${task.kind}), cannot unregister via this endpoint` };
+    }
+
+    // Ownership check: only the registering user can unregister. Legacy/backfilled
+    // tracking tasks may not have userId, so fail closed unless the callback is
+    // scoped to the same thread that owns the task.
+    if (!canUnregisterTrackingTask(task, record)) {
+      reply.status(403);
+      return { error: 'Not authorized to unregister this tracking task' };
+    }
+
+    await taskStore.delete(task.id);
+    return { status: 'ok', deleted: { id: task.id, subjectKey: parsed.data.subjectKey } };
+  });
+
+  // F174 Phase C: refresh-token endpoint — keep tokens alive in long sessions
+  // where智能体 has no incidental tool calls. Heartbeat = empty verify (preHandler
+  // slides TTL via Phase B mechanism); we just compute remaining TTL.
+  //
+  // P1 fix (gpt52 review): cooldown MUST run before app-level preHandler.
+  // Otherwise verify() in preHandler已经 slides TTL even on rate-limited
+  // requests → 429 is cosmetic, abuser still extends. Route-level onRequest
+  // hook fires before plugin-scoped preHandler in Fastify's lifecycle, so we
+  // claim the cooldown there and reply.send → preHandler is short-circuited.
+  const REFRESH_COOLDOWN_MS = 5 * 60_000;
+  app.post(
+    '/api/callbacks/refresh-token',
+    {
+      preValidation: async (request, reply) => {
+        // Cloud Codex P1 + gpt52 P1 #2/#3 (#1368): cooldown must mirror auth
+        // — same creds extraction rule as preHandler, then peek (no-slide)
+        // verify, claim cooldown, then atomic verifyLatest (replaces global
+        // preHandler verify so stale-check + slide happen in one step).
+        //
+        // Cloud Codex P2 (08:54Z #1368): isLatest check in preValidation +
+        // separate slide in preHandler had a race window — newer invocation
+        // could win between hooks. verifyLatest closes it atomically.
+        //
+        // Hook stage: preValidation fires AFTER body parse and BEFORE all
+        // preHandler hooks — body/query is accessible AND we can short-circuit
+        // before app preHandler runs verify-with-slide.
+        const creds = extractCallbackCredentials(request);
+        if (!creds) {
+          // Cloud Codex P2 (PR #1368, 6c8a4365): refresh-token route always
+          // requires auth — no panel-path here. Global preHandler no-ops on
+          // total absence (panel-path), which would let handler fall through
+          // to unknown_invocation and misclassify the reason. Emit
+          // missing_creds locally to keep telemetry/diagnostics accurate.
+          recordCallbackAuthFailure({ reason: 'missing_creds', tool: 'refresh-token' });
+          reply.status(401).send({
+            error: 'callback_auth_failed',
+            reason: 'missing_creds',
+            message: 'refresh-token requires X-Invocation-Id + X-Callback-Token headers',
+            hint: 'Both headers must be sent together; mixed-source (header + body) is not accepted.',
+          });
+          return;
+        }
+
+        const peeked = await registry.peek(creds.invocationId, creds.callbackToken);
+        if (!peeked.ok) {
+          // Let preHandler emit the corresponding reason 401 (no cooldown burned).
+          // preHandler's verify() path records the failure; we don't double-record here.
+          return;
+        }
+
+        const cooldownClaimed = await registry.tryClaimRefreshCooldown(creds.invocationId, REFRESH_COOLDOWN_MS);
+        if (!cooldownClaimed) {
+          reply.status(429).send({ error: 'refresh_rate_limited', retryAfterMs: REFRESH_COOLDOWN_MS });
+          // reply.send short-circuits the lifecycle — preHandler/handler skipped,
+          // so verify() never slides TTL for the rate-limited request.
+          return;
+        }
+
+        // Atomic: verify token + check stale + slide TTL in one backend op.
+        // Replaces global preHandler.verify for this route (we set
+        // request.callbackAuth so the preHandler early-returns).
+        const result = await registry.verifyLatest(creds.invocationId, creds.callbackToken);
+        if (!result.ok) {
+          const agentId = peeked.ok ? peeked.record.agentId : undefined;
+          recordCallbackAuthFailure({ reason: result.reason, tool: 'refresh-token', agentId });
+          if (result.reason === 'stale_invocation') {
+            reply.status(401).send({
+              error: 'callback_auth_failed',
+              reason: 'stale_invocation',
+              message: 'Invocation has been superseded by a newer one for the same thread/agent slot',
+              hint: 'A newer invocation now owns this (threadId, agentId) slot. Old invocations cannot be refreshed.',
+            });
+            return;
+          }
+          // expired / invalid_token / unknown_invocation — race against expiry
+          // or registry mutation between peek and verifyLatest. Surface the
+          // structured reason directly (we own the auth path now, preHandler
+          // will skip via the request.callbackAuth check).
+          reply.status(401).send({
+            error: 'callback_auth_failed',
+            reason: result.reason,
+            message: 'Auth state changed between peek and atomic verify',
+            hint: '',
+          });
+          return;
+        }
+        request.callbackAuth = result.record;
+      },
+    },
+    async (request, reply) => {
+      const record = requireCallbackAuth(request, reply);
+      if (!record) return; // preHandler already 401'd
+
+      // preHandler's verify() already slid the record TTL forward.
+      // Re-fetch to get the new expiresAt without triggering another slide.
+      const fresh = await registry.getRecord(record.invocationId);
+      if (!fresh) {
+        recordCallbackAuthFailure({ reason: 'unknown_invocation', tool: 'refresh-token', agentId: record.agentId });
+        reply.status(401);
+        return {
+          error: 'callback_auth_failed',
+          reason: 'unknown_invocation',
+          message: 'Invocation vanished between preHandler verify and refresh re-fetch',
+          hint: '',
+        };
+      }
+      const ttlRemainingMs = Math.max(0, fresh.expiresAt - Date.now());
+      return { ok: true, expiresAt: fresh.expiresAt, ttlRemainingMs };
+    },
+  );
+
+  // F22: Rich block creation via MCP callback
+  app.post('/api/callbacks/create-rich-block', async (request, reply) => {
+    // #85 M2b: normalize block before Zod parse (type→kind, auto v:1)
+    const rawBody = request.body as Record<string, unknown>;
+    if (rawBody && typeof rawBody === 'object' && rawBody.block) {
+      normalizeRichBlock(rawBody.block);
+    }
+
+    const parsed = createRichBlockSchema.safeParse(rawBody);
+    if (!parsed.success) {
+      reply.status(400);
+      return { error: 'Invalid request body', details: parsed.error.issues };
+    }
+
+    const record = requireCallbackAuth(request, reply);
+    if (!record) return;
+
+    const { block } = parsed.data;
+    const { invocationId } = record;
+    // #573: parent (outer) id used for broadcast identity to align with stream/queue path.
+    const effectiveInvId = record.parentInvocationId ?? invocationId;
+
+    // F34-b P2: audio blocks must have at least url or text (R10: trim whitespace)
+    if (block.kind === 'audio' && !block.url?.trim() && !block.text?.trim()) {
+      reply.status(400);
+      return { error: 'audio block requires url or text' };
+    }
+
+    if (!(await registry.isLatest(invocationId))) {
+      return { status: 'stale_ignored' };
+    }
+
+    // F34-b: Resolve voice blocks (audio with text, no url) before buffering
+    let resolvedBlock: RichBlock = block as unknown as RichBlock;
+    const synthesizer = getVoiceBlockSynthesizer();
+    if (synthesizer && block.kind === 'audio' && 'text' in block) {
+      const resolved = await synthesizer.resolveVoiceBlocks([block as unknown as RichBlock], record.agentId as string);
+      if (resolved.length > 0) resolvedBlock = resolved[0]!;
+    }
+
+    // Buffer the block — consumed at append time in route-serial/route-parallel
+    const isNew = getRichBlockBuffer().add(record.threadId, record.agentId as string, resolvedBlock, invocationId);
+
+    // Only broadcast new blocks (dedup retries at server to prevent frontend duplicates)
+    // #454/573: include effectiveInvId (parent/outer) so frontend can exact-match
+    // callback to stream bubble.
+    // F194 Phase Z3 (砚砚 R2 P1-4): rich_block broadcast 带 turnInvocationId
+    if (isNew) {
+      socketManager.broadcastAgentMessage(
+        {
+          type: 'system_info' as const,
+          agentId: record.agentId,
+          content: JSON.stringify({ type: 'rich_block', block: resolvedBlock }),
+          ...stampVisibleTurn(effectiveInvId, invocationId),
+          timestamp: Date.now(),
+        },
+        record.threadId,
+      );
+    }
+
+    // F182 AC-C1: A class — routing_warnings + KD-7 message (rich blocks have no routing targets)
+    return { status: 'ok', routing_warnings: [], message: '富文本块已创建。' };
+  });
+
+  // F079 Gap 4: Agent-initiated vote via MCP callback
+  const startVoteCallbackSchema = z.object({
+    question: z.string().min(1).max(500),
+    options: z.array(z.string().min(1).max(100)).min(2).max(20),
+    anonymous: z.boolean().optional().default(false),
+    timeoutSec: z.number().int().min(10).max(600).optional().default(120),
+    voters: z.array(z.string().min(1).max(50)).min(1).max(20),
+  });
+
+  app.post('/api/callbacks/start-vote', async (request, reply) => {
+    if (!threadStore) {
+      reply.status(503);
+      return { error: 'Thread store not configured' };
+    }
+
+    const parsed = startVoteCallbackSchema.safeParse(request.body);
+    if (!parsed.success) {
+      reply.status(400);
+      return { error: 'Invalid request body', details: parsed.error.issues };
+    }
+
+    const record = requireCallbackAuth(request, reply);
+    if (!record) return;
+
+    const { question, options, anonymous, timeoutSec, voters } = parsed.data;
+
+    // P1-2 fix: stale invocation guard (parity with post-message, create-rich-block)
+    if (!(await registry.isLatest(record.invocationId))) {
+      return { status: 'stale_ignored' };
+    }
+
+    // P2 fix: verify thread exists
+    const thread = await threadStore.get(record.threadId);
+    if (!thread) {
+      reply.status(404);
+      return { error: '对话不存在', code: 'THREAD_NOT_FOUND' };
+    }
+
+    // F182 AC-C2: B class — validate all voters are available, collect resolved canonical agentIds
+    const resolvedVoters: AgentId[] = [];
+    for (const voter of voters) {
+      const resolved = resolveAgentTarget(voter);
+      if ('error' in resolved) {
+        reply.status(400);
+        return resolved.error;
+      }
+      resolvedVoters.push(createAgentId(resolved.ok));
+    }
+
+    // Check for existing active vote
+    const existing = await threadStore.getVotingState(record.threadId);
+    if (existing && existing.status === 'active') {
+      reply.status(409);
+      return { error: '已有活跃投票', code: 'VOTE_ALREADY_ACTIVE' };
+    }
+
+    // P1-1 fix: createdBy must be userId (closeVoteInternal uses it as message userId).
+    // initiatedByAgent tracks which agent started the vote (for display purposes).
+    const votingState: VotingStateV1 = {
+      v: 1,
+      question,
+      options,
+      votes: {},
+      anonymous,
+      deadline: Date.now() + timeoutSec * 1000,
+      createdBy: record.userId,
+      status: 'active',
+      voters: resolvedVoters,
+      initiatedByAgent: record.agentId as string,
+    };
+
+    await threadStore.updateVotingState(record.threadId, votingState);
+
+    // Register timeout auto-close (shared timer map with votes.ts)
+    clearVoteTimer(record.threadId);
+    const timer = setTimeout(() => {
+      closeVoteInternal(record.threadId, threadStore, socketManager, messageStore).catch((err) => {
+        log.error({ threadId: record.threadId, err }, 'Timeout auto-close failed');
+      });
+    }, timeoutSec * 1000);
+    if (typeof timer === 'object' && 'unref' in timer) timer.unref();
+    voteTimers.set(record.threadId, timer);
+
+    socketManager.broadcastToRoom(`thread:${record.threadId}`, 'vote_started', {
+      threadId: record.threadId,
+      votingState,
+    });
+
+    // Send notification message to each voter (so they see the vote request in chat)
+    const notificationContent = buildVoteNotification(question, options);
+    const mentionAgentIds = resolvedVoters;
+    let notificationMsg: Awaited<ReturnType<typeof messageStore.append>> | undefined;
+    try {
+      notificationMsg = await messageStore.append({
+        userId: record.userId,
+        agentId: record.agentId,
+        content: notificationContent,
+        mentions: mentionAgentIds,
+        origin: 'callback',
+        timestamp: Date.now(),
+        threadId: record.threadId,
+      });
+    } catch (err) {
+      log.warn({ err }, 'Failed to persist vote notification');
+    }
+
+    // Dispatch voter agents so they receive the notification and can vote.
+    // Uses enqueueA2ATargets (standard A2A dispatch, NOT multi_mention depth guard).
+    // If queue overflows (>MAX_QUEUE_DEPTH), falls back to direct dispatch for remaining voters.
+    if (notificationMsg && router && invocationRecordStore) {
+      const a2aDeps = {
+        router,
+        invocationRecordStore,
+        socketManager,
+        messageStore,
+        invocationTracker,
+        deliveryCursorStore,
+        queueProcessor,
+        invocationQueue: opts.invocationQueue,
+        log: app.log,
+      };
+      const a2aOpts = {
+        targetAgents: mentionAgentIds,
+        content: notificationContent,
+        userId: record.userId,
+        threadId: record.threadId,
+        triggerMessage: notificationMsg,
+        callerAgentId: record.agentId as AgentId,
+        callerTraceContext: record.traceContext,
+      };
+      try {
+        const { enqueued, coalesced } = await enqueueA2ATargets(a2aDeps, a2aOpts);
+        // Fallback: voters that hit queue capacity limit → direct dispatch.
+        // F216 AC-D5: coalesced voters are already handled (content merged into existing entry),
+        // so they must NOT be counted as missed. Only truly unhandled agents get direct dispatch.
+        const handled = new Set([...enqueued, ...(coalesced ?? [])]);
+        const missed = mentionAgentIds.filter((c) => !handled.has(c));
+        if (missed.length > 0) {
+          app.log.info(
+            { threadId: record.threadId, missed, enqueued },
+            '[callbacks/start-vote] Queue overflow: falling back to direct dispatch for remaining voters',
+          );
+          await triggerA2AInvocation(a2aDeps, { ...a2aOpts, targetAgents: missed });
+        }
+      } catch (err) {
+        app.log.warn(`[callbacks/start-vote] Failed to dispatch voter invocations: ${String(err)}`);
+      }
+    }
+
+    return { status: 'ok', threadId: record.threadId, votingState };
+  });
+
+  if (taskStore) {
+    registerCallbackTaskRoutes(app, {
+      taskStore,
+      socketManager,
+      ...(threadStore ? { threadStore } : {}),
+    });
+  }
+
+  if (opts.workflowSopStore && opts.backlogStore) {
+    registerCallbackWorkflowSopRoutes(app, {
+      workflowSopStore: opts.workflowSopStore,
+      backlogStore: opts.backlogStore,
+    });
+  }
+
+  // F087: Bootcamp state transition callbacks
+  if (opts.threadStore) {
+    registerCallbackBootcampRoutes(app, { registry, threadStore: opts.threadStore, socketManager });
+  }
+
+  // F171: First-Run Quest state transition callbacks
+  if (opts.threadStore) {
+    registerCallbackQuestRoutes(app, { registry, threadStore: opts.threadStore });
+  }
+
+  if (opts.holdBallDeps) {
+    registerCallbackHoldBallRoutes(app, opts.holdBallDeps);
+  }
+
+  // Thread agents discovery for MCP
+  if (opts.threadStore && opts.agentRegistry) {
+    registerCallbackThreadAgentsRoutes(app, {
+      threadStore: opts.threadStore,
+      agentRegistry: opts.agentRegistry,
+    });
+  }
+
+  // F128: Agent-side thread proposal callback
+  if (opts.proposalStore && opts.threadStore) {
+    registerCallbackProposeThreadRoutes(app, {
+      registry,
+      proposalStore: opts.proposalStore,
+      threadStore: opts.threadStore,
+      messageStore: opts.messageStore,
+      socketManager,
+    });
+  }
+
+  // F231 Phase C: Agent-side profile-update proposal callback
+  if (opts.profileUpdateProposalStore && opts.profileDir) {
+    registerCallbackProposeProfileUpdateRoutes(app, {
+      registry,
+      proposalStore: opts.profileUpdateProposalStore,
+      messageStore: opts.messageStore,
+      socketManager,
+      profileDir: opts.profileDir,
+    });
+  }
+
+  // F225: Agent-initiated session handoff propose callback
+  if (opts.handoffProposalStore && opts.sessionChainStore) {
+    registerCallbackProposeSessionHandoffRoutes(app, {
+      registry,
+      handoffProposalStore: opts.handoffProposalStore,
+      sessionChainStore: opts.sessionChainStore,
+      messageStore: opts.messageStore,
+      socketManager,
+    });
+  }
+
+  await registerCallbackMemoryRoutes(app, {
+    evidenceStore: opts.evidenceStore,
+    markerQueue: opts.markerQueue,
+    reflectionService: opts.reflectionService,
+  });
+
+  // F126: Limb node callback routes
+  if (opts.limbRegistry) {
+    registerCallbackLimbRoutes(app, {
+      limbRegistry: opts.limbRegistry,
+      pairingStore: opts.limbPairingStore,
+    });
+  }
+
+  // F086: Multi-mention orchestration routes
+  if (router && invocationRecordStore) {
+    registerMultiMentionRoutes(app, {
+      messageStore,
+      socketManager,
+      router,
+      invocationRecordStore,
+      ...(invocationTracker ? { invocationTracker } : {}),
+      ...(opts.invocationQueue ? { invocationQueue: opts.invocationQueue } : {}),
+      ...(queueProcessor ? { queueProcessor } : {}),
+    });
+    // Wire orchestrator into SocketManager for cancel propagation (P1-1 fix)
+    if (typeof socketManager.setMultiMentionOrchestrator === 'function') {
+      socketManager.setMultiMentionOrchestrator(getMultiMentionOrchestrator());
+    }
+  }
+
+  // F088 Phase J2: Document generation callback routes
+  registerCallbackDocumentRoutes(app, { registry, socketManager });
+
+  // F162: WeChat Work enterprise action callback routes
+  registerCallbackWeComActionRoutes(app, { registry });
+
+  // F162 Phase B: Lark/Feishu enterprise action callback routes
+  registerCallbackLarkActionRoutes(app, { registry });
+
+  // F101: Game action callback for non-Claude agents (OpenCode/Codex/Gemini)
+  registerCallbackGameRoutes(app);
+
+  // F155: Guide engine — state-validated routes with ThreadStore authority
+  if (opts.threadStore) {
+    await registerCallbackGuideRoutes(app, {
+      registry,
+      threadStore: opts.threadStore,
+      socketManager,
+      ...(opts.guideSessionStore ? { guideSessionStore: opts.guideSessionStore } : {}),
+      ...(opts.loadGuideFlow ? { loadGuideFlow: opts.loadGuideFlow } : {}),
+      ...(opts.getGuideAvailabilityContext ? { getGuideAvailabilityContext: opts.getGuideAvailabilityContext } : {}),
+    });
+  }
+};

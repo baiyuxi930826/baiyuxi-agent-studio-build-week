@@ -1,0 +1,4187 @@
+/**
+ * Agent Studio API Server
+ * 后端 API 入口
+ */
+
+import { join } from 'node:path';
+import {
+  type AgentConfig,
+  type AgentId,
+  agentRegistry as agentConfigRegistry,
+  CORE_COMMANDS,
+  type EventMemoryRecord,
+  type ILimbNode,
+} from '@agent-studio/shared';
+import type { RedisClient } from '@agent-studio/shared/utils';
+import { createRedisClient, SessionStore } from '@agent-studio/shared/utils';
+import fastifyCookie from '@fastify/cookie';
+import cors from '@fastify/cors';
+import fastifyWebsocket from '@fastify/websocket';
+import Fastify, { type FastifyReply } from 'fastify';
+import { resolveAnthropicRuntimeProfile, resolveForClient } from './config/account-resolver.js';
+import { resolveBoundAccountRefForAgent } from './config/agent-account-binding.js';
+import { getAgentContextBudget } from './config/agent-budgets.js';
+import {
+  bootstrapDefaultAgentCatalog,
+  getAcpConfig,
+  getConfigSessionStrategy,
+  getDefaultAgentId,
+  isAgentAvailable,
+  toAllAgentConfigs,
+} from './config/agent-config-loader.js';
+import { regenerateStartupCliConfigs } from './config/capabilities/startup-cli-config.js';
+import { configEventBus } from './config/config-event-bus.js';
+import { resolveFrontendBaseUrl, resolveFrontendCorsOrigins } from './config/frontend-origin.js';
+import { initRuntimeOverrides } from './config/session-strategy-overrides.js';
+import { assertStorageReady } from './config/storage-guard.js';
+import type { CollaborationContinuityCapsuleV1 } from './domains/agents/services/agents/invocation/CollaborationContinuityCapsule.js';
+import { createTaskProgressStore } from './domains/agents/services/agents/invocation/createTaskProgressStore.js';
+import { InvocationQueue } from './domains/agents/services/agents/invocation/InvocationQueue.js';
+import {
+  InvocationRegistry,
+  selectInvocationBackendKind,
+} from './domains/agents/services/agents/invocation/InvocationRegistry.js';
+import { InvocationTracker } from './domains/agents/services/agents/invocation/InvocationTracker.js';
+import type {
+  InvocationRecordStoreLike,
+  RouterLike,
+} from './domains/agents/services/agents/invocation/QueueProcessor.js';
+import { QueueProcessor } from './domains/agents/services/agents/invocation/QueueProcessor.js';
+import { SessionContinuationCoordinator } from './domains/agents/services/agents/invocation/SessionContinuationCoordinator.js';
+import { SessionMutex } from './domains/agents/services/agents/invocation/SessionMutex.js';
+import {
+  resolveAcpBootstrapArgs,
+  resolveAcpBootstrapCommand,
+  resolveAcpBootstrapCwd,
+} from './domains/agents/services/agents/providers/acp/acp-bootstrap-cwd.js';
+import { AntigravityAgentService } from './domains/agents/services/agents/providers/antigravity/AntigravityAgentService.js';
+import { RedisAntigravitySupervisorStore } from './domains/agents/services/agents/providers/antigravity/AntigravitySupervisorStore.js';
+import {
+  clearL0Cache,
+  resolveL0CompilerScriptPath,
+  warmL0Cache,
+} from './domains/agents/services/agents/providers/l0-compiler.js';
+import { AgentRegistry } from './domains/agents/services/agents/registry/AgentRegistry.js';
+import { AuthorizationManager } from './domains/agents/services/auth/AuthorizationManager.js';
+import {
+  AgentRouter,
+  AuditEventTypes,
+  CodexAgentService,
+  createDraftStore,
+  createInvocationRecordStore,
+  createSessionChainStore,
+  DareAgentService,
+  DeliveryCursorStore,
+  GeminiAgentService,
+  getEventAuditLog,
+  KimiAgentService,
+  MemoryGovernanceStore,
+  OpenCodeAgentService,
+} from './domains/agents/services/index.js';
+import { resolveWritableProfileDir } from './domains/agents/services/profile/profile-dir.js';
+import {
+  getPushNotificationService,
+  initPushNotificationService,
+  resetPushNotificationService,
+} from './domains/agents/services/push/PushNotificationService.js';
+import {
+  RuntimeSessionSealReaper,
+  type RuntimeSessionSealReaperDrainResult,
+  startSerializedRuntimeSessionSealReaperInterval,
+} from './domains/agents/services/runtime-session/RuntimeSessionSealReaper.js';
+import { createRuntimeSessionStore } from './domains/agents/services/runtime-session/RuntimeSessionStoreFactory.js';
+import type { HandoffConfig } from './domains/agents/services/session/SessionSealer.js';
+import { SessionSealer } from './domains/agents/services/session/SessionSealer.js';
+import { TranscriptReader } from './domains/agents/services/session/TranscriptReader.js';
+import { TranscriptWriter } from './domains/agents/services/session/TranscriptWriter.js';
+import { createAuthorizationAuditStore } from './domains/agents/services/stores/factories/AuthorizationAuditStoreFactory.js';
+import { createAuthorizationRuleStore } from './domains/agents/services/stores/factories/AuthorizationRuleStoreFactory.js';
+import { createBacklogStore } from './domains/agents/services/stores/factories/BacklogStoreFactory.js';
+import { createCommunityIssueDraftStore } from './domains/agents/services/stores/factories/CommunityIssueDraftStoreFactory.js';
+import { createCommunityIssueStore } from './domains/agents/services/stores/factories/CommunityIssueStoreFactory.js';
+import { createFrustrationIssueStore } from './domains/agents/services/stores/factories/FrustrationIssueStoreFactory.js';
+import { createLabelStore } from './domains/agents/services/stores/factories/LabelStoreFactory.js';
+import { createMemoryStore } from './domains/agents/services/stores/factories/MemoryStoreFactory.js';
+import { createMessageStore } from './domains/agents/services/stores/factories/MessageStoreFactory.js';
+import { createPendingRequestStore } from './domains/agents/services/stores/factories/PendingRequestStoreFactory.js';
+import { createProfileUpdateProposalStore } from './domains/agents/services/stores/factories/ProfileUpdateProposalStoreFactory.js';
+import { createProposalStore } from './domains/agents/services/stores/factories/ProposalStoreFactory.js';
+import { createPushSubscriptionStore } from './domains/agents/services/stores/factories/PushSubscriptionStoreFactory.js';
+import { createReadStateStore } from './domains/agents/services/stores/factories/ReadStateStoreFactory.js';
+import { createSessionHandoffProposalStore } from './domains/agents/services/stores/factories/SessionHandoffProposalStoreFactory.js';
+import { createSummaryStore } from './domains/agents/services/stores/factories/SummaryStoreFactory.js';
+import { createTaskStore } from './domains/agents/services/stores/factories/TaskStoreFactory.js';
+import { createThreadStore } from './domains/agents/services/stores/factories/ThreadStoreFactory.js';
+import { createWorkflowSopStore } from './domains/agents/services/stores/factories/WorkflowSopStoreFactory.js';
+import { RedisInvocationRecordStore } from './domains/agents/services/stores/redis/RedisInvocationRecordStore.js';
+import { RedisMessageStore } from './domains/agents/services/stores/redis/RedisMessageStore.js';
+import { MlxAudioTtsProvider } from './domains/agents/services/tts/MlxAudioTtsProvider.js';
+import { initStreamingTtsRegistry } from './domains/agents/services/tts/StreamingTtsChunker.js';
+import { TtsRegistry } from './domains/agents/services/tts/TtsRegistry.js';
+import { startTtsCacheCleaner } from './domains/agents/services/tts/tts-cache-cleaner.js';
+import { initVoiceBlockSynthesizer } from './domains/agents/services/tts/VoiceBlockSynthesizer.js';
+import type { AgentService } from './domains/agents/services/types.js';
+import { ActivityTracker } from './domains/health/ActivityTracker.js';
+import { shouldTrackApiActivity } from './domains/health/activity-route-filter.js';
+import { PortDiscoveryService } from './domains/preview/port-discovery.js';
+import { collectRuntimePorts } from './domains/preview/port-validator.js';
+import { PreviewGateway } from './domains/preview/preview-gateway.js';
+import { appendServiceLog } from './domains/services/service-lifecycle.js';
+import { createSignalArticleLookup } from './domains/signals/services/signal-thread-lookup.js';
+import { AgentPaneRegistry } from './domains/terminal/agent-pane-registry.js';
+import { TmuxGateway } from './domains/terminal/tmux-gateway.js';
+import { CommandRegistry } from './infrastructure/commands/CommandRegistry.js';
+import { parseManifestSlashCommands } from './infrastructure/commands/manifest-commands.js';
+import { buildThreadDeepLink } from './infrastructure/connectors/connector-command-helpers.js';
+import {
+  applyConnectorGatewayAutostartPolicy,
+  isPreconfiguredConnectorAutostartEnabled,
+  loadConnectorGatewayConfig,
+  startConnectorGateway,
+} from './infrastructure/connectors/connector-gateway-bootstrap.js';
+import { restartConnectorGateway } from './infrastructure/connectors/connector-gateway-lifecycle.js';
+import { createConnectorReloadSubscriber } from './infrastructure/connectors/connector-reload-subscriber.js';
+import type { RepoIssueComment } from './infrastructure/connectors/github-repo-event/RepoCommentPollTaskSpec.js';
+import { IssueCommentRouter } from './infrastructure/email/IssueCommentRouter.js';
+import {
+  CiCdRouter,
+  ConflictRouter,
+  ConnectorInvokeTrigger,
+  fetchPrCiStatus,
+  ReviewFeedbackRouter,
+} from './infrastructure/email/index.js';
+import { buildGhCliEnv, resolveGhCliToken } from './infrastructure/github/gh-cli-env.js';
+import { runSchedulerReplyUserIdBackfill } from './infrastructure/scheduler/scheduler-reply-userid-backfill.js';
+import { securityHeadersPlugin } from './infrastructure/security-headers.js';
+import { sessionAuthPlugin, sessionRoute } from './infrastructure/session-auth.js';
+import { SocketManager } from './infrastructure/websocket/index.js';
+import { avatarsRoutes } from './routes/avatars.js';
+import { CallbackAuthSystemMessageNotifier } from './routes/callback-auth-system-message.js';
+import { configSecretsRoutes } from './routes/config-secrets.js';
+import { connectorWebhookRoutes } from './routes/connector-webhooks.js';
+import { gameRoutes } from './routes/games.js';
+import {
+  accountsRoutes,
+  agentHooksRoutes,
+  agentsRoutes,
+  audioProxyRoutes,
+  auditRoutes,
+  authorizationRoutes,
+  backlogRoutes,
+  bootcampRoutes,
+  brakeRoutes,
+  callbackAuthRoutes,
+  callbacksRoutes,
+  capabilitiesRoutes,
+  claudeRescueRoutes,
+  commandsRoutes,
+  communityIssueDraftRoutes,
+  communityIssueRoutes,
+  conciergeRoutes,
+  configRoutes,
+  connectorHubRoutes,
+  connectorMediaRoutes,
+  distillationRoutes,
+  eventsRoutes,
+  evidenceRoutes,
+  executionDigestRoutes,
+  exportRoutes,
+  externalProjectRoutes,
+  externalRuntimeSessionsRoutes,
+  featureDocDetailRoutes,
+  firstRunQuestRoutes,
+  frustrationIssueRoutes,
+  governanceStatusRoute,
+  guideActionRoutes,
+  intentCardRoutes,
+  invocationsRoutes,
+  labelsRoutes,
+  leaderboardEventsRoutes,
+  leaderboardRoutes,
+  libraryRoutes,
+  memoryPublishRoutes,
+  memoryRoutes,
+  messageActionsRoutes,
+  messagesRoutes,
+  mkdirRoute,
+  packsRoutes,
+  perspectiveRoutes,
+  projectSetupRoute,
+  projectsBootstrapRoutes,
+  projectsRoutes,
+  proposalRoutes,
+  pushRoutes,
+  queueRoutes,
+  quotaRoutes,
+  recallMetricsRoutes,
+  refAudioUploadRoutes,
+  reflectRoutes,
+  refluxRoutes,
+  registerCallbackAuthDebugRoute,
+  registerCallbackDocsRoutes,
+  registerProfileUpdateDecisionRoutes,
+  resolutionRoutes,
+  rulesRoutes,
+  servicesRoutes,
+  sessionChainRoutes,
+  sessionHandoffApproveRoutes,
+  sessionHooksRoutes,
+  sessionStrategyConfigRoutes,
+  sessionTranscriptRoutes,
+  signalCollectionRoutes,
+  signalPodcastRoutes,
+  signalStudyRoutes,
+  signalsRoutes,
+  skillsRoutes,
+  skillsWriteRoutes,
+  sliceRoutes,
+  summariesRoutes,
+  tasksRoutes,
+  threadAgentsRoutes,
+  threadBranchRoutes,
+  threadsRoutes,
+  toolUsageRoutes,
+  ttsRoutes,
+  uploadsRoutes,
+  usageRoutes,
+  workflowCapabilitiesRoutes,
+  workflowSopRoutes,
+  workspaceEditRoutes,
+  workspaceGitRoutes,
+  workspaceRoutes,
+  worldRoutes,
+} from './routes/index.js';
+import { knowledgeFeedRoutes } from './routes/knowledge-feed.js';
+import { marketplaceRoutes } from './routes/marketplace.js';
+import { previewRoutes } from './routes/preview.js';
+import { terminalRoutes } from './routes/terminal.js';
+import { threadExportRoutes } from './routes/thread-export.js';
+import { threadMemberStrategyRoutes } from './routes/thread-member-strategy.js';
+import { ApiInstanceLease, type ApiInstanceLeaseInvalidation } from './services/ApiInstanceLease.js';
+import { resolveMemoryRepoPaths } from './utils/memory-root.js';
+import { findMonorepoRoot } from './utils/monorepo-root.js';
+import { resolveUserId } from './utils/request-identity.js';
+import { getDefaultUploadDir } from './utils/upload-paths.js';
+
+const PORT = parseInt(process.env.API_SERVER_PORT ?? '3004', 10);
+const HOST = process.env.API_SERVER_HOST ?? '127.0.0.1';
+
+let socketManager: SocketManager | null = null;
+let redisClient: RedisClient | null = null;
+let burnRateMonitor: { start(): void; stop(): void } | null = null;
+
+/**
+ * Get the SocketManager instance
+ * @throws Error if SocketManager is not initialized
+ */
+export function getSocketManager(): SocketManager {
+  if (!socketManager) {
+    throw new Error('SocketManager not initialized');
+  }
+  return socketManager;
+}
+
+const PROCESS_START_AT = Date.now();
+
+function hasRuntimeSessionDrain(service: AgentService): service is AgentService & {
+  drainRuntimeSession(runtimeSessionId: string): Promise<RuntimeSessionSealReaperDrainResult>;
+} {
+  return typeof (service as { drainRuntimeSession?: unknown }).drainRuntimeSession === 'function';
+}
+
+async function main(): Promise<void> {
+  const { logger: customLogger, isDebugMode, LOG_DIR_PATH } = await import('./infrastructure/logger.js');
+
+  // F152: Initialize OpenTelemetry SDK (must be early, before routes)
+  const { initTelemetry } = await import('./infrastructure/telemetry/init.js');
+  const telemetryHandle = initTelemetry();
+
+  const app = Fastify({ logger: customLogger as unknown as import('fastify').FastifyBaseLogger });
+
+  if (isDebugMode) {
+    app.log.info({ logDir: LOG_DIR_PATH }, '[api] Debug mode enabled (--debug flag)');
+  }
+
+  // CORS for frontend
+  await app.register(cors, {
+    origin: resolveFrontendCorsOrigins(process.env, app.log),
+    credentials: true,
+  });
+
+  // F156 D-2: Anti-clickjacking headers (X-Frame-Options + CSP frame-ancestors)
+  await app.register(securityHeadersPlugin);
+
+  // F156 D-1: Cookie parsing + session-based identity (replaces userId self-reporting)
+  await app.register(fastifyCookie);
+  await app.register(sessionAuthPlugin);
+  await app.register(sessionRoute);
+
+  // WebSocket support (F089 terminal)
+  await app.register(fastifyWebsocket);
+
+  // Prevent Fastify from intercepting Socket.IO paths — Socket.IO handles
+  // them via its own http server listeners (both polling and WebSocket).
+  // Without this, @fastify/websocket causes Fastify to send 404 for
+  // /socket.io/ upgrade requests, killing WebSocket transport entirely.
+  app.addHook('onRequest', (_request, reply, done) => {
+    if (_request.url.startsWith('/socket.io/')) {
+      reply.hijack();
+    }
+    done();
+  });
+
+  // Health check. Keep root paths for direct API access and expose /api/*
+  // aliases for same-origin reverse-proxy deployments.
+  const healthHandler = async () => ({ status: 'ok' as const, timestamp: Date.now() });
+  app.get('/health', healthHandler);
+  app.get('/api/health', healthHandler);
+
+  // F152: Readiness check — verifies dependencies are reachable.
+  // evidenceStoreRef is set after memoryServices init; handler runs at request time.
+  let evidenceStoreRef: { health(): Promise<boolean> } | null = null;
+  async function checkReadiness(): Promise<{
+    status: 'ready' | 'degraded';
+    checks: Record<string, { ok: boolean; ms: number; error?: string }>;
+  }> {
+    const checks: Record<string, { ok: boolean; ms: number; error?: string }> = {};
+    if (redisClient) {
+      const t0 = Date.now();
+      try {
+        await redisClient.ping();
+        checks.redis = { ok: true, ms: Date.now() - t0 };
+      } catch (err) {
+        checks.redis = { ok: false, ms: Date.now() - t0, error: String(err) };
+      }
+    } else {
+      checks.redis = { ok: true, ms: 0 };
+    }
+    if (evidenceStoreRef) {
+      const t0 = Date.now();
+      try {
+        const ok = await evidenceStoreRef.health();
+        checks.sqlite = { ok, ms: Date.now() - t0, ...(ok ? {} : { error: 'SELECT 1 failed' }) };
+      } catch (err) {
+        checks.sqlite = { ok: false, ms: Date.now() - t0, error: String(err) };
+      }
+    }
+    const allOk = Object.values(checks).every((c) => c.ok);
+    return { status: allOk ? 'ready' : 'degraded', checks };
+  }
+  const readyHandler = async (_request: unknown, reply: FastifyReply) => {
+    const result = await checkReadiness();
+    if (result.status !== 'ready') reply.code(503);
+    return { ...result, timestamp: Date.now() };
+  };
+  app.get('/ready', readyHandler);
+  app.get('/api/ready', readyHandler);
+
+  // Create invocation tracker for cancellation support
+  const invocationTracker = new InvocationTracker();
+
+  // Initialize WebSocket manager BEFORE routes (injected via opts, no circular import).
+  // IMPORTANT: Socket.io must attach to the SAME server Fastify listens on.
+  socketManager = new SocketManager(app.server, invocationTracker);
+
+  // F063: Workspace file change watcher — pushes file-changed events to clients
+  const { setupWorkspaceFileWatcher } = await import('./domains/workspace/workspace-file-watcher.js');
+  setupWorkspaceFileWatcher(socketManager.getIO());
+
+  // F153 Phase E L3: Burn-rate alerting — push system_notice via WebSocket
+  if (telemetryHandle.getMetricsText) {
+    const { BurnRateMonitor } = await import('./infrastructure/telemetry/burn-rate-monitor.js');
+    burnRateMonitor = new BurnRateMonitor({
+      getMetricsText: telemetryHandle.getMetricsText,
+      onAlert: (alerts) => {
+        const lines = alerts.map((a) => `${a.metric}: ${a.currentValue.toFixed(2)} (threshold: ${a.threshold})`);
+        socketManager?.broadcastToRoom('workspace:global', 'connector_message', {
+          message: {
+            type: 'connector',
+            content: `[Telemetry Alert] Thresholds exceeded:\n${lines.join('\n')}`,
+            source: { presentation: 'system_notice', noticeTone: 'warning' },
+            timestamp: Date.now(),
+          },
+        });
+      },
+      onClear: () => {
+        socketManager?.broadcastToRoom('workspace:global', 'connector_message', {
+          message: {
+            type: 'connector',
+            content: '[Telemetry] All metrics recovered to normal levels.',
+            source: { presentation: 'system_notice', noticeTone: 'info' },
+            timestamp: Date.now(),
+          },
+        });
+      },
+    });
+    burnRateMonitor.start();
+  }
+
+  // F085 Phase 4: Platform-level activity tracker (hyperfocus brake)
+  const activityTracker = new ActivityTracker();
+  app.addHook('onRequest', (request, _reply, done) => {
+    // Skip non-user API paths and brake endpoints (avoid trigger-on-checkin loop)
+    if (!shouldTrackApiActivity(request.url)) {
+      done();
+      return;
+    }
+    const userId = resolveUserId(request);
+    if (userId) {
+      activityTracker.recordActivity(userId);
+      // shouldTrigger reads per-user settings (enabled + threshold) internally
+      const level = activityTracker.shouldTrigger(userId);
+      if (level > 0 && socketManager) {
+        activityTracker.markTriggered(userId, level as 1 | 2 | 3);
+        socketManager.emitToUser(userId, 'brake:trigger', {
+          level,
+          activeMinutes: Math.round(activityTracker.getState(userId).activeWorkMs / 60_000),
+          nightMode: ActivityTracker.isNightMode(),
+          timestamp: Date.now(),
+        });
+      }
+    }
+    done();
+  });
+
+  // Create shared service instances for MCP callback flow
+  const redisUrl = process.env.REDIS_URL;
+  const redis = redisUrl ? createRedisClient({ url: redisUrl }) : undefined;
+  redisClient = redis ?? null;
+
+  // F174 Phase B: select InvocationRegistry backend.
+  // - 'redis' (default when Redis available): API restart no longer drops tokens
+  // - 'memory' (fallback / opt-out): pre-Phase-B in-memory behavior
+  // - if Redis unavailable, force memory regardless of env (degraded mode)
+  // F174-B P2 fix (cloud Codex review #1363): reject unsupported env values
+  // via shared helper. Silent fallback masks typos (REDUS=...) -> user thinks
+  // Redis is active but actually in-memory (defeats Phase B). Throw on unknown.
+  const registryBackendKind = selectInvocationBackendKind(process.env.AGENT_STUDIO_INVOCATION_REGISTRY, !!redis);
+  const registry =
+    registryBackendKind === 'redis' && redis
+      ? new InvocationRegistry({
+          backend: new (
+            await import('./domains/agents/services/agents/invocation/RedisAuthInvocationBackend.js')
+          ).RedisAuthInvocationBackend(redis),
+        })
+      : new InvocationRegistry();
+  app.log.info(`[api] InvocationRegistry backend: ${registryBackendKind === 'redis' && redis ? 'redis' : 'memory'}`);
+
+  const { AgentKeyRegistry } = await import('./domains/agents/services/agents/agent-key/AgentKeyRegistry.js');
+  const agentKeyRegistryBackendKind = redis ? 'redis' : 'memory';
+  const agentKeyRegistry =
+    agentKeyRegistryBackendKind === 'redis' && redis
+      ? new AgentKeyRegistry({
+          backend: new (
+            await import('./domains/agents/services/agents/agent-key/RedisAgentKeyBackend.js')
+          ).RedisAgentKeyBackend(redis),
+        })
+      : new AgentKeyRegistry();
+  app.log.info(`[api] AgentKeyRegistry initialized (${agentKeyRegistryBackendKind} backend)`);
+  try {
+    const { shouldProvisionAntigravityAgentKeySidecar } = await import(
+      './domains/agents/services/agents/agent-key/antigravity-agent-key-sidecar-policy.js'
+    );
+    if (shouldProvisionAntigravityAgentKeySidecar({ backendKind: agentKeyRegistryBackendKind })) {
+      const { ensureAntigravityAgentKeySidecar } = await import(
+        './domains/agents/services/agents/agent-key/antigravity-agent-key-sidecar.js'
+      );
+      const sidecar = await ensureAntigravityAgentKeySidecar(agentKeyRegistry);
+      app.log.info(
+        `[api] Antigravity agent-key sidecar ready: ${sidecar.filePath} (${sidecar.agentId}/${sidecar.userId})`,
+      );
+    } else {
+      app.log.warn(
+        '[api] Antigravity agent-key sidecar skipped: memory AgentKeyRegistry cannot safely back global sidecar files; set AGENT_STUDIO_AGENT_KEY_ALLOW_MEMORY_SIDECAR=1 only for local degraded development',
+      );
+    }
+  } catch (err) {
+    app.log.warn(`[api] Antigravity agent-key sidecar setup failed (best-effort): ${String(err)}`);
+  }
+
+  // Fail-closed: refuse to start without Redis unless explicitly opted into memory mode.
+  // Also verify Redis is actually reachable (PING), not just configured.
+  if (redis) {
+    try {
+      await redis.ping();
+      app.log.info('[api] Redis PING OK');
+    } catch (err) {
+      await redis.quit().catch(() => {});
+      throw new Error(
+        `[api] Redis PING failed: ${err instanceof Error ? err.message : err}. ` +
+          'Check REDIS_URL or set MEMORY_STORE=1 for memory mode.',
+      );
+    }
+  }
+  const storageResult = assertStorageReady(!!redis);
+  app.log.info(`[api] Storage mode: ${storageResult.mode}`);
+  const { systemStatusRoutes } = await import('./routes/system-status.js');
+  await app.register(systemStatusRoutes, { storageMode: storageResult.mode });
+
+  // F102 KD-34: append listener placeholder (wired after memoryServices init)
+  let appendListener: ((msg: { id: string; threadId: string; timestamp: number; content: string }) => void) | null =
+    null;
+
+  const messageStore = createMessageStore(redis, {
+    onAppend: (msg) => {
+      appendListener?.(msg);
+    },
+  });
+  const sessionStore = redis ? new SessionStore(redis) : undefined;
+  const deliveryCursorStore = new DeliveryCursorStore(sessionStore);
+  const threadStore = createThreadStore(redis);
+  const proposalStore = createProposalStore(redis);
+  const handoffProposalStore = createSessionHandoffProposalStore(redis);
+  // F231 Phase C: profile-update proposals + per-target write lock (process-scoped, like
+  // SessionMutex/F118) + profile data dir (MUST match l0-compiler's capsule/primer read path).
+  const profileUpdateProposalStore = createProfileUpdateProposalStore(redis);
+  const profileUpdateLock = new SessionMutex();
+  const profileDir = resolveWritableProfileDir(process.cwd(), resolveL0CompilerScriptPath());
+  const frustrationIssueStore = createFrustrationIssueStore(redis);
+
+  // F235: Community issue draft store + publisher for "Publish to Community" flow
+  const communityIssueDraftStore = createCommunityIssueDraftStore(redis);
+
+  // F222: Create early so it's available for both AgentRouter (cancel burst detection) and AuthorizationManager
+  const authPendingStore = createPendingRequestStore(redis);
+  // F155 B-4/B-6: Guide state is runtime-only (in-memory, resets on restart)
+  const { InMemoryGuideSessionStore } = await import('./domains/guides/GuideSessionRepository.js');
+  const guideSessionStore = new InMemoryGuideSessionStore();
+  const { InMemoryGuideDismissTracker } = await import('./domains/guides/GuideDismissTracker.js');
+  const dismissTracker = new InMemoryGuideDismissTracker();
+  const taskStore = createTaskStore(redis);
+  const labelStore = createLabelStore(redis);
+  const communityIssueStore = createCommunityIssueStore(redis);
+
+  // F168 Phase A P1-1: create community event services from Redis (best-effort, optional).
+  // Passed to communityIssueRoutes, rehydrateGitHubSchedules, and connector gateway.
+  let communityEventLog: import('./domains/community/CommunityEventLog.js').ICommunityEventLog | undefined;
+  let communityObjectStore: import('./domains/community/CommunityObjectStore.js').ICommunityObjectStore | undefined;
+  let communityProjector: import('./domains/community/community-projector.js').CommunityProjector | undefined;
+  // F233 Phase B (B2): ball-custody ingest（fire-and-forget 旁路写球权事件，注入 AgentRouter）
+  let ballCustodyIngest: import('./domains/ball-custody/BallCustodyIngest.js').BallCustodyIngest | undefined;
+  if (redis) {
+    const [elMod, osMod, pjMod] = await Promise.all([
+      import('./domains/community/CommunityEventLog.js'),
+      import('./domains/community/CommunityObjectStore.js'),
+      import('./domains/community/community-projector.js'),
+    ]);
+    communityEventLog = new elMod.RedisCommunityEventLog(redis);
+    communityObjectStore = new osMod.RedisCommunityObjectStore(redis);
+    communityProjector = new pjMod.CommunityProjector(communityEventLog, communityObjectStore);
+    app.log.info('[api] F168 Phase A: community event services initialized');
+
+    // F233 Phase B (B2): ball-custody 事件流 stack（旁路写球权事件，照 community ingest 先例）
+    const [bcMod, bcStoreMod, bcProjMod, bcIngestMod] = await Promise.all([
+      import('./domains/ball-custody/BallCustodyEventLog.js'),
+      import('./domains/ball-custody/BallCustodyProjectionStore.js'),
+      import('./domains/ball-custody/BallCustodyProjector.js'),
+      import('./domains/ball-custody/BallCustodyIngest.js'),
+    ]);
+    const ballCustodyEventLog = new bcMod.RedisBallCustodyEventLog(redis);
+    const ballCustodyProjectionStore = new bcStoreMod.RedisBallCustodyProjectionStore(redis);
+    const ballCustodyProjector = new bcProjMod.BallCustodyProjector(ballCustodyEventLog, ballCustodyProjectionStore);
+    ballCustodyIngest = new bcIngestMod.BallCustodyIngest(ballCustodyEventLog, ballCustodyProjector);
+    app.log.info('[api] F233 Phase B: ball-custody ingest initialized');
+  }
+
+  if (redis) {
+    const { RedisPrTrackingStore } = await import('./infrastructure/email/RedisPrTrackingStore.js');
+    const { backfillLegacyPrTracking } = await import('./infrastructure/email/backfill-legacy-pr-tracking.js');
+    await backfillLegacyPrTracking({
+      legacyStore: new RedisPrTrackingStore(redis),
+      taskStore,
+      log: app.log,
+    });
+  }
+
+  // F153 Phase F AC-F4: Hydrate trace store from Redis messages on cold start
+  if (telemetryHandle.traceStore && redis) {
+    const { hydrateTraceStoreFromRedis } = await import('./infrastructure/telemetry/hydrate-traces.js');
+    void hydrateTraceStoreFromRedis(telemetryHandle.traceStore, redis).catch(() => {});
+  }
+
+  const backlogStore = createBacklogStore(redis);
+  const workflowSopStore = createWorkflowSopStore(redis);
+  const summaryStore = createSummaryStore(redis);
+  const memoryStore = createMemoryStore(redis);
+  const taskProgressStore = createTaskProgressStore(redis);
+  const invocationRecordStore = createInvocationRecordStore(redis);
+  const draftStore = createDraftStore(redis);
+  const readStateStore = createReadStateStore(redis);
+  const { ExecutionDigestStore } = await import('./domains/projects/execution-digest-store.js');
+  const executionDigestStore = new ExecutionDigestStore();
+
+  if (
+    redis &&
+    messageStore instanceof RedisMessageStore &&
+    invocationRecordStore instanceof RedisInvocationRecordStore
+  ) {
+    const { getOwnerUserId } = await import('./config/agent-config-loader.js');
+    const backfillResult = await runSchedulerReplyUserIdBackfill({
+      redis,
+      messageStore,
+      invocationRecordStore,
+      threadStore,
+      defaultUserId: getOwnerUserId(),
+    });
+    if (!backfillResult.skipped && (backfillResult.repairedMessages > 0 || backfillResult.repairedInvocations > 0)) {
+      app.log.info(
+        {
+          repairedMessages: backfillResult.repairedMessages,
+          repairedInvocations: backfillResult.repairedInvocations,
+        },
+        '[api] F139 scheduler reply userId backfill completed',
+      );
+    }
+  }
+
+  const sessionChainStore = createSessionChainStore(redis);
+  const runtimeSessionStore = createRuntimeSessionStore(redis);
+  // F24: Transcript Writer/Reader for session chain
+  // E7 fix: resolve relative to monorepo root, not CWD (same fix as docsRoot in PR #524)
+  const transcriptDataDir = process.env.TRANSCRIPT_DATA_DIR ?? `${findMonorepoRoot(process.cwd())}/data/transcripts`;
+  const transcriptWriter = new TranscriptWriter({ dataDir: transcriptDataDir });
+  const transcriptReader = new TranscriptReader({ dataDir: transcriptDataDir });
+  // F065 Phase C: HandoffConfig for LLM-generated digest on seal
+  const handoffConfig: HandoffConfig = {
+    getBootstrapDepth: (agentId: string) => getConfigSessionStrategy(agentId)?.handoff?.bootstrapDepth ?? 'extractive',
+    resolveProfile: async (threadId: string, agentId: string) => {
+      try {
+        let projectRoot = findMonorepoRoot(process.cwd());
+        const thread = await threadStore.get(threadId);
+        if (thread?.projectPath && thread.projectPath !== 'default') {
+          projectRoot = thread.projectPath;
+        }
+        const agentConfig = agentConfigRegistry.tryGet(agentId)?.config;
+        if (agentConfig?.clientId === 'anthropic' || agentConfig?.clientId === 'opencode') {
+          const effectiveAccountRef = resolveBoundAccountRefForAgent(projectRoot, agentId, agentConfig);
+          const runtime = resolveForClient(projectRoot, agentConfig.clientId, effectiveAccountRef);
+          if (!runtime?.apiKey) return null;
+          return { apiKey: runtime.apiKey, baseUrl: runtime.baseUrl || 'https://api.anthropic.com' };
+        }
+
+        const runtime = resolveAnthropicRuntimeProfile(projectRoot);
+        if (!runtime.apiKey) return null;
+        return { apiKey: runtime.apiKey, baseUrl: runtime.baseUrl || 'https://api.anthropic.com' };
+      } catch {
+        return null;
+      }
+    },
+  };
+  const sessionSealer = new SessionSealer(
+    sessionChainStore,
+    transcriptWriter,
+    threadStore,
+    transcriptReader,
+    (agentId) => getAgentContextBudget(agentId).maxPromptTokens,
+    handoffConfig,
+    summaryStore,
+  );
+
+  // F102: Memory services — SQLite-only
+  const { resolve } = await import('node:path');
+  const { repoRoot, docsRoot, markersDir } = resolveMemoryRepoPaths(process.cwd());
+
+  const { initRepoIdentity, isSameRepo } = await import('./utils/is-same-repo.js');
+  initRepoIdentity(repoRoot);
+
+  const { createMemoryServices } = await import('./domains/memory/factory.js');
+  // Resolve embed mode. Priority:
+  //   1. If the user enabled the Embedding service in console (service.enabled=true),
+  //      force the in-process mode to 'on' (or honor an explicit 'shadow' / 'on' env
+  //      override). UI toggle is the most direct expression of user intent — letting
+  //      a stale EMBED_MODE=off in .env silently disable catch-up would be a foot-gun
+  //      (sidecar runs, but evidence_vectors stays empty + catch-up logs probed=false).
+  //   2. Otherwise, an explicit EMBED_MODE env wins.
+  //   3. Otherwise, default 'off' (service disabled in console, no env → no
+  //      embedding services wired up).
+  const { getServiceConfig: getEmbedSvcCfg } = await import('./domains/services/service-config.js');
+  const embedSvcEnabled = getEmbedSvcCfg('embedding-model')?.enabled ?? false;
+  const resolvedEmbedMode: 'off' | 'shadow' | 'on' = (() => {
+    const envMode = process.env.EMBED_MODE;
+    if (embedSvcEnabled) {
+      return envMode === 'shadow' || envMode === 'on' ? envMode : 'on';
+    }
+    if (envMode === 'off' || envMode === 'shadow' || envMode === 'on') return envMode;
+    return 'off';
+  })();
+  app.log.info(
+    `[api] F102: embed mode = ${resolvedEmbedMode} (EMBED_MODE=${process.env.EMBED_MODE ?? '(unset)'}, service.enabled=${embedSvcEnabled})`,
+  );
+  const memoryServices = await createMemoryServices({
+    type: 'sqlite',
+    sqlitePath: process.env.EVIDENCE_DB ?? resolve(repoRoot, 'evidence.sqlite'),
+    docsRoot,
+    markersDir,
+    transcriptDataDir, // reuse the same resolved path as Writer/Reader (line 282)
+    embed: { embedMode: resolvedEmbedMode },
+    // Phase E-2: message passage indexing — provide a callback that reads thread messages
+    messageListFn: async (threadId: string, limit?: number) => {
+      const messages = await messageStore.getByThread(threadId, limit ?? 2000, 'default-user');
+      return messages
+        .filter((m: { origin?: string }) => m.origin !== 'briefing') // F148 Phase E (AC-E2): exclude briefing from evidence index
+        .map(
+          (m: {
+            id: string;
+            content: string;
+            agentId?: string | null;
+            threadId: string;
+            timestamp: number;
+            contentBlocks?: readonly unknown[];
+            extra?: { rich?: { blocks?: readonly unknown[] } };
+          }) => ({
+            id: m.id,
+            content: m.content,
+            agentId: m.agentId ?? undefined,
+            threadId: m.threadId,
+            timestamp: m.timestamp,
+            contentBlocks: m.contentBlocks,
+            richBlocks: m.extra?.rich?.blocks,
+          }),
+        );
+    },
+    // Phase E-1: thread summary indexing — provide a callback that lists all threads
+    threadListFn: async () => {
+      const threads = await threadStore.list('default-user');
+      return threads
+        .filter((t) => !t.projectPath.startsWith('games/'))
+        .map((t) => ({
+          id: t.id,
+          title: t.title,
+          participants: t.participants as string[],
+          threadMemory: t.threadMemory ? { summary: t.threadMemory.summary } : null,
+          lastActiveAt: t.lastActiveAt,
+          featureIds: t.backlogItemId ? [t.backlogItemId] : undefined,
+        }));
+    },
+    excludeThreadIdsFn: async () => {
+      const allThreads = await threadStore.list('default-user');
+      const excluded = new Set<string>();
+      for (const t of allThreads) {
+        if (t.projectPath.startsWith('games/')) excluded.add(t.id);
+      }
+      return excluded;
+    },
+  });
+  // F152: Wire evidence store into /ready probe
+  evidenceStoreRef = memoryServices.evidenceStore;
+  app.log.info('[api] F102: SQLite memory services initialized');
+
+  // Thread index repair: rebuild ZSet indexes from thread detail hashes if sparse.
+  // Prevents "all threads disappeared" after unclean shutdown.
+  // Must run BEFORE evidence index rebuild — threadListFn reads ZSet indexes.
+  if (threadStore.repairIndex) {
+    const startMs = Date.now();
+    try {
+      const result = await threadStore.repairIndex();
+      if (result.repairedMembers > 0) {
+        app.log.info(
+          `[api] Thread index repair: ${result.repairedMembers} members rebuilt across ${result.repairedUsers} user indexes (${Date.now() - startMs}ms)`,
+        );
+      }
+    } catch (err) {
+      app.log.warn(`[api] Thread index repair failed (non-fatal): ${err}`);
+    }
+  }
+
+  // F152 Phase B: Expedition Bootstrap — state manager + service
+  const { IndexStateManager } = await import('./domains/memory/IndexStateManager.js');
+  const { ExpeditionBootstrapService } = await import('./domains/memory/ExpeditionBootstrapService.js');
+  const indexStateManager = new IndexStateManager(memoryServices.store.getDb());
+  const { execFileSync } = await import('node:child_process');
+  const getFingerprint = (projectPath: string) => {
+    try {
+      return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: projectPath, encoding: 'utf-8' }).trim();
+    } catch {
+      return '';
+    }
+  };
+  const expeditionBootstrapService = new ExpeditionBootstrapService(indexStateManager, {
+    rebuildIndex: async (projectPath: string) => {
+      if (isSameRepo(projectPath, repoRoot)) {
+        const startMs = Date.now();
+        const { buildStructuralSummary } = await import('./domains/memory/ExpeditionBootstrapService.js');
+        const summary = buildStructuralSummary(projectPath);
+        return { docsIndexed: summary.docsList.length, durationMs: Date.now() - startMs };
+      }
+      const { ensureProjectCollection } = await import('./domains/memory/bootstrap-collection-bridge.js');
+      return ensureProjectCollection(
+        projectPath,
+        memoryServices.catalog!,
+        memoryServices.collectionStores ?? new Map(),
+        memoryServices.dataDir!,
+        memoryServices.embeddingService,
+      );
+    },
+    getFingerprint,
+    getTierCoverage: async (projectPath: string) => {
+      if (!isSameRepo(projectPath, repoRoot)) return {};
+
+      const db = memoryServices.store.getDb();
+      const rows = db
+        .prepare(
+          `SELECT provenance_tier, COUNT(*) as cnt FROM evidence_docs WHERE provenance_tier IS NOT NULL AND source_path NOT LIKE 'archive/%' GROUP BY provenance_tier`,
+        )
+        .all() as Array<{ provenance_tier: string; cnt: number }>;
+      const result: Record<string, number> = {};
+      for (const row of rows) {
+        result[row.provenance_tier] = row.cnt;
+      }
+      return result;
+    },
+    getKindCoverage: async (projectPath: string) => {
+      if (!isSameRepo(projectPath, repoRoot)) return {};
+
+      const { mapKindToSourceType } = await import('./routes/evidence-helpers.js');
+      const db = memoryServices.store.getDb();
+      const rows = db
+        .prepare(
+          `SELECT kind, COUNT(*) as cnt FROM evidence_docs WHERE kind IS NOT NULL AND source_path NOT LIKE 'archive/%' GROUP BY kind`,
+        )
+        .all() as Array<{ kind: string; cnt: number }>;
+      const result: Record<string, number> = {};
+      for (const row of rows) {
+        const sourceType = mapKindToSourceType(row.kind);
+        result[sourceType] = (result[sourceType] || 0) + row.cnt;
+      }
+      return result;
+    },
+  });
+
+  // F102 D-2: Auto-rebuild evidence index on startup (AC-D4)
+  if (memoryServices.indexBuilder) {
+    const startMs = Date.now();
+    try {
+      const result = await memoryServices.indexBuilder.rebuild();
+      app.log.info(
+        `[api] F102: evidence index rebuilt — ${result.docsIndexed} indexed, ${result.docsSkipped} skipped (${Date.now() - startMs}ms)`,
+      );
+    } catch (err) {
+      app.log.warn(`[api] F102: evidence index rebuild failed (non-fatal): ${err}`);
+    }
+  }
+
+  // F-4: Global knowledge rebuild (Skills + MEMORY.md → global_knowledge.sqlite)
+  if (memoryServices.globalIndexBuilder) {
+    try {
+      const gResult = await memoryServices.globalIndexBuilder.rebuild();
+      app.log.info(`[api] F102: global knowledge rebuilt — ${gResult.docsIndexed} indexed (${gResult.durationMs}ms)`);
+    } catch (err) {
+      app.log.warn(`[api] F102: global knowledge rebuild failed (non-fatal): ${err}`);
+    }
+  }
+
+  // Phase E-2: Dirty-thread debounce — flush modified thread summaries every 30s
+  const DIRTY_THREAD_FLUSH_INTERVAL_MS = 30_000;
+  if (memoryServices.indexBuilder) {
+    const { IndexBuilder } = await import('./domains/memory/IndexBuilder.js');
+    const ib = memoryServices.indexBuilder;
+    if (ib instanceof IndexBuilder) {
+      // F102 KD-34: Wire append listener now that memoryServices is ready.
+      // This covers ALL 36 messageStore.append() call sites via the store itself,
+      // replacing the old HTTP onResponse hooks that only caught 2 routes.
+      appendListener = (msg) => {
+        if (msg.threadId) {
+          ib.markThreadDirty(msg.threadId);
+          // G-3c P1 fix (砚砚 review): accumulate delta from actual new message,
+          // not from rebuilt summary snapshot in flushDirtyThreads
+          ib.accumulateSummaryDelta(msg.threadId, msg.content);
+        }
+      };
+
+      const dirtyFlushTimer = setInterval(async () => {
+        try {
+          const flushed = await ib.flushDirtyThreads();
+          if (flushed > 0) {
+            app.log.info(`[api] F102 E-2: flushed ${flushed} dirty thread(s) to evidence index`);
+          }
+        } catch {
+          // best-effort
+        }
+      }, DIRTY_THREAD_FLUSH_INTERVAL_MS);
+      dirtyFlushTimer.unref();
+    }
+  }
+
+  // ── F139: Unified Scheduler (TaskRunnerV2) ──
+  const { TaskRunnerV2 } = await import('./infrastructure/scheduler/TaskRunnerV2.js');
+  const { RunLedger } = await import('./infrastructure/scheduler/RunLedger.js');
+  const { createActorResolver } = await import('./infrastructure/scheduler/ActorResolver.js');
+  const { getRoster } = await import('./config/agent-config-loader.js');
+  const schedulerDb = memoryServices.store.getDb();
+  const runLedger = new RunLedger(schedulerDb);
+  const actorResolver = createActorResolver(getRoster);
+  // ── F139 Phase 3B: Governance + Emission stores ──
+  const { GlobalControlStore } = await import('./infrastructure/scheduler/GlobalControlStore.js');
+  const { EmissionStore } = await import('./infrastructure/scheduler/EmissionStore.js');
+  const { PackTemplateStore } = await import('./infrastructure/scheduler/PackTemplateStore.js');
+  const globalControlStore = new GlobalControlStore(schedulerDb);
+  const emissionStore = new EmissionStore(schedulerDb);
+  const packTemplateStore = new PackTemplateStore(schedulerDb);
+
+  // Phase 4: delivery + content fetch for template execution
+  const { createDeliverFn, createLifecycleToastFn } = await import('./infrastructure/scheduler/delivery.js');
+  const { createFetchContentFn } = await import('./infrastructure/scheduler/content-fetcher.js');
+  const schedulerDeliver = createDeliverFn({ messageStore, socketManager });
+  const schedulerLifecycleToast = createLifecycleToastFn({ socketManager });
+  const schedulerFetchContent = createFetchContentFn();
+
+  const taskRunnerV2 = new TaskRunnerV2({
+    logger: { info: app.log.info.bind(app.log), error: app.log.error.bind(app.log) },
+    ledger: runLedger,
+    actorResolver,
+    globalControlStore,
+    emissionStore,
+    deliver: schedulerDeliver,
+    notifyLifecycle: schedulerLifecycleToast,
+    fetchContent: schedulerFetchContent,
+  });
+
+  // ── F139 Phase 3A: Dynamic task store + template registry ──
+  const { DynamicTaskStore } = await import('./infrastructure/scheduler/DynamicTaskStore.js');
+  const { templateRegistry } = await import('./infrastructure/scheduler/templates/registry.js');
+  const dynamicTaskStore = new DynamicTaskStore(schedulerDb);
+  taskRunnerV2.setDynamicTaskStore(dynamicTaskStore); // #415: wire store for once-trigger auto-retirement
+
+  // ── F139 Phase 2+3A+3B: Schedule panel API routes ──
+  const { scheduleRoutes } = await import('./routes/schedule.js');
+  await app.register(scheduleRoutes, {
+    taskRunner: taskRunnerV2,
+    dynamicTaskStore,
+    templateRegistry,
+    globalControlStore,
+    packTemplateStore,
+    taskStore,
+    notifyLifecycle: schedulerLifecycleToast,
+    registry,
+  });
+
+  // ── F233 Phase A: 值班简报（BriefingConfigStore + route + daily cron）──
+  const { RedisBriefingConfigStore, MemoryBriefingConfigStore } = await import(
+    './domains/agents/services/duty-briefing/BriefingConfigStore.js'
+  );
+  const { getOwnerUserId: getDutyBriefingOwnerUserId } = await import('./config/agent-config-loader.js');
+  const briefingConfigStore = redis ? new RedisBriefingConfigStore(redis) : new MemoryBriefingConfigStore();
+  // f167SnapshotProvider Phase A 未接 → voidPasses 暂空（F167 锚点降级，Phase B 接）
+  const dutyBriefingCollectDeps = {
+    taskStore,
+    invocationRecordStore,
+    draftStore,
+    dynamicTaskStore,
+    threadStore,
+    messageStore,
+    userId: getDutyBriefingOwnerUserId(),
+  };
+  const { dutyBriefingRoutes } = await import('./routes/duty-briefing.js');
+  await app.register(dutyBriefingRoutes, {
+    configStore: briefingConfigStore,
+    messageStore,
+    threadStore,
+    collectDeps: dutyBriefingCollectDeps,
+  });
+
+  // ── Phase G: Summary Compaction (registers into unified scheduler) ──
+  if (process.env.F102_ABSTRACTIVE === 'on' && memoryServices.indexBuilder) {
+    try {
+      const { createSummaryCompactionTaskSpec } = await import('./domains/memory/SummaryCompactionTaskSpec.js');
+      const { createAbstractiveClient } = await import('./domains/memory/AbstractiveSummaryClient.js');
+
+      // Abstractive summary API config resolution (priority order):
+      // 1. F102_API_BASE + F102_API_KEY (explicit override)
+      // 2. Unified accounts system (credentials.json) + local proxy
+      // 3. null → skip abstractive
+      const generateAbstractive = createAbstractiveClient(
+        async () => {
+          // Priority 1: explicit F102 config
+          if (process.env.F102_API_BASE && process.env.F102_API_KEY) {
+            return { mode: 'api_key' as const, baseUrl: process.env.F102_API_BASE, apiKey: process.env.F102_API_KEY };
+          }
+          // Priority 2: deterministic binding with installer-only fallback (502 regression)
+          const runtimeProfile = resolveAnthropicRuntimeProfile(process.cwd());
+          const apiKey = runtimeProfile.apiKey;
+          if (!apiKey) return null;
+          const proxyPort = process.env.ANTHROPIC_PROXY_PORT || '9877';
+          // Read first upstream slug from proxy-upstreams.json
+          try {
+            const { readFileSync } = await import('fs');
+            const { resolve: resolvePath } = await import('path');
+            const upstreamsPath =
+              process.env.ANTHROPIC_PROXY_UPSTREAMS_PATH ||
+              resolvePath(process.cwd(), '.agent-studio', 'proxy-upstreams.json');
+            const upstreams = JSON.parse(readFileSync(upstreamsPath, 'utf-8'));
+            const firstSlug = Object.keys(upstreams)[0];
+            if (!firstSlug) return null;
+            return {
+              mode: 'api_key' as const,
+              baseUrl: `http://127.0.0.1:${proxyPort}/${firstSlug}`,
+              apiKey,
+            };
+          } catch {
+            // No proxy config → try direct with API key
+            return { mode: 'api_key' as const, baseUrl: 'https://api.anthropic.com', apiKey };
+          }
+        },
+        { info: app.log.info.bind(app.log), error: app.log.error.bind(app.log) },
+      );
+
+      const db = memoryServices.store.getDb();
+      const summarySpec = createSummaryCompactionTaskSpec({
+        db,
+        enabled: () => process.env.F102_ABSTRACTIVE === 'on',
+        getThreadLastActivity: async (threadId) => {
+          const msgs = await messageStore.getByThread(threadId, 1, 'default-user');
+          if (msgs.length === 0) return null;
+          return { threadId, lastMessageAt: msgs[0]!.timestamp };
+        },
+        getMessagesAfterWatermark: async (threadId, afterMessageId, limit) => {
+          // P1 fix (砚砚 review): use getByThreadAfter for true "after watermark" semantics,
+          // not "latest N + slice" which would skip messages if delta > limit
+          const msgs = await messageStore.getByThreadAfter(
+            threadId,
+            afterMessageId ?? undefined,
+            limit,
+            'default-user',
+          );
+          return msgs.map((m) => ({
+            id: m.id,
+            content: m.content,
+            agentId: m.agentId ?? undefined,
+            timestamp: m.timestamp,
+          }));
+        },
+        generateAbstractive,
+        // Re-embed thread after abstractive summary update (semantic search uses vectors)
+        reEmbed: memoryServices.embeddingService?.isReady()
+          ? async (anchor: string, text: string) => {
+              const [vec] = await memoryServices.embeddingService!.embed([text]);
+              memoryServices.vectorStore?.upsert(anchor, vec);
+            }
+          : undefined,
+        // H-3: Submit durable candidates to knowledge emergence pipeline
+        // Gated by F102_DURABLE_CANDIDATES flag (spec §F102 env config)
+        submitCandidate:
+          process.env.F102_DURABLE_CANDIDATES !== 'on'
+            ? undefined
+            : async (candidate) => {
+                const marker = await memoryServices.markerQueue.submit({
+                  content: `[${candidate.kind}] ${candidate.title}: ${candidate.claim}`,
+                  source: `thread:${candidate.threadId}`,
+                  status: 'captured',
+                  // method → lesson: EvidenceKind has no 'method' variant; methods are stored as lessons
+                  targetKind: candidate.kind === 'decision' ? 'decision' : 'lesson',
+                });
+                // Auto-approve explicit candidates (co-creator不需要每条都审)
+                if (candidate.confidence === 'explicit') {
+                  await memoryServices.markerQueue.transition(marker.id, 'normalized');
+                  await memoryServices.markerQueue.transition(marker.id, 'approved');
+                  app.log.info(`[knowledge-emergence] auto-approved: [${candidate.kind}] ${candidate.title}`);
+                } else {
+                  app.log.info(`[knowledge-emergence] submitted for review: [${candidate.kind}] ${candidate.title}`);
+                }
+              },
+        logger: { info: app.log.info.bind(app.log), error: app.log.error.bind(app.log) },
+      });
+
+      taskRunnerV2.register(summarySpec);
+      const candidatesOn = process.env.F102_DURABLE_CANDIDATES === 'on';
+      const topicSegOn = process.env.F102_TOPIC_SEGMENTS === 'on';
+      app.log.info(
+        `[api] F139: summary-compact spec registered (candidates=${candidatesOn ? 'on' : 'off'}, topicSegments=${topicSegOn ? 'on' : 'off'})`,
+      );
+
+      // H-3 backfill: replay lost candidates from summary_segments into MarkerQueue.
+      // Gated by F102_DURABLE_CANDIDATES (same gate as submitCandidate above).
+      if (!candidatesOn) {
+        app.log.info('[knowledge-backfill] skipped (F102_DURABLE_CANDIDATES=off)');
+      } else {
+        // Before the mkdirSync fix, submit() silently failed (ENOENT). This one-shot
+        // replay recovers those candidates. Idempotent via content-based dedup: each
+        // candidate is skipped if a marker with identical content already exists.
+        const existingMarkers = await memoryServices.markerQueue.list();
+        const existingContents = new Set(existingMarkers.map((m) => m.content));
+        const rows = db
+          .prepare('SELECT thread_id, candidates FROM summary_segments WHERE candidates IS NOT NULL')
+          .all() as Array<{ thread_id: string; candidates: string }>;
+        let backfilled = 0;
+        for (const row of rows) {
+          try {
+            const candidates = JSON.parse(row.candidates) as Array<{
+              kind: string;
+              title: string;
+              claim: string;
+              confidence?: string;
+            }>;
+            for (const c of candidates) {
+              const content = `[${c.kind}] ${c.title}: ${c.claim}`;
+              if (existingContents.has(content)) continue;
+              const marker = await memoryServices.markerQueue.submit({
+                content,
+                source: `thread:${row.thread_id}`,
+                status: 'captured',
+                targetKind: c.kind === 'decision' ? 'decision' : 'lesson',
+              });
+              if ((c.confidence ?? 'inferred') === 'explicit') {
+                await memoryServices.markerQueue.transition(marker.id, 'normalized');
+                await memoryServices.markerQueue.transition(marker.id, 'approved');
+              }
+              existingContents.add(content);
+              backfilled++;
+            }
+          } catch (backfillErr) {
+            app.log.error(`[knowledge-backfill] failed for thread ${row.thread_id}: ${backfillErr}`);
+          }
+        }
+        if (backfilled > 0) {
+          app.log.info(`[knowledge-backfill] replayed ${backfilled} lost candidates into MarkerQueue`);
+        }
+      }
+    } catch (err) {
+      app.log.warn(`[api] F102 Phase G: scheduler init failed (non-fatal): ${err}`);
+    }
+  }
+
+  // ── F32-b/F127: Bootstrap runtime catalog, then populate AgentRegistry (all variants) ──
+  // Must happen BEFORE AgentRouter construction (parseMentions reads agentRegistry)
+  try {
+    const agentConfig = bootstrapDefaultAgentCatalog();
+    const allConfigs = toAllAgentConfigs(agentConfig);
+    for (const [id, config] of Object.entries(allConfigs)) {
+      agentConfigRegistry.register(id, config);
+    }
+    app.log.info(`[api] AgentRegistry initialized: ${agentConfigRegistry.getAllIds().join(', ')}`);
+  } catch (err) {
+    app.log.error(`[api] Failed to load agent catalog — .agent-studio/agent-catalog.json is required: ${String(err)}`);
+    throw err;
+  }
+
+  // ── F149 Phase C: ACP process pool registry (variantId → AcpProcessPool) ──
+  // Using Map<string, any> because AcpProcessPool is dynamically imported only when acp config present.
+  // biome-ignore lint: dynamic import bridge
+  const acpPoolRegistry = new Map<string, any>(); // eslint-disable-line @typescript-eslint/no-explicit-any
+
+  // ── F32-b: AgentRegistry (agentId → AgentService) — one instance per agent ──
+  // Each agent gets its own AgentService instance with its agentId + model.
+  const agentRegistry = new AgentRegistry();
+  let router!: AgentRouter;
+  const syncAgentRegistry = async (configs: Record<string, AgentConfig>) => {
+    agentRegistry.reset();
+    clearL0Cache(); // Invalidate stale L0 compilations from previous sync
+    for (const [id, config] of Object.entries(configs)) {
+      const agentId = config.id;
+      // F32-b P1 fix: do NOT pass model here — let constructors resolve via
+      // getAgentModel(agentId) which respects env override (AGENT_*_MODEL > config > fallback)
+      let service: AgentService;
+      switch (config.clientId) {
+        case 'anthropic': {
+          // F198 Phase B Step 3 canary: env-gated carrier selection.
+          // AGENT_STUDIO_CLAUDE_CARRIER=bg_daemon → --bg carrier (subscription
+          // quota, R1 救宪宪). Unset/other → -p (current production default).
+          const { createClaudeAgentServiceForCanary } = await import(
+            './domains/agents/services/agents/providers/claude-carrier-factory.js'
+          );
+          service = createClaudeAgentServiceForCanary(agentId);
+          break;
+        }
+        case 'openai':
+          service = new CodexAgentService({ agentId });
+          break;
+        case 'google': {
+          const acpConfig = getAcpConfig(id);
+          if (acpConfig) {
+            const { GeminiAcpAdapter } = await import(
+              './domains/agents/services/agents/providers/acp/GeminiAcpAdapter.js'
+            );
+            const { AcpProcessPool } = await import('./domains/agents/services/agents/providers/acp/AcpProcessPool.js');
+            const { AcpClient } = await import('./domains/agents/services/agents/providers/acp/AcpClient.js');
+            const acpProjectRoot = findMonorepoRoot();
+            const acpCommand = resolveAcpBootstrapCommand(acpProjectRoot, acpConfig.command);
+            const acpArgs = resolveAcpBootstrapArgs(acpProjectRoot, acpConfig.startupArgs);
+            const poolKey = { projectPath: acpProjectRoot, providerProfile: id };
+            // Shared pool per variant — reused across agents with same variant
+            if (!acpPoolRegistry.has(id)) {
+              const pool = new AcpProcessPool(
+                {
+                  maxLiveProcesses: acpConfig.pool?.maxLiveProcesses ?? 3,
+                  idleTtlMs: acpConfig.pool?.idleTtlMs ?? 5 * 60 * 1000,
+                  healthCheckIntervalMs: 30_000,
+                },
+                acpConfig,
+                () =>
+                  new AcpClient({
+                    command: acpCommand,
+                    args: acpArgs,
+                    cwd: resolveAcpBootstrapCwd(acpProjectRoot, id),
+                  }),
+              );
+              acpPoolRegistry.set(id, pool);
+            }
+            const { resolveAcpMcpServers } = await import(
+              './domains/agents/services/agents/providers/acp/acp-mcp-resolver.js'
+            );
+            const mcpServers = resolveAcpMcpServers(acpProjectRoot, acpConfig.mcpWhitelist ?? []);
+            service = new GeminiAcpAdapter({
+              agentId,
+              pool: acpPoolRegistry.get(id)!,
+              poolKey,
+              projectRoot: acpProjectRoot,
+              mcpServers,
+            });
+          } else {
+            service = new GeminiAgentService({ agentId, agyProfile: config.agyProfile });
+          }
+          break;
+        }
+        case 'kimi':
+          service = new KimiAgentService({ agentId });
+          break;
+        case 'dare':
+          service = new DareAgentService({ agentId });
+          break;
+        case 'antigravity':
+          service = new AntigravityAgentService({
+            agentId,
+            runtimeSessionStore,
+            transcriptReader,
+            supervisorStore: redisClient
+              ? new RedisAntigravitySupervisorStore(redisClient, {
+                  auditDir: join(process.cwd(), 'data', 'antigravity-audit'),
+                })
+              : undefined,
+          });
+          break;
+        case 'opencode':
+          service = new OpenCodeAgentService({ agentId });
+          break;
+        case 'agentrunner': {
+          const { AgentRunnerService } = await import(
+            './domains/agents/services/agents/providers/agentrunner/AgentRunnerService.js'
+          );
+          service = new AgentRunnerService({ agentId, projectRoot: findMonorepoRoot(), agentConfig: config });
+          break;
+        }
+        case 'a2a': {
+          const { A2AAgentService } = await import('./domains/agents/services/agents/providers/A2AAgentService.js');
+          const envKey = `AGENT_${id.toUpperCase()}_A2A_URL`;
+          const a2aUrl = process.env[envKey] ?? '';
+          if (!a2aUrl) {
+            app.log.warn(`[api] A2A agent "${id}" missing ${envKey} env var. It will not be routable.`);
+            continue;
+          }
+          service = new A2AAgentService({ agentId, config: { url: a2aUrl } });
+          break;
+        }
+        default:
+          app.log.warn(`[api] Unknown client "${config.clientId}" for agent "${id}". It will not be routable.`);
+          continue;
+      }
+      agentRegistry.register(id, service);
+    }
+    if (router) router.refreshFromRegistry(agentRegistry);
+
+    // Pre-compile L0 system prompts for all registered agents in parallel.
+    // Avoids per-invocation subprocess overhead and ensures L0 is ready
+    // before the first message — also bypasses Windows NTFS junction
+    // issues that resolve by the time the user actually interacts (#802).
+    const registeredAgentIds = Object.keys(configs).filter((id) => agentRegistry.has(id));
+    await warmL0Cache(registeredAgentIds, app.log);
+  };
+  await syncAgentRegistry(agentConfigRegistry.getAllConfigs());
+
+  const runtimeSessionSealReaper = new RuntimeSessionSealReaper({
+    runtimeSessionStore,
+    sessionSealer,
+    drainRuntimeSession: async (record) => {
+      if (!agentRegistry.has(record.agentId)) {
+        return {
+          ok: false,
+          drainResult: 'skipped_runtime_unreachable',
+          reason: `no AgentService registered for ${record.agentId}`,
+        };
+      }
+      const service = agentRegistry.get(record.agentId);
+      if (!hasRuntimeSessionDrain(service)) {
+        return {
+          ok: false,
+          drainResult: 'skipped_runtime_unreachable',
+          reason: `AgentService for ${record.agentId} cannot drain ${record.runtime}`,
+        };
+      }
+      return service.drainRuntimeSession(record.runtimeSessionId);
+    },
+  });
+
+  // F136 Phase 3A: Agent catalog subscriber — syncs AgentRegistry when agents CRUD emits agent-config events
+  const { createAgentCatalogSubscriber } = await import('./config/agent-catalog-subscriber.js');
+  const agentCatalogSubscriber = createAgentCatalogSubscriber({
+    async onReconcile() {
+      app.log.info('[api] F136: Agent catalog changed, syncing agent registry...');
+      await syncAgentRegistry(agentConfigRegistry.getAllConfigs());
+    },
+    log: app.log,
+  });
+
+  // F136 Phase 4c: Account binding subscriber — rebinds provider profiles when accounts change
+  const { createAccountBindingSubscriber } = await import('./config/account-binding-subscriber.js');
+  const accountBindingSubscriber = createAccountBindingSubscriber({
+    async onRebind(changedAccountRefs) {
+      app.log.info(`[api] F136: Accounts changed [${changedAccountRefs.join(', ')}], syncing agent registry...`);
+      await syncAgentRegistry(agentConfigRegistry.getAllConfigs());
+    },
+    log: app.log,
+  });
+
+  // F089 Phase 2: Shared instances for tmux agent pane execution (opt-in)
+  const enableTmuxAgent = process.env.AGENT_STUDIO_TMUX_AGENT === '1';
+  let tmuxGateway: TmuxGateway | undefined;
+  if (enableTmuxAgent) {
+    try {
+      tmuxGateway = new TmuxGateway();
+      app.log.info(`[tmux] enabled — binary: ${tmuxGateway.tmuxBin}`);
+    } catch (err) {
+      app.log.error(`[tmux] AGENT_STUDIO_TMUX_AGENT=1 but tmux not found: ${(err as Error).message}`);
+    }
+  }
+  // F198 Phase C P1-1: registry is unconditional — bg carrier sessions (claude --bg)
+  // must be trackable regardless of whether tmux agent panes are enabled.
+  const agentPaneRegistry = new AgentPaneRegistry();
+
+  // F120: Preview Gateway (独立端口反向代理) + Port Discovery
+  const PREVIEW_GATEWAY_ENABLED = process.env.PREVIEW_GATEWAY_ENABLED !== '0';
+  const PREVIEW_GATEWAY_PORT = Number.parseInt(process.env.PREVIEW_GATEWAY_PORT ?? '4100', 10);
+  const runtimePorts = collectRuntimePorts();
+  const previewGateway = new PreviewGateway({ port: PREVIEW_GATEWAY_PORT, runtimePorts });
+  const portDiscovery = new PortDiscoveryService();
+  if (PREVIEW_GATEWAY_ENABLED) {
+    try {
+      await previewGateway.start();
+      app.log.info(`[preview] Gateway started on port ${previewGateway.actualPort}`);
+    } catch (err) {
+      app.log.warn(`[preview] Gateway failed to start: ${(err as Error).message}`);
+    }
+  } else {
+    app.log.info('[preview] Gateway disabled (PREVIEW_GATEWAY_ENABLED=0)');
+  }
+  // Port discovery → Socket.IO push to worktree-scoped room
+  portDiscovery.onDiscovered((port) => {
+    if (socketManager) {
+      const room = port.worktreeId ? `worktree:${port.worktreeId}` : 'preview:global';
+      socketManager.broadcastToRoom(room, 'preview:port-discovered', port);
+    }
+  });
+
+  // F129: Pack store — shared between router (invocation) and routes (API)
+  const { PackStore } = await import('./domains/packs/PackStore.js');
+  const packStoreDir = join(findMonorepoRoot(process.cwd()), '.agent-studio', 'packs');
+  const packStore = new PackStore(packStoreDir);
+
+  // F150: Tool usage counter (fire-and-forget INCR on tool_use events)
+  const toolUsageArchiver = redis
+    ? new (await import('./domains/agents/services/tool-usage/ToolUsageArchiver.js')).ToolUsageArchiver(
+        join(findMonorepoRoot(process.cwd()), '.agent-studio', 'tool-usage-archive.jsonl'),
+      )
+    : undefined;
+  const toolUsageCounter = redis
+    ? new (await import('./domains/agents/services/tool-usage/ToolUsageCounter.js')).ToolUsageCounter(
+        redis,
+        toolUsageArchiver,
+      )
+    : undefined;
+  // F188 Phase F AC-F10: append-only tool event log (sequence preserving)
+  const toolEventLog = redis
+    ? new (await import('./domains/agents/services/tool-usage/ToolEventLog.js')).ToolEventLog(redis)
+    : undefined;
+  // F188 Phase F AC-F10 (AS-4): skill load event log
+  const skillLoadEventLog = redis
+    ? new (await import('./domains/agents/services/tool-usage/SkillLoadEventLog.js')).SkillLoadEventLog(redis)
+    : undefined;
+
+  // F150: Daily archive sweep — persist expiring Redis counters to JSONL
+  if (toolUsageCounter && toolUsageArchiver) {
+    const sweepLog = (await import('./infrastructure/logger.js')).createModuleLogger('tool-usage-sweep');
+    let sweepInFlight = false;
+    const runSweep = async () => {
+      if (sweepInFlight) return;
+      sweepInFlight = true;
+      try {
+        const archivedDates = await toolUsageArchiver.getArchivedDates();
+        // Catch-up: archive ALL unarchived dates older than 7 days (not just 85-89).
+        // Covers downtime gaps — any date still in Redis but not yet archived gets saved.
+        const now = new Date();
+        const targetDates = new Set<string>();
+        for (let offset = 7; offset <= 89; offset++) {
+          const d = new Date(now);
+          d.setDate(d.getDate() - offset);
+          const dateStr = d.toISOString().slice(0, 10);
+          if (!archivedDates.has(dateStr)) targetDates.add(dateStr);
+        }
+        if (targetDates.size === 0) return;
+        // Single SCAN for all dates, then filter client-side
+        const allEntries = await toolUsageCounter.fetchAllEntries();
+        let archived = 0;
+        for (const date of targetDates) {
+          const entries = allEntries.filter((e) => e.date === date);
+          if (entries.length > 0) {
+            archived += await toolUsageArchiver.archiveEntries(entries);
+          }
+        }
+        if (archived > 0) sweepLog.info({ archived }, 'Tool usage archive sweep completed');
+      } catch (err) {
+        sweepLog.warn({ err }, 'Tool usage archive sweep failed');
+      } finally {
+        sweepInFlight = false;
+      }
+    };
+    // First sweep 30s after startup, then daily
+    const startupTimer = setTimeout(runSweep, 30_000);
+    startupTimer.unref();
+    const dailyTimer = setInterval(runSweep, 24 * 60 * 60 * 1000);
+    dailyTimer.unref();
+  }
+
+  // F093: World Engine — runtime store + coordinator + context provider
+  const { SqliteWorldStore } = await import('./domains/world/SqliteWorldStore.js');
+  const { WorldRuntimeCoordinator } = await import('./domains/world/WorldRuntimeCoordinator.js');
+  const { WorldContextProvider } = await import('./domains/world/WorldContextProvider.js');
+  const { WorldKnowledgeAdapter } = await import('./domains/world/WorldKnowledgeAdapter.js');
+  const worldDbPath = process.env.WORLD_DB ?? resolve(repoRoot, 'world.sqlite');
+  const worldStore = new SqliteWorldStore(worldDbPath);
+  await worldStore.initialize();
+  const worldCoordinator = new WorldRuntimeCoordinator(worldStore);
+  const worldKnowledgeAdapter = new WorldKnowledgeAdapter(memoryServices.evidenceStore);
+  const worldContextProvider = new WorldContextProvider(worldStore, worldKnowledgeAdapter);
+
+  // F229: Concierge config store — created before AgentRouter so it can be passed into
+  // invocationDeps for routing-layer 岗位 prompt injection (ConciergeRoutingInterceptor).
+  const { RedisConciergeConfigStore: _RCCSEarly, MemoryConciergeConfigStore: _MCCSEarly } = await import(
+    './domains/concierge/ConciergeConfigStore.js'
+  );
+  const conciergeConfigStoreShared = redis ? new _RCCSEarly(redis) : new _MCCSEarly();
+
+  // F229 KD-17: HandleMap store — per-concierge-thread R1/R2→anchor mapping
+  const { RedisConciergeHandleMapStore: _RHMSEarly, MemoryConciergeHandleMapStore: _MHMSEarly } = await import(
+    './domains/concierge/ConciergeHandleMapStore.js'
+  );
+  const conciergeHandleMapStoreShared = redis ? new _RHMSEarly(redis) : new _MHMSEarly();
+
+  // F229 Phase B: TriagePlan store (needed by AgentRouter for reply validator)
+  const { RedisConciergeTriagePlanStore: _RTPSEarly, MemoryConciergeTriagePlanStore: _MTPSEarly } = await import(
+    './domains/concierge/ConciergeTriagePlanStore.js'
+  );
+  const conciergeTriagePlanStore = redis ? new _RTPSEarly(redis) : new _MTPSEarly();
+
+  // F229 Phase B2: InvestigationJob store
+  const { RedisConciergeInvestigationJobStore: _RIJSEarly, MemoryConciergeInvestigationJobStore: _MIJSEarly } =
+    await import('./domains/concierge/ConciergeInvestigationJobStore.js');
+  const conciergeInvestigationJobStore = redis ? new _RIJSEarly(redis) : new _MIJSEarly();
+
+  // Shared AgentRouter — used by messagesRoutes and invocationsRoutes
+  router = new AgentRouter({
+    agentRegistry,
+    registry,
+    messageStore,
+    taskProgressStore,
+    ...(deliveryCursorStore ? { deliveryCursorStore } : {}),
+    ...(sessionStore ? { sessionStore } : {}),
+    ...(threadStore ? { threadStore } : {}),
+    sessionChainStore,
+    runtimeSessionStore,
+    transcriptWriter,
+    transcriptReader,
+    sessionSealer,
+    draftStore,
+    taskStore,
+    ...(workflowSopStore ? { workflowSopStore } : {}),
+    executionDigestStore,
+    socketManager,
+    ...(tmuxGateway ? { tmuxGateway } : {}),
+    ...(agentPaneRegistry ? { agentPaneRegistry } : {}),
+    signalArticleLookup: createSignalArticleLookup({ transcriptReader }),
+    packStore,
+    evidenceStore: memoryServices.evidenceStore,
+    ...(toolUsageCounter ? { toolUsageCounter } : {}),
+    ...(toolEventLog ? { toolEventLog } : {}),
+    ...(skillLoadEventLog ? { skillLoadEventLog } : {}),
+    guideSessionStore,
+    dismissTracker,
+    worldContextProvider,
+    worldStore,
+    ...(ballCustodyIngest ? { ballCustody: ballCustodyIngest } : {}),
+    frustrationIssueStore,
+    pendingRequestStore: authPendingStore,
+    conciergeConfigStore: conciergeConfigStoreShared,
+    conciergeHandleMapStore: conciergeHandleMapStoreShared,
+    conciergeTriagePlanStore,
+  });
+
+  // F39: Message queue delivery
+  const invocationQueue = new InvocationQueue();
+  const sessionContinuationCoordinator = new SessionContinuationCoordinator({
+    threadStore: {
+      getMemberSessionStrategy: async (threadId, agentId, userId) => {
+        if (threadStore.getMemberSessionStrategy) {
+          return (await threadStore.getMemberSessionStrategy(threadId, agentId, userId)) ?? undefined;
+        }
+        if (threadStore.isRebornSession && (await threadStore.isRebornSession(threadId, agentId))) {
+          return 'reborn';
+        }
+        return undefined;
+      },
+      consumePendingContinuation: async (threadId, agentId, userId) => {
+        const entry = await threadStore.consumePendingContinuation(threadId, agentId, userId);
+        return (entry?.capsule as unknown as CollaborationContinuityCapsuleV1 | undefined) ?? null;
+      },
+      setPendingContinuation: async (threadId, agentId, userId, capsule) => {
+        await threadStore.setPendingContinuation(threadId, agentId, userId, {
+          capsule: capsule as unknown as Record<string, unknown>,
+          createdAt: Date.now(),
+        });
+      },
+    },
+  });
+  const queueProcessor = new QueueProcessor({
+    queue: invocationQueue,
+    invocationTracker,
+    invocationRecordStore: invocationRecordStore as unknown as InvocationRecordStoreLike,
+    router: router as unknown as RouterLike,
+    socketManager,
+    messageStore,
+    log: app.log,
+    threadStore:
+      threadStore as unknown as import('./domains/agents/services/agents/invocation/QueueProcessor.js').ThreadStoreLike,
+    sessionContinuationCoordinator,
+  });
+  socketManager.setQueueProcessor(queueProcessor);
+
+  // F101: Game engine store (created early so messages route can intercept /game commands)
+  const { RedisGameStore } = await import('./domains/agents/services/stores/redis/RedisGameStore.js');
+  const f101GameStore = redis ? new RedisGameStore(redis) : undefined;
+
+  // F101 Phase I: Shared ActionNotifier + game driver (narrator or legacy).
+  // Created early so both messagesRoutes and gameRoutes use the same driver instance.
+  const { EventEmitterActionNotifier } = await import('./domains/agents/services/game/EventEmitterActionNotifier.js');
+  const sharedActionNotifier = new EventEmitterActionNotifier();
+  let f101SharedDriver: import('./domains/agents/services/game/GameDriver.js').GameDriver | undefined;
+  if (f101GameStore) {
+    const gameNarratorEnabled = process.env.GAME_NARRATOR_ENABLED === 'true';
+    const { GameOrchestrator } = await import('./domains/agents/services/game/GameOrchestrator.js');
+    const sharedOrchestrator = new GameOrchestrator({ gameStore: f101GameStore, socketManager, messageStore });
+    const { createGameDriver } = await import('./domains/agents/services/game/createGameDriver.js');
+    if (gameNarratorEnabled) {
+      const { createWakeAgentFn } = await import('./domains/agents/services/game/wakeAgentImpl.js');
+      const wakeAgent = createWakeAgentFn({
+        threadStore,
+        invocationQueue,
+        queueProcessor,
+        log: app.log,
+      });
+      f101SharedDriver = createGameDriver({
+        gameNarratorEnabled: true,
+        legacyDeps: { gameStore: f101GameStore, orchestrator: sharedOrchestrator, messageStore },
+        narratorDeps: {
+          gameStore: f101GameStore,
+          wakeAgent,
+          actionNotifier: sharedActionNotifier,
+          orchestrator: sharedOrchestrator,
+          messageStore,
+          socketManager,
+        },
+      });
+      app.log.info('[api] F101 game driver: GameNarratorDriver (agent-driven)');
+    } else {
+      f101SharedDriver = createGameDriver({
+        gameNarratorEnabled: false,
+        legacyDeps: { gameStore: f101GameStore, orchestrator: sharedOrchestrator, messageStore },
+      });
+      app.log.info('[api] F101 game driver: LegacyAutoDriver');
+    }
+  }
+
+  // Register routes (socketManager injected, no circular import)
+  const messagesOpts = {
+    registry,
+    messageStore,
+    socketManager,
+    router,
+    deliveryCursorStore,
+    ...(sessionStore ? { sessionStore } : {}),
+    threadStore,
+    invocationTracker,
+    invocationRecordStore,
+    summaryStore,
+    draftStore,
+    invocationQueue,
+    queueProcessor,
+    sessionContinuationCoordinator,
+    taskProgressStore, // F194 AC-B7: cleared on zombie reconcile
+    ...(f101GameStore ? { gameStore: f101GameStore } : {}),
+    ...(f101SharedDriver ? { autoPlayer: f101SharedDriver } : {}),
+    holdBallCancelDeps: { dynamicTaskStore, taskRunner: taskRunnerV2 },
+    // F192 Phase G AC-G12 / F227 归一: magic word → Event Memory (single truth
+    // source) + a lightweight episode ref for F192's a2 projection.
+    onMagicWordDetected: (
+      hits: Array<{ word: string }>,
+      threadId: string,
+      agentId: string | null,
+      messageId: string,
+      ownerUserId: string,
+      messageExcerpt?: string,
+    ) => {
+      for (const hit of hits) {
+        // 1) Write the full event FIRST. LL-048 / 砚砚: user-visible data — never
+        //    silently swallow. On failure, dead-letter for replay (最终不丢);
+        //    must not block message processing.
+        const record: EventMemoryRecord = {
+          type: hit.word,
+          trigger: 'human_brake',
+          agent: agentId ?? 'unknown',
+          threadId,
+          messageId,
+          timestamp: Date.now(),
+          summary: messageExcerpt ?? hit.word,
+          cognitiveTransition: 'user_brake',
+          relatedHarness: null,
+          confidence: 'high',
+        };
+        let eventId: string;
+        try {
+          eventId = memoryServices.eventMemoryStore.markEvent(record, ownerUserId).event.eventId;
+        } catch (err) {
+          // P1-3 (砚砚): dead-letter so the event is recoverable, not lost.
+          try {
+            memoryServices.eventMemoryStore.appendDeadLetter(record, ownerUserId, String(err));
+          } catch (dlErr) {
+            app.log.error({ dlErr, threadId, word: hit.word }, '[F227] dead-letter append ALSO failed');
+          }
+          app.log.error(
+            { err, threadId, word: hit.word },
+            '[F227] Event Memory write failed — dead-lettered for replay',
+          );
+          continue; // no orphan episode ref without a backing event
+        }
+        // 2) Episode ref = projection convenience for F192 a2 (secondary, best-effort).
+        try {
+          appendMagicWordRefToEpisode(taskOutcomeStore, {
+            eventId,
+            word: hit.word,
+            threadId,
+            agentId: agentId ?? 'unknown',
+          });
+        } catch (err) {
+          app.log.error(
+            { err, threadId, eventId },
+            '[F227] episode magic_word_ref append failed (event already persisted)',
+          );
+        }
+      }
+    },
+  };
+  await app.register(messagesRoutes, messagesOpts);
+  await app.register(queueRoutes, {
+    threadStore,
+    invocationQueue,
+    queueProcessor,
+    invocationTracker,
+    socketManager,
+    messageStore, // F117: for marking queued messages as canceled on withdraw/clear
+    invocationRecordStore, // F194 Phase B: canonical liveness read source
+    draftStore, // F194 Phase B: canonical liveness read source
+    taskProgressStore, // F194 AC-B7: cleared on zombie reconcile
+    invocationRegistry: registry, // F194 Phase Z (KD-22): namespace bridge for parent↔child invocation
+  });
+  await app.register(invocationsRoutes, {
+    invocationRecordStore,
+    messageStore,
+    socketManager,
+    router,
+    invocationTracker,
+    queueProcessor,
+  });
+  await app.register(messageActionsRoutes, {
+    messageStore,
+    socketManager,
+    threadStore,
+  });
+  // F155: Frontend-facing guide actions (no MCP auth, uses userId header)
+  if (threadStore) {
+    await app.register(guideActionRoutes, {
+      threadStore,
+      socketManager,
+      guideSessionStore,
+      dismissTracker,
+    });
+  }
+  await app.register(agentsRoutes);
+
+  // F182 Phase D: disable-impact endpoint
+  {
+    const { registerDisableImpactRoute } = await import('./routes/disable-impact.js');
+    registerDisableImpactRoute(app, { taskStore, dynamicTaskStore });
+  }
+
+  // F149 Phase C: ACP pool diagnostics endpoint (gated by env flag)
+  app.get('/api/diagnostics/acp-pool', async (_req, reply) => {
+    if (process.env.AGENT_STUDIO_DIAGNOSTICS !== '1') {
+      return reply.code(403).send({ error: 'Diagnostics disabled' });
+    }
+    const pools: Record<string, unknown> = {};
+    for (const [variantId, pool] of acpPoolRegistry) {
+      pools[variantId] = pool.getMetrics();
+    }
+    return { pools, poolCount: acpPoolRegistry.size };
+  });
+
+  await app.register(quotaRoutes);
+  // F128: Daily token usage aggregation
+  await app.register(usageRoutes, { invocationRecordStore });
+  await app.register(workflowCapabilitiesRoutes);
+  // F150: Tool/Skill/MCP usage statistics
+  if (toolUsageCounter) {
+    await app.register(toolUsageRoutes, { toolUsageCounter });
+  }
+  // F200 Phase B: Recall metrics API
+  await app.register(recallMetricsRoutes, {
+    evidenceDb: memoryServices.store.getDb(),
+    messageStore,
+    taskStore,
+    threadStore,
+  });
+  // F153 Phase E: Hub embedded observability routes
+  const { telemetryRoutes } = await import('./routes/telemetry.js');
+  await app.register(telemetryRoutes, {
+    traceStore: telemetryHandle.traceStore,
+    getMetricsText: telemetryHandle.getMetricsText ?? undefined,
+    metricsSnapshotStore: telemetryHandle.metricsSnapshotStore ?? undefined,
+    checkReadiness,
+  });
+  // F192 Phase E-hub: harness eval verdict lifecycle surface.
+  // F192 OQ-21: late-bound holder for ConnectorInvokeTrigger — eval-hub routes
+  // register before invokeTrigger is created (line ~2600). Manual trigger route
+  // resolves the live trigger at request time via this holder, so the provider
+  // returns null until index.ts wires it after invokeTrigger construction.
+  const invokeTriggerHolder: {
+    current: ConnectorInvokeTrigger | null;
+    get(): ConnectorInvokeTrigger | null;
+  } = {
+    current: null,
+    get() {
+      return this.current;
+    },
+  };
+
+  const { evalHubRoutes } = await import('./routes/eval-hub.js');
+  // F192 Phase H AC-H4: real GitPublisher (git worktree + gh) + per-domain generators
+  const { createGitWorktreePublisher } = await import(
+    './infrastructure/harness-eval/publish-verdict/git-worktree-publisher.js'
+  );
+  const { createA2aGeneratorAdapter } = await import(
+    './infrastructure/harness-eval/publish-verdict/a2a-generator-adapter.js'
+  );
+  const { createTaskOutcomeGeneratorAdapter } = await import(
+    './infrastructure/harness-eval/publish-verdict/task-outcome-generator-adapter.js'
+  );
+  const { createSopGeneratorAdapter } = await import(
+    './infrastructure/harness-eval/publish-verdict/sop-generator-adapter.js'
+  );
+
+  // F192 Phase H 收尾 PR-2 (砚砚 R1 P1 + Q5): capability-wakeup generator wires a real
+  // CapabilityWakeupTrialProviderImpl with all 4 required ports (sessionStore /
+  // transcriptReader / toolEventLog / skillLoadEventLog). Constructor fail-closed —
+  // if Redis-backed ports are unavailable (no Redis client), skip cw wire entirely
+  // (eval-agent-invocation domain instructions filtering will degrade gracefully:
+  // cw agents see base instructions without publish section, handler returns 501).
+  const verdictGenerators: Partial<
+    Record<
+      'eval:a2a' | 'eval:capability-wakeup' | 'eval:memory' | 'eval:sop' | 'eval:task-outcome',
+      ReturnType<typeof createA2aGeneratorAdapter>
+    >
+  > = {
+    'eval:a2a': createA2aGeneratorAdapter(),
+    'eval:sop': createSopGeneratorAdapter(),
+    'eval:task-outcome': createTaskOutcomeGeneratorAdapter(),
+  };
+  if (toolEventLog && skillLoadEventLog) {
+    const { createCapabilityWakeupGeneratorAdapter } = await import(
+      './infrastructure/harness-eval/publish-verdict/capability-wakeup-generator-adapter.js'
+    );
+    const { CapabilityWakeupTrialProviderImpl } = await import(
+      './infrastructure/harness-eval/capability-wakeup/capability-wakeup-trial-provider-impl.js'
+    );
+    const { createCapabilityWakeupRuntimeSessionEnumerator } = await import(
+      './infrastructure/harness-eval/capability-wakeup/capability-wakeup-session-enumerator.js'
+    );
+    const cwProvider = new CapabilityWakeupTrialProviderImpl({
+      sessionStore: sessionChainStore,
+      transcriptReader,
+      toolEventLog,
+      skillLoadEventLog,
+      sessionEnumerator: createCapabilityWakeupRuntimeSessionEnumerator({
+        runtimeSessionStore,
+        getFamilyForAgent: (agentId) => agentConfigRegistry.tryGet(agentId)?.config.roleId,
+      }),
+    });
+    verdictGenerators['eval:capability-wakeup'] = createCapabilityWakeupGeneratorAdapter(cwProvider);
+  }
+
+  // F192 publish_verdict eval:memory wire-up — wires MemoryMetricsProvider
+  // backed by RecallMetricsComputer + computeLibraryHealth against live
+  // evidenceDb + markerQueue. Constructor is cheap (pure ctor), so unconditional.
+  if (memoryServices.markerQueue) {
+    const { createMemoryGeneratorAdapter } = await import(
+      './infrastructure/harness-eval/publish-verdict/memory-generator-adapter.js'
+    );
+    const { MemoryMetricsProviderImpl } = await import(
+      './infrastructure/harness-eval/memory/memory-metrics-provider-impl.js'
+    );
+    const memProvider = new MemoryMetricsProviderImpl({
+      evidenceDb: memoryServices.store.getDb(),
+      markersProvider: memoryServices.markerQueue,
+      repoRoot,
+      docsRoot,
+    });
+    verdictGenerators['eval:memory'] = createMemoryGeneratorAdapter(memProvider);
+  }
+
+  // F192 Phase G: Task Outcome Episode — L3 eval signals.
+  const { TaskOutcomeEpisodeStore } = await import('./infrastructure/harness-eval/task-outcome/task-outcome-store.js');
+  const taskOutcomeDbPath = process.env.TASK_OUTCOME_DB ?? resolve(repoRoot, 'task-outcome-episodes.sqlite');
+  const taskOutcomeStore = new TaskOutcomeEpisodeStore(taskOutcomeDbPath);
+  await app.register(evalHubRoutes, {
+    harnessFeedbackRoot: resolve(repoRoot, 'docs', 'harness-feedback'),
+    threadStore,
+    redis: redisClient ?? undefined,
+    invokeTriggerProvider: invokeTriggerHolder,
+    messageStore,
+    gitPublisher: createGitWorktreePublisher({ repoRoot }),
+    verdictGenerators,
+    // 砚砚 R4 P1 + cloud R4 P1: register CallbackAuthRegistry for MCP route auth.
+    callbackRegistry: registry,
+    // 砚砚 R9 P1: shared-MCP (Antigravity) agent-key publish path needs this.
+    agentKeyRegistry,
+    taskOutcomeDbPath,
+    eventMemoryDbPath: memoryServices.eventMemoryDbPath,
+  });
+  // AC-G13: Cancel burst detector (in-memory, per-process)
+  const { buildProposalRejectSignal } = await import(
+    './infrastructure/harness-eval/task-outcome/task-outcome-signal-builder.js'
+  );
+  const { CancelBurstDetector } = await import('./infrastructure/harness-eval/task-outcome/cancel-burst-detector.js');
+  const cancelBurstDetector = new CancelBurstDetector({ threshold: 3, windowMs: 60_000 });
+  const { appendPermissionCancelToEpisode, appendMagicWordRefToEpisode, checkAndAppendCancelBurst } = await import(
+    './infrastructure/harness-eval/task-outcome/task-outcome-signal-wiring.js'
+  );
+  const { taskOutcomeRoutes } = await import('./routes/task-outcome.js');
+  await app.register(taskOutcomeRoutes, { store: taskOutcomeStore });
+
+  // F153: Prompt X-Ray debug routes
+  const { promptCaptureRoutes } = await import('./routes/prompt-captures.js');
+  await app.register(promptCaptureRoutes);
+
+  // F075 Phase B+C: Game + Achievement stores
+  const { GameStore } = await import('./domains/leaderboard/game-store.js');
+  const { AchievementStore } = await import('./domains/leaderboard/achievement-store.js');
+  const gameStore = new GameStore();
+  const achievementStore = new AchievementStore();
+  await app.register(leaderboardRoutes, { messageStore, gameStore, achievementStore });
+  await app.register(leaderboardEventsRoutes, { gameStore, achievementStore });
+  await app.register(bootcampRoutes, { threadStore });
+  await app.register(firstRunQuestRoutes, { threadStore });
+
+  // F229: Concierge routes — reuse the shared conciergeConfigStoreShared created before AgentRouter.
+  // conciergeThreadServiceShared is also passed to threadsRoutes so includeConcierge=true works
+  // (threadStore.list cannot return concierge threads — they use createdBy='concierge-system').
+  const { ConciergeThreadService } = await import('./domains/concierge/ConciergeThreadService.js');
+  const conciergeThreadServiceShared = new ConciergeThreadService({
+    threadStore,
+    redis: redis ?? undefined,
+    conciergeConfigStore: conciergeConfigStoreShared,
+  });
+  // F229 PR-A3b: relay + confirmation stores
+  const { RedisConciergeRelayStore, MemoryConciergeRelayStore } = await import(
+    './domains/concierge/ConciergeRelayStore.js'
+  );
+  const { RedisConciergeConfirmationStore, MemoryConciergeConfirmationStore } = await import(
+    './domains/concierge/ConciergeConfirmationStore.js'
+  );
+  const conciergeRelayStore = redis ? new RedisConciergeRelayStore(redis) : new MemoryConciergeRelayStore();
+  const conciergeConfirmationStore = redis
+    ? new RedisConciergeConfirmationStore(redis)
+    : new MemoryConciergeConfirmationStore();
+  // F229 Phase B: triage plan store — already created above for AgentRouter, reuse here
+  await app.register(conciergeRoutes, {
+    conciergeConfigStore: conciergeConfigStoreShared,
+    conciergeThreadService: conciergeThreadServiceShared,
+    conciergeRelayStore,
+    conciergeConfirmationStore,
+    conciergeTriagePlanStore,
+    conciergeInvestigationJobStore,
+    evidenceStore: memoryServices?.evidenceStore,
+    messageStore,
+  });
+  const connectorHubOpts: Parameters<typeof connectorHubRoutes>[1] = { threadStore };
+  await app.register(connectorHubRoutes, connectorHubOpts);
+  await app.register(brakeRoutes, { activityTracker });
+
+  // F101: Game routes (store created earlier for /game command interception)
+  if (f101GameStore) {
+    await app.register(gameRoutes, {
+      gameStore: f101GameStore,
+      socketManager,
+      threadStore,
+      messageStore,
+      ...(f101SharedDriver ? { autoPlayer: f101SharedDriver } : {}),
+    });
+
+    const { gameActionRoutes, clearGameNonces } = await import('./routes/game-actions.js');
+    const { GameOrchestrator } = await import('./domains/agents/services/game/GameOrchestrator.js');
+    const actionOrchestrator = new GameOrchestrator({
+      gameStore: f101GameStore,
+      socketManager,
+      messageStore,
+      onGameEnd: (gameId) => clearGameNonces(gameId),
+    });
+    await app.register(gameActionRoutes, {
+      gameStore: f101GameStore,
+      orchestrator: actionOrchestrator,
+      threadStore,
+      actionNotifier: sharedActionNotifier,
+    });
+
+    app.log.info('[api] F101 game routes registered');
+  }
+
+  // Phase D (AC-D1): validate repo exists via `gh repo view` before PR tracking registration.
+  // Generic — works for any GitHub repo the caller has access to, not hardcoded to ours.
+  // Cloud P1: distinguish "repo not found" (return false) from infra failure (throw).
+  const validateRepo = async (repoFullName: string): Promise<boolean> => {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+    try {
+      await execFileAsync('gh', ['repo', 'view', repoFullName, '--json', 'name'], getGitHubExecOptions(10_000));
+      return true;
+    } catch (err: unknown) {
+      // gh ran but repo not found/no access → process exit code is a number
+      if (err instanceof Error && 'code' in err && typeof (err as Record<string, unknown>).code === 'number') {
+        return false;
+      }
+      // Infrastructure failure (gh not found, timeout, auth broken) → propagate
+      throw err;
+    }
+  };
+
+  const getGitHubPermission = async (
+    repoFullName: string,
+  ): Promise<{
+    repoFullName: string;
+    accessible: boolean;
+    viewerPermission: string | null;
+    login?: string;
+    url?: string;
+    source: string;
+    error?: string;
+  }> => {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+
+    let login: string | undefined;
+    try {
+      const { stdout } = await execFileAsync('gh', ['api', '/user', '--jq', '.login'], getGitHubExecOptions(10_000));
+      const trimmed = stdout.trim();
+      if (trimmed) login = trimmed;
+    } catch (err) {
+      app.log.warn({ err }, 'GitHub login lookup failed during permission query');
+    }
+
+    try {
+      const { stdout } = await execFileAsync(
+        'gh',
+        ['repo', 'view', repoFullName, '--json', 'nameWithOwner,viewerPermission,url'],
+        getGitHubExecOptions(10_000),
+      );
+      const parsed = JSON.parse(stdout.trim()) as Record<string, unknown>;
+      const resolvedRepoFullName =
+        typeof parsed.nameWithOwner === 'string' && parsed.nameWithOwner.trim() ? parsed.nameWithOwner : repoFullName;
+      return {
+        repoFullName: resolvedRepoFullName,
+        accessible: true,
+        viewerPermission: typeof parsed.viewerPermission === 'string' ? parsed.viewerPermission : null,
+        ...(login ? { login } : {}),
+        ...(typeof parsed.url === 'string' && parsed.url ? { url: parsed.url } : {}),
+        source: 'gh-cli',
+      };
+    } catch (err: unknown) {
+      if (err instanceof Error && 'code' in err && typeof (err as Record<string, unknown>).code === 'number') {
+        return {
+          repoFullName,
+          accessible: false,
+          viewerPermission: null,
+          ...(login ? { login } : {}),
+          source: 'gh-cli',
+          error: 'not_accessible_or_not_found',
+        };
+      }
+      throw err;
+    }
+  };
+
+  // F202 Phase 2 follow-up: validate specific PR exists (number-level, not just repo)
+  const validatePr = async (repoFullName: string, prNumber: number): Promise<boolean> => {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+    try {
+      await execFileAsync(
+        'gh',
+        ['api', `repos/${repoFullName}/pulls/${prNumber}`, '--jq', '.number'],
+        getGitHubExecOptions(10_000),
+      );
+      return true;
+    } catch (err: unknown) {
+      if (err instanceof Error && 'code' in err && typeof (err as Record<string, unknown>).code === 'number') {
+        return false;
+      }
+      throw err;
+    }
+  };
+
+  // F202 Phase 2 follow-up: validate specific issue exists (number-level, not just repo)
+  // P2-cloud: also reject PR numbers — GitHub Issues API returns PRs with .pull_request set
+  const validateIssue = async (repoFullName: string, issueNumber: number): Promise<boolean> => {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+    try {
+      const { stdout } = await execFileAsync(
+        'gh',
+        ['api', `repos/${repoFullName}/issues/${issueNumber}`, '--jq', '.pull_request != null'],
+        getGitHubExecOptions(10_000),
+      );
+      // If .pull_request is set, this is a PR not a pure issue — reject
+      if (stdout.trim() === 'true') return false;
+      return true;
+    } catch (err: unknown) {
+      if (err instanceof Error && 'code' in err && typeof (err as Record<string, unknown>).code === 'number') {
+        return false;
+      }
+      throw err;
+    }
+  };
+
+  // F126: Create LimbRegistry + Phase B deps for device/hardware capability management
+  const { LimbRegistry } = await import('./domains/limb/LimbRegistry.js');
+  const { LimbAccessPolicy } = await import('./domains/limb/LimbAccessPolicy.js');
+  const { LimbLeaseManager } = await import('./domains/limb/LimbLeaseManager.js');
+  const { LimbActionLog } = await import('./domains/limb/LimbActionLog.js');
+  const limbRegistry = new LimbRegistry();
+  limbRegistry.setDeps({
+    accessPolicy: new LimbAccessPolicy(),
+    leaseManager: new LimbLeaseManager(),
+    actionLog: new LimbActionLog(),
+  });
+
+  // F126 Phase C: Pairing store + limb node routes for remote devices
+  const { LimbPairingStore } = await import('./domains/limb/LimbPairingStore.js');
+  const { registerLimbNodeRoutes } = await import('./routes/limb-node-routes.js');
+  const limbPairingStore = new LimbPairingStore();
+  registerLimbNodeRoutes(app, { limbRegistry, pairingStore: limbPairingStore });
+
+  // F202-2B: Hoisted for late-binding GitHub schedule rehydration (closure set inside F202 block)
+  let rehydrateGitHubSchedules: ((githubDeps: Record<string, unknown>) => Promise<void>) | undefined;
+  let getGitHubPluginEnv: () => Record<string, string | undefined> = () => ({});
+  const getGitHubEnvValue = (key: string): string | undefined => {
+    const pluginEnv = getGitHubPluginEnv();
+    return Object.hasOwn(pluginEnv, key) ? pluginEnv[key] : process.env[key];
+  };
+  const getGitHubToken = (): string | undefined => {
+    return resolveGhCliToken({ pluginEnv: getGitHubPluginEnv() });
+  };
+  const getGitHubExecOptions = (timeout: number): { timeout: number; env?: NodeJS.ProcessEnv } => {
+    return {
+      timeout,
+      env: buildGhCliEnv({ token: getGitHubToken() }),
+    };
+  };
+  const { createRepoActivityTemplate } = await import('./infrastructure/scheduler/templates/repo-activity.js');
+  templateRegistry.register(createRepoActivityTemplate({ getGitHubToken }));
+  const maxGithubId = (items: { id?: unknown }[]): number => {
+    let cursor = 0;
+    for (const item of items) {
+      if (typeof item.id === 'number' && Number.isFinite(item.id) && item.id > cursor) {
+        cursor = item.id;
+      }
+    }
+    return cursor;
+  };
+  const fetchPrTrackingBoundary = async (repoFullName: string, prNumber: number) => {
+    const { fetchPaginated } = await import('./infrastructure/github/fetch-paginated.js');
+    const [reviewComments, issueComments, reviews, ciStatus] = await Promise.all([
+      fetchPaginated(`/repos/${repoFullName}/pulls/${prNumber}/comments`, {
+        ghToken: getGitHubToken(),
+      }),
+      fetchPaginated(`/repos/${repoFullName}/issues/${prNumber}/comments`, {
+        ghToken: getGitHubToken(),
+      }),
+      fetchPaginated(`/repos/${repoFullName}/pulls/${prNumber}/reviews`, {
+        ghToken: getGitHubToken(),
+      }),
+      fetchPrCiStatus(repoFullName, prNumber, app.log, { ghToken: getGitHubToken() }),
+    ]);
+    return {
+      review: {
+        lastCommentCursor: maxGithubId([
+          ...(reviewComments as { id?: unknown }[]),
+          ...(issueComments as { id?: unknown }[]),
+        ]),
+        lastDecisionCursor: maxGithubId(reviews as { id?: unknown }[]),
+      },
+      ...(ciStatus
+        ? {
+            ci: {
+              headSha: ciStatus.headSha,
+              ...(ciStatus.aggregateBucket === 'pending'
+                ? {}
+                : {
+                    lastFingerprint: `${ciStatus.headSha}:${ciStatus.aggregateBucket}`,
+                    lastBucket: ciStatus.aggregateBucket,
+                  }),
+            },
+          }
+        : {}),
+    };
+  };
+  const fetchIssueCommentCursor = async (repoFullName: string, issueNumber: number): Promise<number> => {
+    const { fetchPaginated } = await import('./infrastructure/github/fetch-paginated.js');
+    const comments = await fetchPaginated(`/repos/${repoFullName}/issues/${issueNumber}/comments`, {
+      ghToken: getGitHubToken(),
+    });
+    return maxGithubId(comments as { id?: unknown }[]);
+  };
+
+  // F202: Plugin framework — discovery + config + resource activation
+  {
+    const { join } = await import('node:path');
+    const { PluginRegistry } = await import('./domains/plugin/PluginRegistry.js');
+    const { PluginResourceActivator, rehydrateEnabledPluginLimbs, rehydrateEnabledPluginSchedules } = await import(
+      './domains/plugin/PluginResourceActivator.js'
+    );
+    const { ScheduleFactoryRegistry } = await import('./domains/plugin/ScheduleFactoryRegistry.js');
+    const { registerPluginRoutes } = await import('./routes/plugin-routes.js');
+    const { generateCliConfigs, readCapabilitiesConfig, writeCapabilitiesConfig, withCapabilityLock } = await import(
+      './config/capabilities/capability-orchestrator.js'
+    );
+    const { resolveStartupCliConfigContext } = await import('./config/capabilities/startup-cli-config.js');
+    const { resolveActiveProjectRoot } = await import('./utils/active-project-root.js');
+
+    const monorepoRoot = findMonorepoRoot(process.cwd());
+    const pluginsDir = join(monorepoRoot, 'plugins');
+    const { loadAllPluginConfigs, resolvePluginEnv } = await import('./domains/plugin/plugin-config-store.js');
+    const pluginRegistry = new PluginRegistry(pluginsDir);
+    pluginRegistry.scan();
+    const scannedManifests = pluginRegistry.getAllManifests();
+    const loadedEnvKeys = loadAllPluginConfigs(resolveActiveProjectRoot(), scannedManifests);
+    app.log.info(
+      `[api] F202: PluginRegistry scanned ${scannedManifests.length} plugin(s), loaded ${loadedEnvKeys} config key(s)`,
+    );
+    getGitHubPluginEnv = () => {
+      const githubManifest = pluginRegistry.getManifest('github');
+      return githubManifest ? resolvePluginEnv([githubManifest]) : {};
+    };
+
+    const limbAdapterRegistry = new Map<string, (yamlPath: string) => Promise<ILimbNode>>();
+
+    // F202 Phase 2: Schedule factory registry + GitHub factories
+    const scheduleFactoryRegistry = new ScheduleFactoryRegistry();
+    const { registerGitHubScheduleFactories } = await import('./domains/plugin/github-schedule-factories.js');
+    registerGitHubScheduleFactories(scheduleFactoryRegistry);
+
+    // F202-2B: Mutable deps ref — starts with just log, populated with full GitHub deps later
+    const scheduleFactoryDeps: Record<string, unknown> = { log: app.log };
+
+    const pluginActivator = new PluginResourceActivator({
+      resolveProjectRoot: () => resolveActiveProjectRoot(),
+      resolveMainProjectRoot: () => monorepoRoot,
+      pluginsDir,
+      limbRegistry,
+      readCapabilities: () => readCapabilitiesConfig(resolveActiveProjectRoot()),
+      writeCapabilities: async (config) => {
+        const root = resolveActiveProjectRoot();
+        await writeCapabilitiesConfig(root, config);
+        const { paths } = resolveStartupCliConfigContext(root);
+        await generateCliConfigs(config, paths);
+      },
+      withCapabilityLock: (fn) => withCapabilityLock(resolveActiveProjectRoot(), fn),
+      limbAdapterFactory: async (pluginId, limbYamlPath) => {
+        const factory = limbAdapterRegistry.get(pluginId);
+        if (!factory) {
+          throw new Error(
+            `No platform-specific limb adapter registered for plugin '${pluginId}'. ` +
+              `Limb resources require a concrete adapter (see Phase 2 for examples).`,
+          );
+        }
+        return factory(limbYamlPath);
+      },
+      // F202 Phase 2: schedule resource activation deps
+      scheduleFactoryRegistry,
+      taskRunner: {
+        registerPostStart: (task) => taskRunnerV2.registerPostStart(task),
+        unregister: (taskId) => taskRunnerV2.unregister(taskId),
+      },
+      // F202-2B: Mutable deps ref — populated via rehydrateGitHubSchedules after GitHub services created
+      scheduleFactoryDeps:
+        scheduleFactoryDeps as import('./domains/plugin/ScheduleFactoryRegistry.js').ScheduleFactoryDeps,
+    });
+
+    const startupCaps = await readCapabilitiesConfig(resolveActiveProjectRoot());
+    await rehydrateEnabledPluginLimbs({
+      capabilities: startupCaps,
+      pluginRegistry,
+      pluginsDir,
+      limbAdapterRegistry,
+      limbRegistry,
+      log: app.log,
+    });
+
+    // F202-2B: Schedule rehydration deferred — GitHub factories need deps created later.
+    // Closure captures F202 scope; called after GitHub services are created (before taskRunnerV2.start).
+    rehydrateGitHubSchedules = async (githubDeps: Record<string, unknown>) => {
+      // Populate the mutable deps ref (also updates pluginActivator's reference)
+      Object.assign(scheduleFactoryDeps, githubDeps);
+
+      // Migration: auto-enable GitHub schedule resources on first startup after Phase B migration
+      // Uses marker file to prevent re-enable after explicit disable (P2-1 fix)
+      const root = resolveActiveProjectRoot();
+      const githubManifest = pluginRegistry.getManifest('github');
+      if (githubManifest) {
+        const existingCaps = await readCapabilitiesConfig(root);
+        const {
+          shouldRunGitHubScheduleMigration,
+          markGitHubScheduleMigrationDone,
+          buildGitHubMigrationEntries,
+          buildGitHubMigrationEnv,
+          buildGitHubScheduleOverrideMigrations,
+          promotePendingGitHubMigrationEntries,
+          backfillMissingGitHubScheduleEntries,
+          hasGitHubScheduleBackfillRun,
+          markGitHubScheduleBackfillDone,
+        } = await import('./domains/plugin/github-schedule-factories.js');
+        const hasRepoScanRuntimeDeps = !!(githubDeps as Record<string, unknown>).reconciliationDedup;
+        const migrationEnv = buildGitHubMigrationEnv(getGitHubPluginEnv());
+        let latestCaps = existingCaps;
+        if (shouldRunGitHubScheduleMigration(root, existingCaps)) {
+          // P2-1 fix: gate repo-scan on both env vars AND runtime deps (Redis).
+          // Without Redis, factory construction fails at rehydration, leaving
+          // capabilities.json with "enabled" but no running task.
+          const entries = buildGitHubMigrationEntries(githubManifest, migrationEnv, {
+            repoScanDepsAvailable: hasRepoScanRuntimeDeps,
+          });
+          if (entries.length > 0) {
+            const overrideMigrations = buildGitHubScheduleOverrideMigrations(
+              entries,
+              globalControlStore.listOverrides(),
+            );
+            for (const override of overrideMigrations) {
+              globalControlStore.setTaskOverride(override.taskId, override.enabled, override.updatedBy);
+            }
+
+            // P2-cloud: spread existingCaps to preserve governancePack and other top-level fields
+            const updatedCaps: import('@agent-studio/shared').CapabilitiesConfig = {
+              ...(existingCaps ?? { version: 1 as const, capabilities: [] }),
+              version: 1 as const,
+              capabilities: [...(existingCaps?.capabilities ?? []), ...entries],
+            };
+            await writeCapabilitiesConfig(root, updatedCaps);
+            latestCaps = updatedCaps;
+            markGitHubScheduleMigrationDone(root);
+            const enabledEntryCount = entries.filter((entry) => entry.enabled).length;
+            const pendingEntryCount = entries.length - enabledEntryCount;
+            app.log.info(
+              `[api] F202-2B migration: enabled ${enabledEntryCount} GitHub schedule resources ` +
+                `${pendingEntryCount > 0 ? `and left ${pendingEntryCount} pending ` : ''}` +
+                `and migrated ${overrideMigrations.length} scheduler overrides`,
+            );
+          }
+        }
+        // P1-1 (cloud review): backfill manifest schedule resources missing from existing
+        // installations. shouldRunGitHubScheduleMigration returns false once any github
+        // schedule exists, so a NEW resource (repo-comment-poll) added after the one-time
+        // migration ran would never be added. Runs every startup; adds only absent entries
+        // (respects explicit disable). Redis-gated entries land pending → promoted below.
+        const alreadyBackfilled = hasGitHubScheduleBackfillRun(root);
+        const backfill = backfillMissingGitHubScheduleEntries(
+          latestCaps ?? { version: 1 as const, capabilities: [] },
+          githubManifest,
+          migrationEnv,
+          { repoScanDepsAvailable: hasRepoScanRuntimeDeps, alreadyBackfilled },
+        );
+        if (backfill.changed) {
+          await writeCapabilitiesConfig(root, backfill.config);
+          latestCaps = backfill.config;
+          app.log.info('[api] F168-C0.3: backfilled missing GitHub schedule resource(s) for existing installation');
+        }
+        if (!alreadyBackfilled) {
+          // One-time (cloud R2 P1): mark backfill done so a TARGET resource the operator
+          // later disables (physically removed) is not resurrected on the next startup.
+          markGitHubScheduleBackfillDone(root);
+        }
+        const pendingPromotion = promotePendingGitHubMigrationEntries(
+          latestCaps ?? { version: 1 as const, capabilities: [] },
+          githubManifest,
+          migrationEnv,
+          { repoScanDepsAvailable: hasRepoScanRuntimeDeps },
+        );
+        if (pendingPromotion.changed) {
+          await writeCapabilitiesConfig(root, pendingPromotion.config);
+          app.log.info(
+            '[api] F202-2B migration: enabled pending GitHub repo-scan schedule after deps became available',
+          );
+        }
+      }
+
+      // Rehydrate all enabled schedule resources (includes any migrated GitHub entries)
+      const caps = await readCapabilitiesConfig(resolveActiveProjectRoot());
+      await rehydrateEnabledPluginSchedules({
+        capabilities: caps,
+        pluginRegistry,
+        scheduleFactoryRegistry,
+        taskRunner: taskRunnerV2,
+        scheduleFactoryDeps:
+          scheduleFactoryDeps as import('./domains/plugin/ScheduleFactoryRegistry.js').ScheduleFactoryDeps,
+        log: app.log,
+      });
+    };
+
+    registerPluginRoutes(app, { pluginRegistry, pluginActivator, limbRegistry, pluginsDir });
+  }
+  // F174 D2b-1 — single notifier instance shared between callback auth preHandler
+  // (posts in-context surface on 401) and the hide-similar debug endpoint
+  // (lets the user 24h-suppress a (reason, tool, agentId) tuple).
+  const callbackAuthNotifier = new CallbackAuthSystemMessageNotifier({ messageStore, socketManager });
+
+  const callbackOpts = {
+    registry,
+    agentKeyRegistry,
+    messageStore,
+    socketManager,
+    callbackAuthNotifier,
+    taskStore,
+    backlogStore,
+    threadStore,
+    sessionChainStore,
+    runtimeSessionStore,
+    proposalStore,
+    handoffProposalStore,
+    profileUpdateProposalStore,
+    profileDir,
+    agentRegistry,
+    router,
+    invocationRecordStore,
+    invocationTracker,
+    deliveryCursorStore,
+    validateRepo,
+    getGitHubPermission,
+    validatePr,
+    validateIssue,
+    fetchPrTrackingBoundary,
+    fetchIssueCommentCursor,
+    ...(workflowSopStore ? { workflowSopStore } : {}),
+    queueProcessor,
+    invocationQueue,
+    evidenceStore: memoryServices.evidenceStore,
+    markerQueue: memoryServices.markerQueue,
+    reflectionService: memoryServices.reflectionService,
+    limbRegistry,
+    limbPairingStore,
+    guideSessionStore,
+    labelStore,
+    holdBallDeps: {
+      registry,
+      taskRunner: taskRunnerV2,
+      templateRegistry,
+      dynamicTaskStore,
+      messageStore,
+      socketManager,
+      threadStore,
+      onHoldBallCancelFeedback: (input) => {
+        void import('./domains/agents/services/frustration/FrustrationDetector.js')
+          .then(({ evaluate }) =>
+            evaluate(
+              {
+                signal: {
+                  type: 'user_report',
+                  toolName: 'agent_studio_hold_ball',
+                  cancelReason: 'hold_ball_cancel',
+                },
+                threadId: input.threadId,
+                userId: input.userId,
+                agentId: input.agentId,
+              },
+              { frustrationIssueStore, messageStore, socketManager: socketManager ?? undefined },
+            ),
+          )
+          .catch(() => {
+            // Best-effort: hold cancellation must not be blocked by feedback issue creation.
+          });
+      },
+    },
+  } as Parameters<typeof callbacksRoutes>[1];
+  await app.register(callbacksRoutes, callbackOpts);
+
+  // F174 Phase D1 — callback auth failure telemetry debug endpoint (AC-D3).
+  // D2b-1 adds POST /api/debug/callback-auth/hide-similar (24h opt-out) when notifier is wired.
+  registerCallbackAuthDebugRoute(app, { notifier: callbackAuthNotifier });
+
+  // Authorization system — Agent dynamic permissions (Redis-backed when available)
+  const authRuleStore = createAuthorizationRuleStore(redis);
+  // authPendingStore created earlier (line ~480) for F222 cancel burst detection
+  const authAuditStore = createAuthorizationAuditStore(redis);
+  const authManager = new AuthorizationManager({
+    ruleStore: authRuleStore,
+    pendingStore: authPendingStore,
+    auditStore: authAuditStore,
+    io: socketManager.getIO(),
+  });
+  await app.register(callbackAuthRoutes, { authManager, registry });
+  await app.register(authorizationRoutes, {
+    authManager,
+    ruleStore: authRuleStore,
+    auditStore: authAuditStore,
+    socketManager,
+    onPermissionCancel: (input) => {
+      try {
+        // AC-G10/G11: permission cancel → episode a2 signal (production helper)
+        appendPermissionCancelToEpisode(taskOutcomeStore, {
+          toolName: input.toolName,
+          paramsSummary: input.paramsSummary,
+          cancelReason: input.cancelReason,
+          agentId: input.agentId,
+          threadId: input.threadId,
+        });
+
+        // AC-G13: Check for cancel burst (≥3 cancels in 1 minute)
+        checkAndAppendCancelBurst(taskOutcomeStore, cancelBurstDetector, input.threadId, Date.now());
+
+        // F222 UX-3: "取消并反馈" — immediately trigger auto-issue (no threshold)
+        if (input.withFeedback && input.userId) {
+          void import('./domains/agents/services/frustration/FrustrationDetector.js')
+            .then(({ evaluate }) =>
+              evaluate(
+                {
+                  signal: {
+                    type: 'user_report',
+                    toolName: input.toolName,
+                    cancelReason: input.cancelReason,
+                  },
+                  threadId: input.threadId,
+                  userId: input.userId,
+                  agentId: input.agentId,
+                },
+                { frustrationIssueStore, messageStore, socketManager: socketManager ?? undefined },
+              ),
+            )
+            .catch(() => {
+              // Best-effort: swallow import/evaluate failures so the authorization
+              // response is never blocked by frustration detection issues.
+            });
+        }
+      } catch {
+        // Best-effort: don't break authorization flow
+      }
+    },
+  });
+  await app.register(threadsRoutes, {
+    threadStore,
+    messageStore,
+    taskStore,
+    memoryStore,
+    deliveryCursorStore,
+    invocationTracker,
+    draftStore,
+    taskProgressStore,
+    backlogStore,
+    ...(readStateStore ? { readStateStore } : {}),
+    guideSessionStore,
+    labelStore,
+    indexBuilder: memoryServices.indexBuilder as
+      | { markThreadDirty(threadId: string): void; flushDirtyThreads?(): number | Promise<number> }
+      | undefined,
+    conciergeThreadService: conciergeThreadServiceShared,
+  });
+  await app.register(labelsRoutes, { labelStore, threadStore });
+  await app.register(threadBranchRoutes, {
+    threadStore,
+    messageStore,
+    socketManager,
+  });
+  await app.register(threadExportRoutes, { threadStore });
+  await app.register(threadMemberStrategyRoutes, { threadStore }); // #921
+  // F192: Shared callback — record proposal rejection as task outcome A2 signal.
+  // Covers both F128 (thread proposal) and F225 (session handoff proposal) rejections.
+  const onProposalReject = (input: {
+    proposalId: string;
+    proposalType: 'thread' | 'session_handoff';
+    agentId: string;
+    threadId: string;
+    proposalTitle?: string;
+    rejectionReason?: string;
+  }) => {
+    try {
+      const record = buildProposalRejectSignal(input);
+      taskOutcomeStore.appendSignal(
+        (
+          taskOutcomeStore.getActiveEpisode(input.threadId) ??
+          taskOutcomeStore.createEpisode({
+            trigger: 'agent_initiated',
+            threadId: input.threadId,
+            participants: input.agentId ? [input.agentId] : [],
+          })
+        ).episodeId,
+        { category: 'a2', record },
+      );
+    } catch {
+      // Best-effort: eval signal recording must not break the rejection flow
+    }
+  };
+
+  await app.register(proposalRoutes, {
+    proposalStore,
+    threadStore,
+    messageStore,
+    socketManager,
+    router,
+    invocationQueue,
+    queueProcessor,
+    onProposalReject: (input) => onProposalReject({ ...input, proposalType: 'thread' }),
+  });
+  // F231 Phase C: profile-update approve/reject (user-auth; locked critical section in service)
+  registerProfileUpdateDecisionRoutes(app, {
+    store: profileUpdateProposalStore,
+    lock: profileUpdateLock,
+    profileDir,
+    socketManager,
+  });
+  // F225: agent-initiated session handoff approve/reject (user-auth commit-point dispatcher)
+  await app.register(sessionHandoffApproveRoutes, {
+    handoffProposalStore,
+    sessionChainStore,
+    sessionSealer,
+    invocationQueue,
+    queueProcessor,
+    socketManager,
+    onProposalReject: (input) => onProposalReject({ ...input, proposalType: 'session_handoff' }),
+  });
+  // F222: Frustration auto-issue routes
+  await app.register(frustrationIssueRoutes, { frustrationIssueStore });
+
+  // F235: Community issue draft routes (publish to community flow)
+  {
+    const { GitHubIssuePublisher } = await import('./domains/community/GitHubIssuePublisher.js');
+    const defaultRepo = process.env.COMMUNITY_PUBLISH_DEFAULT_REPO ?? 'baiyuxi930826/baiyuxi-agent-studio-build-week';
+    const repoAllowlist = (process.env.COMMUNITY_PUBLISH_REPO_ALLOWLIST ?? defaultRepo).split(',').map((s) => s.trim());
+    // Lazy token factory: resolves at publish time so late-binding plugin config is picked up (P1-1 cloud R6).
+    const publisher = new GitHubIssuePublisher({ token: getGitHubToken, repoAllowlist });
+    await app.register(communityIssueDraftRoutes, {
+      communityIssueDraftStore,
+      frustrationIssueStore,
+      publisher,
+      config: { defaultRepo, repoAllowlist },
+    });
+  }
+
+  // F142: shared connector binding store — reused by threadAgentsRoutes AND connector gateway
+  const { RedisConnectorThreadBindingStore } = await import(
+    './infrastructure/connectors/RedisConnectorThreadBindingStore.js'
+  );
+  const { MemoryConnectorThreadBindingStore } = await import(
+    './infrastructure/connectors/ConnectorThreadBindingStore.js'
+  );
+  const connectorBindingStore = redisClient
+    ? new RedisConnectorThreadBindingStore(redisClient)
+    : new MemoryConnectorThreadBindingStore();
+  {
+    const allAgentConfigs = agentConfigRegistry.getAllConfigs();
+    await app.register(threadAgentsRoutes, {
+      threadStore,
+      agentRegistry,
+      bindingStore: connectorBindingStore,
+      getAgentDisplayName: (agentId: string) => allAgentConfigs[agentId]?.displayName ?? agentId,
+      getAllAgentIds: () => Object.keys(allAgentConfigs),
+      isAgentAvailable: (agentId: string) => isAgentAvailable(agentId),
+    });
+  }
+  await app.register(tasksRoutes, { taskStore, socketManager });
+
+  // F093: World Engine — routes (store + coordinator initialized above, before AgentRouter)
+  await app.register(worldRoutes, { worldStore, coordinator: worldCoordinator });
+
+  const fetchIssuesForSync = async (repo: string) => {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+    const { stdout } = await execFileAsync(
+      'gh',
+      [
+        'api',
+        `/repos/${repo}/issues`,
+        '--method',
+        'GET',
+        '--jq',
+        '.[] | select(.pull_request == null) | {number, title, state, labels: [.labels[].name], comments, user: .user.login, html_url}',
+        '--paginate',
+        '-f',
+        'state=all',
+        '-f',
+        'per_page=100',
+      ],
+      { timeout: 60_000 },
+    );
+    if (!stdout.trim()) return [];
+    return stdout
+      .trim()
+      .split('\n')
+      .map((line: string) => JSON.parse(line));
+  };
+  const fetchPrsForSync = async (repo: string) => {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+    const { stdout } = await execFileAsync(
+      'gh',
+      [
+        'api',
+        `/repos/${repo}/pulls`,
+        '--method',
+        'GET',
+        '--jq',
+        '.[] | {number, title, state, merged_at: .merged_at, user: .user.login, head_sha: .head.sha, draft, labels: [.labels[].name], updated_at: .updated_at}',
+        '--paginate',
+        '-f',
+        'state=all',
+        '-f',
+        'per_page=100',
+      ],
+      { timeout: 60_000 },
+    );
+    if (!stdout.trim()) return [];
+    return stdout
+      .trim()
+      .split('\n')
+      .map((line: string) => JSON.parse(line));
+  };
+  const fetchPrReviewsForSync = async (_repo: string, prNumber: number) => {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+    const { stdout } = await execFileAsync(
+      'gh',
+      [
+        'api',
+        '--paginate',
+        `/repos/${_repo}/pulls/${prNumber}/reviews`,
+        '--method',
+        'GET',
+        '--jq',
+        '.[] | {user: .user.login, state, commit_id}',
+      ],
+      { timeout: 30_000 },
+    );
+    if (!stdout.trim()) return [];
+    return stdout
+      .trim()
+      .split('\n')
+      .map((line: string) => JSON.parse(line));
+  };
+  const { InMemoryCommunityPrStore } = await import(
+    './domains/agents/services/stores/memory/InMemoryCommunityPrStore.js'
+  );
+  const communityPrStore = new InMemoryCommunityPrStore();
+
+  // F168 Phase C C2.2: community narrator wiring (conditional — disabled without thread ID)
+  const communityNarratorThreadId = process.env.COMMUNITY_NARRATOR_THREAD_ID;
+  let communityNarratorDriver: import('./domains/community/NarratorDriver.js').NarratorDriver | undefined;
+  if (communityNarratorThreadId) {
+    const { NarratorDriver } = await import('./domains/community/NarratorDriver.js');
+    const { createRoleResolver, DEFAULT_COMMUNITY_ROLE_BINDINGS } = await import('./domains/community/RoleResolver.js');
+    const { createWakeAgentFn } = await import('./domains/agents/services/game/wakeAgentImpl.js');
+    const communityWakeAgent = createWakeAgentFn({
+      threadStore,
+      invocationQueue,
+      queueProcessor,
+      log: app.log,
+    });
+    const communityRoleResolver = createRoleResolver(getRoster, DEFAULT_COMMUNITY_ROLE_BINDINGS);
+    communityNarratorDriver = new NarratorDriver({
+      roleResolver: communityRoleResolver,
+      narratorThreadId: communityNarratorThreadId,
+      wakeAgent: communityWakeAgent,
+      log: app.log,
+    });
+    app.log.info({ narratorThreadId: communityNarratorThreadId }, '[F168] Community NarratorDriver wired');
+  }
+
+  await app.register(communityIssueRoutes, {
+    communityIssueStore,
+    taskStore,
+    threadStore, // F168 Phase C: narrator Path 2 (new-thread routing) requires threadStore
+    socketManager,
+    registry,
+    fetchIssues: fetchIssuesForSync,
+    communityPrStore,
+    fetchPrs: fetchPrsForSync,
+    fetchPrReviews: fetchPrReviewsForSync,
+    // F168 Phase A P1-1: wire community event services
+    eventLog: communityEventLog,
+    projector: communityProjector,
+    objectStore: communityObjectStore,
+    // Cloud R2 P2: seed initial comment cursor on auto-registration to avoid
+    // replaying historical comments on first poll after case.routed
+    fetchIssueCommentCursor,
+    // F168 Phase C C2.2: narrator driver (fire-and-forget after case.triaged)
+    narratorDriver: communityNarratorDriver,
+  });
+  await app.register(backlogRoutes, { backlogStore, threadStore, messageStore });
+
+  // F076: External projects + Need Audit
+  const { ExternalProjectStore } = await import('./domains/projects/external-project-store.js');
+  const { IntentCardStore } = await import('./domains/projects/intent-card-store.js');
+  const { NeedAuditFrameStore } = await import('./domains/projects/need-audit-frame-store.js');
+  const externalProjectStore = new ExternalProjectStore(redis);
+  const intentCardStore = new IntentCardStore();
+  const needAuditFrameStore = new NeedAuditFrameStore();
+  const { ResolutionStore } = await import('./domains/projects/resolution-store.js');
+  const { SliceStore } = await import('./domains/projects/slice-store.js');
+  const { RefluxPatternStore } = await import('./domains/projects/reflux-pattern-store.js');
+  const resolutionStore = new ResolutionStore();
+  const sliceStore = new SliceStore();
+  const refluxPatternStore = new RefluxPatternStore();
+  await app.register(externalProjectRoutes, { externalProjectStore, needAuditFrameStore, backlogStore });
+  await app.register(intentCardRoutes, { externalProjectStore, intentCardStore });
+  await app.register(resolutionRoutes, { externalProjectStore, resolutionStore });
+  await app.register(sliceRoutes, { externalProjectStore, sliceStore });
+  await app.register(refluxRoutes, { externalProjectStore, refluxPatternStore });
+  await app.register(executionDigestRoutes, { executionDigestStore });
+  if (workflowSopStore) {
+    await app.register(workflowSopRoutes, { workflowSopStore, backlogStore });
+  }
+  await app.register(summariesRoutes, { summaryStore, socketManager });
+  await app.register(projectsRoutes);
+  await app.register(mkdirRoute);
+  await app.register(agentHooksRoutes);
+  await app.register(governanceStatusRoute);
+  await app.register(projectSetupRoute, {
+    memoryBootstrapService: expeditionBootstrapService as { bootstrap: (p: string, o?: unknown) => Promise<unknown> },
+    socketManager: socketManager ?? undefined,
+  });
+  await app.register(projectsBootstrapRoutes, {
+    stateManager: indexStateManager,
+    bootstrapService: expeditionBootstrapService,
+    socketManager: socketManager!,
+    getFingerprint,
+  });
+  await app.register(exportRoutes, { messageStore, threadStore });
+  await app.register(configRoutes);
+  await app.register(configSecretsRoutes);
+  await app.register(rulesRoutes);
+  await app.register(servicesRoutes, {
+    lifecycle: {
+      autoStartEnabled: true,
+      onServiceReady: ({ service, operator, reason }) => {
+        if (service.id !== 'embedding-model' || !memoryServices.indexBuilder) return;
+        appendServiceLog(service.id, `[start] embedding service ready (${reason}); scheduling evidence rebuild\n`);
+        app.log.info(
+          { serviceId: service.id, operator, reason },
+          '[api] F102: embedding service ready; scheduling evidence rebuild',
+        );
+        const startedAt = Date.now();
+        void memoryServices.indexBuilder
+          .rebuild({ force: true })
+          .then((result) => {
+            const elapsedMs = Date.now() - startedAt;
+            appendServiceLog(
+              service.id,
+              `[start] evidence rebuild completed: ${result.docsIndexed} indexed, ${result.docsSkipped} skipped (${elapsedMs}ms)\n`,
+            );
+            app.log.info(
+              `[api] F102: embedding service catch-up rebuild completed - ${result.docsIndexed} indexed, ${result.docsSkipped} skipped (${elapsedMs}ms)`,
+            );
+          })
+          .catch((error) => {
+            appendServiceLog(service.id, `[start] evidence rebuild failed: ${String(error)}\n`);
+            app.log.warn(
+              { err: error, serviceId: service.id },
+              '[api] F102: embedding service catch-up rebuild failed',
+            );
+          });
+      },
+    },
+  });
+  await app.register(featureDocDetailRoutes);
+  await app.register(accountsRoutes);
+  await app.register(claudeRescueRoutes);
+  await app.register(auditRoutes, { threadStore });
+  await app.register(capabilitiesRoutes);
+  await app.register(audioProxyRoutes);
+
+  {
+    const { createAdapterRegistry } = await import('./marketplace/index.js');
+    const { loadClaudeCatalog, loadCodexCatalog, loadOpenClawCatalog, loadAntigravityCatalog } = await import(
+      './marketplace/catalog-loaders.js'
+    );
+    const registry = createAdapterRegistry({
+      claude: { catalogLoader: loadClaudeCatalog },
+      codex: { catalogLoader: loadCodexCatalog },
+      openclaw: { catalogLoader: loadOpenClawCatalog },
+      antigravity: { catalogLoader: loadAntigravityCatalog },
+    });
+    await app.register(marketplaceRoutes, { registry });
+  }
+
+  await app.register(workspaceRoutes, {
+    socketEmit: (event, data, room) => {
+      socketManager?.broadcastToRoom(room, event, data);
+    },
+  });
+  await app.register(workspaceEditRoutes);
+  await app.register(workspaceGitRoutes);
+  await app.register(terminalRoutes, {
+    ...(tmuxGateway ? { tmuxGateway } : {}),
+    ...(agentPaneRegistry ? { agentPaneRegistry } : {}),
+    portDiscovery,
+  });
+  await app.register(previewRoutes, {
+    portDiscovery,
+    gatewayPort: PREVIEW_GATEWAY_ENABLED ? previewGateway.actualPort || PREVIEW_GATEWAY_PORT : 0,
+    runtimePorts,
+    socketEmit: (event, data, room) => {
+      socketManager?.broadcastToRoom(room, event, data);
+    },
+  });
+  await app.register(avatarsRoutes);
+  await app.register(skillsRoutes);
+  await app.register(skillsWriteRoutes);
+  await app.register((await import('./routes/mount-rules.js')).mountRulesRoutes);
+  await app.register((await import('./routes/skills-drift.js')).skillsDriftRoutes);
+  await app.register(memoryRoutes, { memoryStore, threadStore });
+
+  // Session chain (F24)
+  await app.register(sessionChainRoutes, {
+    sessionChainStore,
+    threadStore,
+    messageStore,
+    transcriptReader,
+    sessionSealer,
+    runtimeSessionStore,
+  });
+  await app.register(sessionTranscriptRoutes, { sessionChainStore, threadStore, transcriptReader });
+  await app.register(externalRuntimeSessionsRoutes, { sessionChainStore, runtimeSessionStore, threadStore });
+  const hookToken = process.env.AGENT_STUDIO_HOOK_TOKEN || '';
+  await app.register(sessionHooksRoutes, {
+    sessionChainStore,
+    sessionSealer,
+    transcriptReader,
+    ...(hookToken ? { hookToken } : {}),
+  });
+
+  // F33 Phase 3: Session strategy config (runtime overrides via Redis)
+  if (redis) {
+    try {
+      await initRuntimeOverrides(redis);
+      app.log.info('[api] Session strategy runtime overrides hydrated from Redis');
+    } catch (err) {
+      app.log.warn(
+        `[api] Session strategy hydration failed (best-effort, continuing with empty cache): ${String(err)}`,
+      );
+    }
+  }
+  await app.register(sessionStrategyConfigRoutes);
+
+  // Voting system (F079)
+  const { voteRoutes } = await import('./routes/votes.js');
+  await app.register(voteRoutes, { threadStore, socketManager, messageStore });
+
+  // F188 Phase A: rebuild job tracker
+  const { RebuildJobTracker } = await import('./domains/memory/RebuildJobTracker.js');
+  const rebuildJobTracker = new RebuildJobTracker();
+
+  // Evidence search (SQLite) + reindex endpoint (D-11) + F-4 federated search + F188 rebuild
+  await app.register(evidenceRoutes, {
+    evidenceStore: memoryServices.evidenceStore,
+    embeddingService: memoryServices.embeddingService,
+    indexBuilder: memoryServices.indexBuilder,
+    knowledgeResolver: memoryServices.knowledgeResolver,
+    rebuildJobTracker,
+  });
+  // F227: Event Memory query route (GET /api/memory/events)
+  await app.register(eventsRoutes, {
+    eventMemoryStore: memoryServices.eventMemoryStore,
+    socketEmit: (event, data, room) => {
+      socketManager?.broadcastToRoom(room, event, data);
+    },
+    // F227 (砚砚 R2 P1): MCP callback auth for the agent_studio_teleport callbackPost path.
+    callbackRegistry: registry,
+    agentKeyRegistry,
+    // F227 Task 7: corpus sources for the historical backfill route.
+    threadStore,
+    messageStore,
+  });
+  await app.register(perspectiveRoutes, {
+    repoRoot,
+    evidenceStore: memoryServices.evidenceStore,
+    knowledgeResolver: memoryServices.knowledgeResolver,
+    ...(memoryServices.catalog && memoryServices.collectionStores
+      ? { graphCatalog: memoryServices.catalog, graphStores: memoryServices.collectionStores }
+      : {}),
+  });
+
+  // F163: Knowledge promotion admin API (localhost-only)
+  const { f163AdminRoutes } = await import('./routes/f163-admin.js');
+  await app.register(f163AdminRoutes, {
+    evidenceStore: memoryServices.evidenceStore as unknown as Parameters<typeof f163AdminRoutes>[1]['evidenceStore'],
+  });
+
+  // F163 Phase C: Knowledge audit routes (contradiction check, flag-review, review-queue, health-report)
+  const { f163AuditRoutes } = await import('./routes/f163-audit-routes.js');
+  await app.register(f163AuditRoutes, {
+    evidenceStore: memoryServices.evidenceStore as unknown as Parameters<typeof f163AuditRoutes>[1]['evidenceStore'],
+    knowledgeResolver: memoryServices.knowledgeResolver,
+    markerQueue: memoryServices.markerQueue,
+    repoRoot,
+    docsRoot,
+  });
+
+  // F152 Phase C: Distillation routes (global lesson reflow)
+  if (memoryServices.globalStore) {
+    const { DistillationService } = await import('./domains/memory/distillation-service.js');
+    const distillationService = new DistillationService(memoryServices.store, memoryServices.globalStore);
+    await distillationService.initialize();
+    await app.register(distillationRoutes, {
+      evidenceStore: memoryServices.evidenceStore,
+      distillationService,
+    });
+  }
+
+  // F129: Pack system routes (reuse shared packStore from above)
+  {
+    const { PackSecurityGuard } = await import('./domains/packs/PackSecurityGuard.js');
+    const { PackLoader } = await import('./domains/packs/PackLoader.js');
+    const packGuard = new PackSecurityGuard();
+    const packLoader = new PackLoader(packStore, packGuard);
+    const root = findMonorepoRoot(process.cwd());
+    await app.register(packsRoutes, {
+      packLoader,
+      agentTemplatePath: join(root, 'agent-template.json'),
+      sharedRulesPath: join(root, 'agent-studio-skills', 'refs', 'shared-rules.md'),
+      skillsManifestPath: join(root, 'agent-studio-skills', 'manifest.yaml'),
+    });
+  }
+
+  // Reflect (SQLite-backed reflection)
+  await app.register(reflectRoutes, {
+    reflectionService: memoryServices.reflectionService,
+  });
+
+  // Phase H: Knowledge Emergence Feed API
+  await knowledgeFeedRoutes(app, {
+    markerQueue: memoryServices.markerQueue,
+    db: memoryServices.store.getDb(),
+    materializationService: memoryServices.materializationService,
+    catalog: memoryServices.catalog,
+    collectionStores: memoryServices.collectionStores,
+  });
+
+  // F186: Library catalog API (Phase D: includes external collections + dataDir for register endpoint)
+  if (memoryServices.catalog) {
+    const libraryStores =
+      memoryServices.collectionStores ?? new Map<string, import('./domains/memory/interfaces.js').IEvidenceStore>();
+    if (!libraryStores.has('project:agent-studio')) libraryStores.set('project:agent-studio', memoryServices.store);
+    if (memoryServices.globalStore && !libraryStores.has('global:methods'))
+      libraryStores.set('global:methods', memoryServices.globalStore);
+    // Use the resolvedEmbedMode computed above (service.enabled overrides EMBED_MODE=off).
+    const libraryEmbedMode: 'shadow' | 'on' | undefined =
+      resolvedEmbedMode === 'shadow' || resolvedEmbedMode === 'on' ? resolvedEmbedMode : undefined;
+    await app.register(libraryRoutes, {
+      catalog: memoryServices.catalog,
+      stores: libraryStores,
+      dataDir: memoryServices.dataDir,
+      managedVaultBase: memoryServices.dataDir,
+      embeddingService: memoryServices.embeddingService,
+      embedMode: libraryEmbedMode,
+      // F188 Phase F AC-F9: pass redis for tool-usage-metrics endpoint (砚砚 review P1-2)
+      ...(redisClient ? { redis: redisClient } : {}),
+      // AC-H1 P1 R3: runtime exclude updates for parent IndexBuilder
+      indexBuilder: memoryServices.indexBuilder as import('./domains/memory/IndexBuilder.js').IndexBuilder | undefined,
+      parentRoot: docsRoot,
+    });
+  }
+
+  // Memory governance (publish workflow)
+  const governanceStore = new MemoryGovernanceStore();
+  await app.register(memoryPublishRoutes, { governanceStore });
+
+  // F142-B: Build unified command registry at startup (AC-B5)
+  const commandRegistry = new CommandRegistry(CORE_COMMANDS);
+  const skillsDir = join(findMonorepoRoot(process.cwd()), 'agent-studio-skills');
+  const skillCommandMap = await parseManifestSlashCommands(skillsDir);
+  for (const [skillId, cmds] of skillCommandMap) {
+    commandRegistry.registerSkillCommands(
+      skillId,
+      cmds.map((c) => ({
+        ...c,
+        usage: c.usage ?? c.name,
+        source: 'skill' as const,
+        category: 'connector',
+        skillId,
+      })),
+      app.log,
+    );
+  }
+  app.log.info(
+    `[api] F142-B: CommandRegistry loaded (${commandRegistry.getAll().length} commands, ${skillCommandMap.size} skills)`,
+  );
+
+  // Commands route needs opus service for task extraction.
+  // Lazy-init: empty catalog (first-run) has no opus entry yet — defer until first use.
+  // 砚砚 Step-3 P2 (2026-05-14): route through canary factory so this path
+  // also honors AGENT_STUDIO_CLAUDE_CARRIER=bg_daemon when canary flips.
+  // 砚砚 Step-3 P1 re-review: invoke() must directly return AsyncIterable
+  // (not Promise<AsyncIterable>), otherwise `for await (... of svc.invoke())`
+  // crashes at runtime. Use sync generator wrapper that defers async setup
+  // to first yield.
+  let _opusService: AgentService | undefined;
+  const opusService: AgentService = {
+    invoke(prompt, options) {
+      // Sync return of AsyncGenerator — IS AsyncIterable. Lazy init happens
+      // before first yield, then delegates.
+      return (async function* opusLazyInvoke() {
+        if (!_opusService) {
+          const { createClaudeAgentServiceForCanary } = await import(
+            './domains/agents/services/agents/providers/claude-carrier-factory.js'
+          );
+          _opusService = createClaudeAgentServiceForCanary('opus' as AgentId);
+        }
+        yield* _opusService.invoke(prompt, options);
+      })();
+    },
+  };
+  await app.register(commandsRoutes, {
+    messageStore,
+    taskStore,
+    socketManager,
+    opusService,
+    threadStore,
+    registry: commandRegistry,
+  });
+  await app.register(signalsRoutes, {
+    getGitHubApiToken: () => getGitHubEnvValue('GITHUB_MCP_PAT'),
+  });
+  await app.register(signalStudyRoutes, { threadStore });
+  await app.register(signalCollectionRoutes);
+  await app.register(signalPodcastRoutes, {
+    messageStore,
+    threadStore,
+    router,
+    invocationRecordStore,
+    invocationTracker,
+  });
+
+  // Serve uploaded files (images)
+  const uploadDir = getDefaultUploadDir(process.env.UPLOAD_DIR);
+  await app.register(uploadsRoutes, { uploadDir });
+  await app.register(refAudioUploadRoutes);
+
+  // F088: Serve downloaded connector media files
+  const connectorMediaDir = process.env.CONNECTOR_MEDIA_DIR ?? './data/connector-media';
+  await app.register(connectorMediaRoutes, { mediaDir: connectorMediaDir });
+
+  // F34: TTS Provider (mlx-audio → Python TTS server)
+  // Drop the eager baseUrl injection so the provider resolves the TTS
+  // endpoint via service manifest + persisted config on every request.
+  // /reconfigure-driven port changes therefore apply without restarting
+  // the API (codex P1 2026-05-26). Explicit TTS_URL env is still honored
+  // because resolveServiceEndpoint reads endpointEnvVars first.
+  const ttsRegistry = new TtsRegistry();
+  ttsRegistry.register(new MlxAudioTtsProvider());
+  const ttsCacheDir = process.env.TTS_CACHE_DIR ?? './data/tts-cache';
+  await app.register(ttsRoutes, { ttsRegistry, cacheDir: ttsCacheDir });
+  initVoiceBlockSynthesizer(ttsRegistry, ttsCacheDir);
+  initStreamingTtsRegistry(ttsRegistry);
+  startTtsCacheCleaner(ttsCacheDir);
+
+  // C1+C2: Web Push Notifications (optional — requires VAPID keys)
+  const pushSubscriptionStore = createPushSubscriptionStore(redis);
+  const resolveVapidPublicKey = (): string => process.env.VAPID_PUBLIC_KEY ?? '';
+  const configurePushServiceFromEnv = () => {
+    const currentVapidPublicKey = process.env.VAPID_PUBLIC_KEY ?? '';
+    const currentVapidPrivateKey = process.env.VAPID_PRIVATE_KEY ?? '';
+    const currentVapidSubject = process.env.VAPID_SUBJECT ?? 'mailto:agent-studio@localhost';
+    if (!currentVapidPublicKey || !currentVapidPrivateKey) {
+      resetPushNotificationService();
+      return null;
+    }
+    return initPushNotificationService({
+      subscriptionStore: pushSubscriptionStore,
+      vapidPublicKey: currentVapidPublicKey,
+      vapidPrivateKey: currentVapidPrivateKey,
+      vapidSubject: currentVapidSubject,
+    });
+  };
+  const pushService = configurePushServiceFromEnv();
+  if (pushService) {
+    app.log.info('[api] Web Push enabled (VAPID configured)');
+  } else {
+    app.log.info('[api] Web Push disabled (VAPID keys not set)');
+  }
+  let pushConfigUnsub: (() => void) | null = configEventBus.onKeysChange(
+    ['VAPID_PUBLIC_KEY', 'VAPID_PRIVATE_KEY', 'VAPID_SUBJECT'],
+    () => {
+      const nextPushService = configurePushServiceFromEnv();
+      if (nextPushService) {
+        app.log.info('[api] Web Push hot-reloaded (VAPID configured)');
+      } else {
+        app.log.info('[api] Web Push hot-reloaded disabled (VAPID keys not set)');
+      }
+    },
+  );
+  await app.register(pushRoutes, {
+    pushSubscriptionStore,
+    pushService,
+    vapidPublicKey: resolveVapidPublicKey(),
+    getPushService: getPushNotificationService,
+    getVapidPublicKey: resolveVapidPublicKey,
+  });
+
+  // F-BLOAT: Progressive disclosure docs endpoints (no auth, static content)
+  await app.register(registerCallbackDocsRoutes);
+
+  // F088: Register connector webhook routes BEFORE listen (Fastify requires it)
+  const connectorWebhookHandlers = new Map<string, import('./routes/connector-webhooks.js').ConnectorWebhookHandler>();
+  await app.register(connectorWebhookRoutes, { handlers: connectorWebhookHandlers });
+
+  let apiInstanceLease: ApiInstanceLease | undefined;
+  let shutdownForLeaseLoss: ((signal: string) => Promise<void>) | null = null;
+  let forcedLeaseLossExitTimer: ReturnType<typeof setTimeout> | null = null;
+  const handleLeaseInvalidation = (event: ApiInstanceLeaseInvalidation): void => {
+    const errorDetail = event.error ? ` error=${String(event.error)}` : '';
+    app.log.error(
+      `[api] API namespace lease invalidated (${event.reason}) for ${event.holder.instanceId} pid=${event.holder.pid} host=${event.holder.hostname} port=${event.holder.apiPort}; shutting down to preserve Redis singleton.${errorDetail}`,
+    );
+    if (!forcedLeaseLossExitTimer) {
+      forcedLeaseLossExitTimer = setTimeout(() => {
+        app.log.error('[api] Lease-loss shutdown timed out; forcing process exit');
+        process.exit(1);
+      }, 5_000);
+      forcedLeaseLossExitTimer.unref?.();
+    }
+    if (shutdownForLeaseLoss) {
+      void shutdownForLeaseLoss(`API_INSTANCE_LEASE_${event.reason.toUpperCase()}`);
+      return;
+    }
+    process.exitCode = 1;
+    setImmediate(() => process.exit(1));
+  };
+  if (redis) {
+    apiInstanceLease = new ApiInstanceLease(redis, {
+      apiPort: PORT,
+      cwd: process.cwd(),
+      startedAt: PROCESS_START_AT,
+      onLeaseInvalidated: handleLeaseInvalidation,
+    });
+    const leaseResult = await apiInstanceLease.acquire();
+    if (!leaseResult.acquired) {
+      await apiInstanceLease.release().catch(() => {});
+      await redis.quit().catch(() => {});
+      const holder = leaseResult.holder;
+      const holderHint = holder
+        ? ` holder=${holder.instanceId} pid=${holder.pid} host=${holder.hostname} port=${holder.apiPort}`
+        : '';
+      throw new Error(`[api] Redis namespace already has a live API instance; refusing to start.${holderHint}`);
+    }
+    app.log.info(
+      `[api] API namespace lease acquired (${leaseResult.holder?.instanceId ?? 'unknown'}) on redis=${redisUrl ?? 'memory'}`,
+    );
+  }
+
+  // F149 Phase C: graceful shutdown for ACP process pools
+  app.addHook('onClose', async () => {
+    for (const pool of acpPoolRegistry.values()) {
+      await pool.closeAll();
+    }
+    acpPoolRegistry.clear();
+  });
+
+  // F101: register onClose hook BEFORE listen (Fastify forbids addHook after listen).
+  // The actual recovery player is assigned post-listen; stopAllLoops is a no-op if null.
+  let f101RecoveryPlayer: { stopAllLoops(): void } | null = null;
+  app.addHook('onClose', async () => {
+    f101RecoveryPlayer?.stopAllLoops();
+  });
+
+  let runtimeSessionSealReaperTimer: ReturnType<typeof setInterval> | null = null;
+  app.addHook('onClose', async () => {
+    if (runtimeSessionSealReaperTimer) {
+      clearInterval(runtimeSessionSealReaperTimer);
+      runtimeSessionSealReaperTimer = null;
+    }
+  });
+
+  // #603: Preload governance overlay (.local / .local-override)
+  // Start listening
+  let address: string;
+  try {
+    const { initGovernanceOverlay } = await import('./domains/agents/services/context/SystemPromptBuilder.js');
+    await initGovernanceOverlay();
+    address = await app.listen({ port: PORT, host: HOST });
+  } catch (err) {
+    await apiInstanceLease?.release().catch(() => {});
+    throw err;
+  }
+  app.log.info(`[api] Server running on ${address}`);
+  app.log.info(`[ws] WebSocket server ready`);
+  memoryServices.indexBuilder?.startPassageEmbeddingWarmup();
+
+  // F156: Friendly hint for private network access
+  if (HOST === '0.0.0.0' && process.env.CORS_ALLOW_PRIVATE_NETWORK !== 'true') {
+    app.log.warn(
+      '[network] 检测到监听所有网络 (0.0.0.0)，但私网设备访问未开启。' +
+        '手机/平板通过局域网或 Tailscale 访问可能被拦截。' +
+        '在 .env 中添加 CORS_ALLOW_PRIVATE_NETWORK=true 并重启服务（参考 .env.example）',
+    );
+  }
+
+  // F048 Phase A: Sweep orphaned invocations from previous process crash.
+  // Runs only after the API has both:
+  // 1) acquired the Redis namespace lease, and
+  // 2) successfully bound its HTTP port.
+  // This prevents a second worktree/runtime instance from sweeping another
+  // live process that happens to share the same Redis namespace.
+  if (redis) {
+    const { StartupReconciler } = await import('./domains/agents/services/agents/invocation/StartupReconciler.js');
+    const reconciler = new StartupReconciler({
+      invocationRecordStore,
+      taskProgressStore,
+      log: app.log,
+      processStartAt: PROCESS_START_AT,
+      messageStore,
+      socketManager: socketManager ?? undefined,
+    });
+    try {
+      await reconciler.reconcileOrphans();
+    } catch (err) {
+      app.log.warn(`[api] Startup sweep failed (best-effort): ${String(err)}`);
+    }
+  }
+
+  // F145 P0: Kill orphan agent-browser headless Chrome processes from previous sessions.
+  try {
+    const { cleanOrphanAgentBrowserChrome } = await import('./utils/orphan-chrome-cleaner.js');
+    await cleanOrphanAgentBrowserChrome(app.log);
+  } catch (err) {
+    app.log.warn(`[api] Orphan Chrome cleanup failed (best-effort): ${String(err)}`);
+  }
+
+  const RUNTIME_SESSION_SEAL_REAPER_INTERVAL_MS = Number.parseInt(
+    process.env.AGENT_STUDIO_RUNTIME_SESSION_SEAL_REAPER_INTERVAL_MS ?? '30000',
+    10,
+  );
+  try {
+    const startupRuntimeReaper = await runtimeSessionSealReaper.runOnce();
+    if (
+      startupRuntimeReaper.sealed > 0 ||
+      startupRuntimeReaper.pending > 0 ||
+      startupRuntimeReaper.skippedMaxRetries > 0 ||
+      startupRuntimeReaper.failed > 0
+    ) {
+      app.log.info({ result: startupRuntimeReaper }, '[api] F211 runtime session seal reaper startup sweep completed');
+    }
+  } catch (err) {
+    app.log.warn(`[api] F211 runtime session seal reaper startup sweep failed (best-effort): ${String(err)}`);
+  }
+  runtimeSessionSealReaperTimer = startSerializedRuntimeSessionSealReaperInterval({
+    runtimeSessionSealReaper,
+    intervalMs:
+      Number.isSafeInteger(RUNTIME_SESSION_SEAL_REAPER_INTERVAL_MS) && RUNTIME_SESSION_SEAL_REAPER_INTERVAL_MS > 0
+        ? RUNTIME_SESSION_SEAL_REAPER_INTERVAL_MS
+        : 30_000,
+    onResult: (result) => {
+      if (result.sealed > 0 || result.failed > 0) {
+        app.log.info({ result }, '[api] F211 runtime session seal reaper sweep completed');
+      }
+    },
+    onError: () => {
+      // best-effort periodic reaper
+    },
+  });
+  runtimeSessionSealReaperTimer.unref();
+
+  // F118 Hardening: Global session reaper — startup sweep + periodic scan.
+  // Reconciles sessions stuck in 'sealing' state that the per-invoke lazy
+  // reaper would never visit (e.g., threads with no subsequent invocations).
+  const GLOBAL_REAPER_INTERVAL_MS = 5 * 60_000;
+  try {
+    const startupReaped = await sessionSealer.reconcileAllStuck();
+    if (startupReaped > 0) {
+      app.log.info(`[api] F118 global reaper: reconciled ${startupReaped} stuck sealing session(s) at startup`);
+    }
+  } catch (err) {
+    app.log.warn(`[api] F118 global reaper startup sweep failed (best-effort): ${String(err)}`);
+  }
+  const globalReaperTimer = setInterval(async () => {
+    try {
+      const reaped = await sessionSealer.reconcileAllStuck();
+      if (reaped > 0) {
+        app.log.info(`[api] F118 global reaper: reconciled ${reaped} stuck sealing session(s)`);
+      }
+    } catch {
+      // best-effort periodic reaper
+    }
+  }, GLOBAL_REAPER_INTERVAL_MS);
+  globalReaperTimer.unref();
+
+  // Log server startup to audit log (best-effort: don't crash if audit dir unwritable)
+  const auditLog = getEventAuditLog();
+  try {
+    await auditLog.append({
+      type: AuditEventTypes.SERVER_STARTED,
+      data: { address, port: PORT, host: HOST, redis: redisClient ? 'connected' : 'memory' },
+    });
+  } catch (err) {
+    app.log.warn(`[api] Audit log write failed (best-effort): ${String(err)}`);
+  }
+
+  // Best-effort: regenerate CLI configs at startup so runtime-derived env
+  // (Gemini placeholders, Antigravity sidecar key files) reaches CLI config.
+  try {
+    const result = await regenerateStartupCliConfigs(process.cwd());
+    if (result.generated) {
+      app.log.info('[api] CLI configs regenerated at startup');
+    }
+  } catch (err) {
+    app.log.warn(`[api] CLI config regeneration failed (best-effort): ${String(err)}`);
+  }
+
+  // baiyuxi-agent-studio#340: Account startup — fail-fast (LL-043 / migration conflict / corrupt credentials).
+  // Errors propagate to main().catch → process.exit(1).
+  {
+    const { accountStartupHook } = await import('./config/account-startup.js');
+    const startupResult = accountStartupHook(findMonorepoRoot(process.cwd()));
+    app.log.info(`[api] baiyuxi-agent-studio#340 accounts: ${startupResult.accountCount} account(s) loaded`);
+  }
+
+  // F101 Phase G: Recover auto-play loops for active games after restart.
+  if (f101GameStore && socketManager && f101SharedDriver) {
+    f101RecoveryPlayer = f101SharedDriver;
+    try {
+      const recovered = await f101SharedDriver.recoverActiveGames();
+      if (recovered > 0) {
+        app.log.info(`[api] F101 auto-play recovery: restored ${recovered} active game loop(s)`);
+      }
+    } catch (err) {
+      app.log.warn(`[api] F101 auto-play recovery failed (best-effort): ${String(err)}`);
+    }
+  }
+
+  // F140 Phase 3b: connector invoke trigger (auto-invoke agent after review feedback delivery via polling)
+  const frontendBaseUrl = resolveFrontendBaseUrl(process.env, app.log);
+  const invokeTrigger = new ConnectorInvokeTrigger({
+    router,
+    socketManager,
+    invocationRecordStore,
+    invocationTracker,
+    invocationQueue,
+    queueProcessor,
+    messageStore,
+    threadMetaLookup: async (threadId) => {
+      const thread = await threadStore.get(threadId);
+      if (!thread) return undefined;
+      return {
+        threadShortId: threadId.slice(0, 15),
+        threadTitle: thread.title ?? undefined,
+        deepLinkUrl: buildThreadDeepLink(frontendBaseUrl, threadId),
+      };
+    },
+    log: app.log,
+  });
+
+  // F140: Feedback filter (Rule A self-authored only post-E.2 cutover)
+  const { createGitHubFeedbackFilter } = await import('./infrastructure/email/github-feedback-filter.js');
+  const { createSetupNoiseFilter } = await import('./infrastructure/email/setup-noise-filter.js');
+  const { createGitHubSelfLoginResolver } = await import('./infrastructure/github/self-login-resolver.js');
+  const resolveGitHubSelfLogin = async (): Promise<string | undefined> => {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const { stdout } = await execFileAsync('gh', ['api', '/user', '--jq', '.login'], getGitHubExecOptions(10_000));
+        const login = stdout.trim();
+        if (login) return login;
+      } catch {
+        if (attempt === 0) await new Promise((r) => setTimeout(r, 3_000));
+      }
+    }
+    return undefined;
+  };
+  const selfLoginResolver = createGitHubSelfLoginResolver({
+    getConfiguredLogin: () => getGitHubEnvValue('GITHUB_SELF_LOGIN'),
+    getTokenFingerprint: () => getGitHubToken(),
+    resolveLogin: resolveGitHubSelfLogin,
+  });
+  let loggedSelfGitHubLogin: string | undefined | null = null;
+  const logGitHubSelfLoginState = (login: string | undefined): void => {
+    if (login) {
+      if (loggedSelfGitHubLogin !== login) {
+        app.log.info(`[api] F140: feedback filter self=${login}`);
+      }
+      loggedSelfGitHubLogin = login;
+      return;
+    }
+    if (loggedSelfGitHubLogin !== undefined) {
+      app.log.error('[api] F140: self-filter DISABLED — set GITHUB_SELF_LOGIN env as fallback');
+    }
+    loggedSelfGitHubLogin = undefined;
+  };
+  const refreshGitHubSelfLogin = async (): Promise<string | undefined> => {
+    const login = await selfLoginResolver.refreshIfNeeded();
+    logGitHubSelfLoginState(login);
+    return login;
+  };
+  await refreshGitHubSelfLogin();
+  const feedbackFilter = createGitHubFeedbackFilter({ getSelfGitHubLogin: () => selfLoginResolver.getCurrent() });
+
+  // F140 Phase E.2 cutover: setup-noise bot allowlist env name切换
+  // GITHUB_SETUP_NOISE_BOT_LOGINS (new, post-E.2 semantics) takes precedence;
+  // P2-3 fix: pass a thunk so the filter reflects runtime config changes
+  // (e.g. GITHUB_SETUP_NOISE_BOT_LOGINS updated via plugin config panel)
+  // without requiring a server restart.
+  // GITHUB_AUTHORITATIVE_REVIEW_LOGINS (legacy E.1 借壳) falls back for
+  // backward compat — will be removed in a follow-up release.
+  const getSetupNoiseBotLogins = (): readonly string[] =>
+    (
+      getGitHubEnvValue('GITHUB_SETUP_NOISE_BOT_LOGINS') ||
+      process.env.GITHUB_AUTHORITATIVE_REVIEW_LOGINS ||
+      'chatgpt-codex-connector[bot]'
+    )
+      .split(',')
+      .map((s: string) => s.trim())
+      .filter(Boolean);
+  app.log.info(`[api] F140: setup-noise bot logins=${getSetupNoiseBotLogins().join(', ')}`);
+
+  const setupNoiseFilter = createSetupNoiseFilter(getSetupNoiseBotLogins);
+
+  // F140 Phase E.3 cleanup (2026-04-25): email/IMAP watcher source files removed.
+  // Polling (ReviewFeedbackTaskSpec) is the sole truth source for review feedback.
+
+  // F139 Phase 4b: late-bind invokeTrigger so templates can wake agents
+  taskRunnerV2.setInvokeTrigger(invokeTrigger);
+
+  // F192 OQ-21: late-bind invokeTrigger for manual eval trigger endpoint.
+  // eval-hub routes registered at line ~1543 (before invokeTrigger existed);
+  // the holder pattern lets `POST /api/eval-domains/:domainId/trigger-now`
+  // resolve the live trigger at request time. Without this bind, the route
+  // returns 503 instead of waking the eval agent.
+  invokeTriggerHolder.current = invokeTrigger;
+
+  // F167 Phase M: late-bind busy checker for pre-fire defer (hold_ball activation).
+  // Same thread-busy signal as delivery-batch-done (messages.ts:1822 /
+  // ConnectorInvokeTrigger.ts:692): active invocation OR queued/processing slot.
+  // When a hold wake fires while the agent is mid-work, the scheduler re-arms the
+  // once-task instead of delivering a stale wake ("history replay").
+  taskRunnerV2.setBusyChecker((threadId) => invocationTracker.has(threadId) || queueProcessor.isThreadBusy(threadId));
+
+  // F202-2B: GitHub schedule deps + rehydration (replaces hardcoded task registrations)
+  // Router/service creation stays here — same deps available as before.
+  // Task registration moved to plugin framework via rehydrateGitHubSchedules closure.
+  {
+    const deliveryDeps = { messageStore, socketManager };
+
+    const cicdRouter = new CiCdRouter({
+      taskStore,
+      deliveryDeps,
+      log: app.log,
+      notifySkip: (threadId, reason) => {
+        socketManager?.broadcastAgentMessage(
+          {
+            type: 'system_info',
+            agentId: getDefaultAgentId(),
+            content: JSON.stringify({ type: 'connector_skip', reason, threadId }),
+            timestamp: Date.now(),
+          },
+          threadId,
+        );
+      },
+      // F168 Phase A: wire PR lifecycle events to community event engine
+      eventLog: communityEventLog,
+      projector: communityProjector,
+      // F192 Phase G: wire PR merge/close events to task-outcome episodes
+      onPrLifecycle: (event) => {
+        try {
+          const ep =
+            taskOutcomeStore.getActiveEpisode(event.threadId) ??
+            taskOutcomeStore.createEpisode({
+              trigger: 'agent_initiated',
+              threadId: event.threadId,
+              participants: [],
+            });
+          taskOutcomeStore.appendSignal(ep.episodeId, {
+            category: 'a1',
+            record: {
+              type: event.type,
+              ref: event.ref,
+              outcome: event.outcome,
+              timestamp: new Date().toISOString(),
+            },
+          });
+          // Auto-complete on merge+success (same logic as handleA1WorldTruth)
+          if (ep.terminalState === 'in_progress' && event.type === 'merge' && event.outcome === 'success') {
+            taskOutcomeStore.updateTerminalState(ep.episodeId, 'completed');
+          }
+        } catch {
+          // Best-effort: don't break CI/CD routing
+        }
+      },
+    });
+
+    const conflictRouter = new ConflictRouter({
+      taskStore,
+      deliveryDeps,
+      log: app.log,
+    });
+
+    const reviewFeedbackRouter = new ReviewFeedbackRouter({
+      deliveryDeps,
+      log: app.log,
+    });
+
+    // F202 Phase 2D: Issue comment tracking
+    const issueCommentRouter = new IssueCommentRouter({
+      deliveryDeps,
+      log: app.log,
+    });
+
+    // F140: conflict-check with ConflictRouter + urgent trigger
+    const checkMergeable = async (repo: string, pr: number) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const execFileAsync = promisify(execFile);
+      const { stdout } = await execFileAsync(
+        'gh',
+        ['pr', 'view', String(pr), '-R', repo, '--json', 'mergeable,headRefOid'],
+        getGitHubExecOptions(15_000),
+      );
+      const data = JSON.parse(stdout);
+      return { mergeState: data.mergeable ?? 'UNKNOWN', headSha: data.headRefOid ?? '' };
+    };
+
+    const { ConflictAutoExecutor } = await import('./infrastructure/email/ConflictAutoExecutor.js');
+    const autoExecutor = new ConflictAutoExecutor({ log: app.log });
+
+    const { fetchPaginated: fetchPaginatedFn } = await import('./infrastructure/github/fetch-paginated.js');
+    const fetchPaginated = (endpoint: string, sinceId?: number) =>
+      fetchPaginatedFn(endpoint, { sinceId, ghToken: getGitHubToken() });
+
+    const fetchPrMetadata = async (repo: string, pr: number) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const execFileAsync = promisify(execFile);
+      try {
+        const { stdout } = await execFileAsync(
+          'gh',
+          ['pr', 'view', String(pr), '-R', repo, '--json', 'headRefOid,state,mergedAt'],
+          getGitHubExecOptions(15_000),
+        );
+        const data = JSON.parse(stdout) as { headRefOid?: string; state?: string; mergedAt?: string | null };
+        const prState =
+          data.mergedAt || data.state === 'MERGED' ? 'merged' : data.state === 'CLOSED' ? 'closed' : 'open';
+        return { headSha: data.headRefOid ?? '', prState };
+      } catch (error) {
+        app.log.warn(
+          { repo, pr, err: error },
+          '[api] review-feedback metadata lookup failed; continuing without PR metadata',
+        );
+        return null;
+      }
+    };
+
+    const fetchComments = async (repo: string, pr: number, sinceId?: number) => {
+      await refreshGitHubSelfLogin();
+      const [reviewComments, issueComments] = await Promise.all([
+        fetchPaginated(`/repos/${repo}/pulls/${pr}/comments`, sinceId),
+        fetchPaginated(`/repos/${repo}/issues/${pr}/comments`, sinceId),
+      ]);
+      return [...reviewComments, ...issueComments].map(
+        (c: {
+          id: number;
+          body: string;
+          created_at: string;
+          user?: { login: string };
+          commit_id?: string;
+          path?: string;
+          line?: number;
+          pull_request_review_id?: number;
+          author_association?: string; // F168 Phase B: needed for delivery policy
+        }) => ({
+          id: c.id,
+          author: c.user?.login ?? 'unknown',
+          body: c.body,
+          createdAt: c.created_at,
+          ...(c.commit_id ? { commitId: c.commit_id } : {}),
+          commentType: c.pull_request_review_id ? ('inline' as const) : ('conversation' as const),
+          ...(c.path ? { filePath: c.path } : {}),
+          ...(c.line ? { line: c.line } : {}),
+          ...(c.author_association !== undefined ? { authorAssociation: c.author_association } : {}),
+        }),
+      );
+    };
+
+    const fetchReviews = async (repo: string, pr: number, sinceId?: number) => {
+      await refreshGitHubSelfLogin();
+      const reviews = await fetchPaginated(`/repos/${repo}/pulls/${pr}/reviews`, sinceId);
+      return reviews.map(
+        (r: {
+          id: number;
+          user?: { login: string };
+          state: string;
+          body: string;
+          submitted_at: string;
+          commit_id?: string;
+          author_association?: string; // F168 Phase B: needed for delivery policy
+        }) => ({
+          id: r.id,
+          author: r.user?.login ?? 'unknown',
+          state: r.state as 'APPROVED' | 'CHANGES_REQUESTED' | 'DISMISSED' | 'COMMENTED',
+          body: r.body,
+          submittedAt: r.submitted_at,
+          ...(r.commit_id ? { commitId: r.commit_id } : {}),
+          ...(r.author_association !== undefined ? { authorAssociation: r.author_association } : {}),
+        }),
+      );
+    };
+
+    // F202 Phase 2D: Issue comment fetchers (parallel to PR comment fetchers)
+    const fetchIssueComments = async (repoFullName: string, issueNumber: number, sinceId?: number) => {
+      await refreshGitHubSelfLogin();
+      const comments = await fetchPaginated(`/repos/${repoFullName}/issues/${issueNumber}/comments`, sinceId);
+      return comments.map(
+        (c: {
+          id: number;
+          body: string;
+          created_at: string;
+          user?: { login: string };
+          author_association?: string; // F168 Phase B: needed for delivery policy
+        }) => ({
+          id: c.id,
+          author: c.user?.login ?? 'unknown',
+          body: c.body,
+          createdAt: c.created_at,
+          // Map snake_case GitHub API field to camelCase IssueComment.authorAssociation
+          ...(c.author_association !== undefined ? { authorAssociation: c.author_association } : {}),
+        }),
+      );
+    };
+
+    const fetchIssueState = async (repoFullName: string, issueNumber: number): Promise<'open' | 'closed'> => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const execFileAsync = promisify(execFile);
+      try {
+        const { stdout } = await execFileAsync(
+          'gh',
+          ['api', `/repos/${repoFullName}/issues/${issueNumber}`, '--jq', '.state'],
+          getGitHubExecOptions(15_000),
+        );
+        return stdout.trim() === 'closed' ? 'closed' : 'open';
+      } catch (error) {
+        app.log.warn({ repoFullName, issueNumber, err: error }, '[api] issue state lookup failed; assuming open');
+        return 'open';
+      }
+    };
+
+    // Repo-scan deps (conditional on env vars + redis)
+    const ghRepoAllowlist = getGitHubEnvValue('GITHUB_REPO_ALLOWLIST');
+    const ghInboxAgentId = getGitHubEnvValue('GITHUB_REPO_INBOX_AGENT_ID');
+    let repoScanDeps: Record<string, unknown> = {};
+
+    if (ghRepoAllowlist && ghInboxAgentId && redisClient) {
+      const { ReconciliationDedup } = await import(
+        './infrastructure/connectors/github-repo-event/ReconciliationDedup.js'
+      );
+      const { deliverConnectorMessage } = await import('./infrastructure/email/deliver-connector-message.js');
+      const { RedisConnectorThreadBindingStore } = await import(
+        './infrastructure/connectors/RedisConnectorThreadBindingStore.js'
+      );
+
+      const reconciliationDedup = new ReconciliationDedup(
+        redisClient as import('./infrastructure/connectors/github-repo-event/ReconciliationDedup.js').ReconciliationRedisLike,
+      );
+
+      const fetchGhApi = async (args: string[]): Promise<string> => {
+        const { execFile } = await import('node:child_process');
+        const { promisify } = await import('node:util');
+        const execFileAsync = promisify(execFile);
+        const { stdout } = await execFileAsync('gh', args, getGitHubExecOptions(30_000));
+        return stdout;
+      };
+
+      const fetchOpenPRs = async (repo: string) => {
+        const stdout = await fetchGhApi([
+          'api',
+          `/repos/${repo}/pulls`,
+          '--jq',
+          '.[] | {number, title, html_url, user: .user.login, author_association, draft}',
+          '--paginate',
+        ]);
+        if (!stdout.trim()) return [];
+        return stdout
+          .trim()
+          .split('\n')
+          .map((line: string) => JSON.parse(line));
+      };
+
+      const fetchOpenIssues = async (repo: string) => {
+        const stdout = await fetchGhApi([
+          'api',
+          `/repos/${repo}/issues`,
+          '--jq',
+          '.[] | select(.pull_request == null) | {number, title, html_url, user: .user.login, author_association}',
+          '--paginate',
+        ]);
+        if (!stdout.trim()) return [];
+        return stdout
+          .trim()
+          .split('\n')
+          .map((line: string) => JSON.parse(line));
+      };
+
+      const { getOwnerUserId } = await import('./config/agent-config-loader.js');
+      const effectiveUserId = getOwnerUserId();
+
+      // F168 C0.3: repo-level comment poller deps (collection-only, redis-gated).
+      // Lists ALL issue comments across allowlisted repos — including un-routed/untracked
+      // issues — closing the IssueCommentTaskSpec per-tracked-issue blind spot. PR
+      // conversation comments are surfaced too (the repo-level endpoint returns them because
+      // PRs are issues in GitHub); they are TAGGED isPullRequest so RepoCommentPollTaskSpec
+      // skips appending them (they belong to the ReviewFeedbackTaskSpec track) yet still
+      // advances the cursor past them — otherwise PR activity with no new issue comments
+      // would re-fetch the same pages every tick (cloud review R4 P2 — churn).
+      // since = the per-repo cursor (max comment updatedAt, ISO-8601) → GitHub `since` param.
+      const fetchRepoComments = async (repo: string, sinceIso?: string): Promise<RepoIssueComment[]> => {
+        const query = new URLSearchParams({ sort: 'updated', direction: 'asc', per_page: '100' });
+        if (sinceIso) query.set('since', sinceIso);
+        const stdout = await fetchGhApi([
+          'api',
+          `/repos/${repo}/issues/comments?${query.toString()}`,
+          '--jq',
+          '.[] | {issueNumber: (.issue_url | split("/") | last | tonumber), commentId: .id, author: .user.login, authorAssociation: .author_association, body: .body, updatedAt: .updated_at, isPullRequest: (.html_url | contains("/pull/"))}',
+          '--paginate',
+        ]);
+        if (!stdout.trim()) return [];
+        return stdout
+          .trim()
+          .split('\n')
+          .map((line: string) => JSON.parse(line));
+      };
+
+      const { RedisRepoCommentCursorStore } = await import(
+        './infrastructure/connectors/github-repo-event/RepoCommentCursorStore.js'
+      );
+      const repoCommentCursorStore = new RedisRepoCommentCursorStore(redisClient);
+
+      repoScanDeps = {
+        repoAllowlist: ghRepoAllowlist.split(',').map((r: string) => r.trim()),
+        inboxAgentId: ghInboxAgentId,
+        defaultUserId: effectiveUserId,
+        reconciliationDedup,
+        bindingStore: new RedisConnectorThreadBindingStore(redisClient),
+        deliverFn: deliverConnectorMessage,
+        deliveryDeps: { messageStore, socketManager },
+        fetchOpenPRs,
+        fetchOpenIssues,
+        // F168 C0.3: repo-level comment poller wiring
+        fetchRepoComments,
+        readRepoCommentCursor: (repo: string) => repoCommentCursorStore.read(repo),
+        writeRepoCommentCursor: (repo: string, cursor: string) => repoCommentCursorStore.write(repo, cursor),
+      };
+    }
+
+    // F202-2B: Populate factory deps + rehydrate schedule resources via plugin framework
+    if (rehydrateGitHubSchedules) {
+      await rehydrateGitHubSchedules({
+        taskStore,
+        cicdRouter,
+        fetchPrStatus: (repo: string, pr: number) => fetchPrCiStatus(repo, pr, app.log, { ghToken: getGitHubToken() }),
+        conflictRouter,
+        reviewFeedbackRouter,
+        invokeTrigger,
+        // #949: thread rotation — inject threadStore so MR review threads can rotate
+        threadStore,
+        checkMergeable,
+        autoExecutor,
+        fetchPrMetadata,
+        fetchComments,
+        fetchReviews,
+        isEchoComment: (c: { author: string }) => feedbackFilter.shouldSkipComment(c),
+        isEchoReview: (r: { author: string }) => feedbackFilter.shouldSkipReview(r),
+        isNoiseComment: setupNoiseFilter,
+        // F202 Phase 2D: issue comment tracking deps
+        issueCommentRouter,
+        fetchIssueComments,
+        fetchIssueState,
+        isEchoIssueComment: (c: { author: string }) => feedbackFilter.shouldSkipComment(c),
+        ...repoScanDeps,
+        // F168 Phase A P1-1: community event services for spec wiring
+        eventLog: communityEventLog,
+        projector: communityProjector,
+      });
+      app.log.info('[api] F202-2B: GitHub schedule resources rehydrated via plugin framework');
+    }
+  }
+
+  // F139 Phase 3B: Hydrate pack templates from SQLite into TemplateRegistry
+  const packDefs = packTemplateStore.listAll();
+  let packHydrated = 0;
+  for (const def of packDefs) {
+    const builtin = templateRegistry.get(def.builtinTemplateRef);
+    if (builtin) {
+      templateRegistry.register({
+        templateId: def.templateId,
+        label: def.label,
+        category: def.category,
+        description: def.description,
+        subjectKind: def.subjectKind,
+        defaultTrigger: def.defaultTrigger,
+        paramSchema:
+          def.paramSchema as import('./infrastructure/scheduler/templates/types.js').TaskTemplate['paramSchema'],
+        createSpec: builtin.createSpec,
+      });
+      packHydrated++;
+    }
+  }
+  if (packHydrated > 0) app.log.info(`[api] F139: hydrated ${packHydrated} pack template(s)`);
+
+  // F139 Phase 3A: Hydrate dynamic tasks from SQLite before starting
+  const hydrated = taskRunnerV2.hydrateDynamic(dynamicTaskStore, templateRegistry);
+  if (hydrated > 0) app.log.info(`[api] F139: hydrated ${hydrated} dynamic task(s)`);
+
+  // F192 livefix OQ-17: Register daily + weekly eval domain tasks (reads eval-domains/*.yaml, triggers eval agents)
+  const { createEvalDomainDailySpec, createEvalDomainWeeklySpec } = await import(
+    './infrastructure/harness-eval/domain/eval-domain-daily.js'
+  );
+  const { getOwnerUserId } = await import('./config/agent-config-loader.js');
+  // cloud R6 P2 (PR-2) + memory wire-up: mirror the same wired set the
+  // eval-hub.ts route computes (Object.keys(verdictGenerators)). Bootstrap-time
+  // invariant:
+  //   eval:a2a always wired;
+  //   eval:capability-wakeup wired iff toolEventLog + skillLoadEventLog exist;
+  //   eval:memory wired iff memoryServices.markerQueue exists (always-present in
+  //     production but gated for parity with test/edge configs).
+  // This gates scheduled daily/weekly invocations' publish instructions on actual runtime support
+  // — without this, scheduled eval would tell agent to publish even when no Redis/markers →
+  // handler 501 → wasted run. Mirrors the eval-hub.ts route-layer gating.
+  const wiredPublishDomains = new Set<
+    'eval:a2a' | 'eval:memory' | 'eval:sop' | 'eval:capability-wakeup' | 'eval:task-outcome'
+  >(['eval:a2a']);
+  wiredPublishDomains.add('eval:task-outcome');
+  // eval:sop has no runtime dependencies (unlike cw needing toolEventLog or memory
+  // needing markerQueue) — unconditionally wired like eval:a2a and eval:task-outcome.
+  wiredPublishDomains.add('eval:sop');
+  if (toolEventLog && skillLoadEventLog) {
+    wiredPublishDomains.add('eval:capability-wakeup');
+  }
+  if (memoryServices.markerQueue) {
+    wiredPublishDomains.add('eval:memory');
+  }
+  // Direction B (baiyuxi-agent-studio#923 fix): per-domain publish-prereq probe.
+  // wiredPublishDomains answers "is the generator registered?" but a stale runtime can
+  // have the generator AND lack the sourceRefs validator that current eval agents expect.
+  // This probe runs once per (domain, cron fire) — its first call dynamically imports
+  // the adapter and caches the result; the cached value answers all subsequent calls.
+  // Unknown domains pass through (true) — only domains with a registered probe can fail
+  // closed. Adding a domain to the switch is opt-in defense; omitting one is no-op.
+  const publishPrereqCache = new Map<string, boolean>();
+  const publishPrereqProbe = async (
+    domainId: 'eval:a2a' | 'eval:memory' | 'eval:sop' | 'eval:capability-wakeup' | 'eval:task-outcome',
+  ): Promise<boolean> => {
+    const cached = publishPrereqCache.get(domainId);
+    if (cached !== undefined) return cached;
+    let ok: boolean;
+    try {
+      if (domainId === 'eval:a2a') {
+        // 砚砚 R1 P1 fix: `isA2aSourceRefs` is exported from `validation.ts`, not from
+        // `a2a-generator-adapter.ts` (the adapter imports + calls it but does not re-export).
+        // Probing the adapter's namespace would always miss the symbol → probe would mark
+        // a healthy runtime as "missing prereq" → eval:a2a skipped forever (P1).
+        const mod = await import('./infrastructure/harness-eval/publish-verdict/validation.js');
+        // isA2aSourceRefs is the post-fix validator; absence on a stale runtime means
+        // the publish flow will throw infra blockers when the agent calls publish_verdict.
+        ok = typeof (mod as { isA2aSourceRefs?: unknown }).isA2aSourceRefs === 'function';
+      } else {
+        ok = true; // Future per-domain probes plug in here.
+      }
+    } catch {
+      ok = false;
+    }
+    publishPrereqCache.set(domainId, ok);
+    return ok;
+  };
+
+  const evalScheduleOpts = {
+    harnessFeedbackRoot: resolve(repoRoot, 'docs', 'harness-feedback'),
+    threadStore,
+    defaultUserId: getOwnerUserId(),
+    listDynamicTasks: () => dynamicTaskStore.getAll(),
+    redis: redisClient ?? undefined,
+    wiredPublishDomains,
+    publishPrereqProbe,
+  };
+  taskRunnerV2.register(createEvalDomainDailySpec(evalScheduleOpts));
+  taskRunnerV2.register(createEvalDomainWeeklySpec(evalScheduleOpts));
+
+  // F233 Phase A: builtin daily 值班简报 cron（07:00 PT；INV-4 幂等 — 同 id 重复注册静默）
+  try {
+    const { createDutyBriefingDailySpec } = await import(
+      './domains/agents/services/duty-briefing/duty-briefing-cron-spec.js'
+    );
+    taskRunnerV2.register(
+      createDutyBriefingDailySpec({
+        collectDeps: dutyBriefingCollectDeps,
+        configStore: briefingConfigStore,
+        threadStore,
+        messageStore,
+        log: app.log,
+      }),
+    );
+    app.log.info('[api] F233: duty-briefing daily cron registered');
+  } catch (err) {
+    if (String((err as Error)?.message ?? '').includes('duplicate')) {
+      app.log.info('[api] F233: duty-briefing cron already registered (idempotent)');
+    } else {
+      throw err;
+    }
+  }
+
+  // F139: Start unified scheduler (all registered specs)
+  taskRunnerV2.start();
+  app.log.info(`[api] F139: unified scheduler started (${taskRunnerV2.getRegisteredTasks().join(', ')})`);
+
+  // F088: Start connector gateway (best-effort, after listen)
+  const gatewayDeps = {
+    messageStore: {
+      async append(input: Parameters<typeof messageStore.append>[0]) {
+        const result = await messageStore.append(input);
+        return { id: result.id };
+      },
+      async getById(id: string) {
+        const msg = messageStore.getById?.(id);
+        if (!msg) return null;
+        const resolved = msg instanceof Promise ? await msg : msg;
+        return resolved ? { source: resolved.source } : null;
+      },
+      async getByThreadBefore(threadId: string, timestamp: number, limit?: number) {
+        return messageStore.getByThreadBefore(threadId, timestamp, limit);
+      },
+    },
+    threadStore,
+    invokeTrigger,
+    socketManager,
+    defaultUserId: 'default-user' as const,
+    // baiyuxi-agent-studio#910 + cloud P1: pass a getter (not a value) so runtime
+    // `PUT /api/config/default-agent` (which calls `setRuntimeDefaultAgentId` →
+    // updates `_runtimeDefaultAgentId`) propagates to ConnectorRouter's
+    // per-message parseMentions resolve, without needing a gateway restart.
+    // An object getter or a one-shot value would still be copied as a
+    // string into `new ConnectorRouter({ defaultAgentId, ... })` and frozen.
+    defaultAgentId: getDefaultAgentId,
+    redis: redisClient ?? undefined,
+    log: app.log,
+    agentRegistry,
+    commandRegistry,
+    bindingStore: connectorBindingStore,
+    frontendBaseUrl,
+  };
+
+  /** Re-wire all hook consumers after gateway (re)start */
+  function wireGatewayHooks(handle: NonNullable<Awaited<ReturnType<typeof startConnectorGateway>>>): void {
+    invokeTrigger.setOutboundHook(handle.outboundHook);
+    invokeTrigger.setStreamingHook(handle.streamingHook);
+    queueProcessor.setOutboundHook(handle.outboundHook as Parameters<typeof queueProcessor.setOutboundHook>[0]);
+    queueProcessor.setStreamingHook(handle.streamingHook as Parameters<typeof queueProcessor.setStreamingHook>[0]);
+    (callbackOpts as { outboundHook?: typeof handle.outboundHook }).outboundHook = handle.outboundHook;
+    (messagesOpts as { outboundHook?: typeof handle.outboundHook }).outboundHook = handle.outboundHook;
+    (messagesOpts as { streamingHook?: typeof handle.streamingHook }).streamingHook = handle.streamingHook;
+    // P1-1 fix: clear stale handlers before re-populating (hot-reload may remove connectors)
+    connectorWebhookHandlers.clear();
+    for (const [id, handler] of handle.webhookHandlers) {
+      connectorWebhookHandlers.set(id, handler);
+    }
+    (connectorHubOpts as { weixinAdapter?: unknown }).weixinAdapter = handle.weixinAdapter;
+    (connectorHubOpts as { startWeixinPolling?: () => void }).startWeixinPolling = handle.startWeixinPolling;
+    // F132 Phase E: WeCom Bot dynamic start/stop
+    (
+      connectorHubOpts as { startWeComBotStream?: (botId: string, secret: string) => Promise<void> }
+    ).startWeComBotStream = handle.startWeComBotStream;
+    (connectorHubOpts as { stopWeComBot?: () => Promise<void> }).stopWeComBot = handle.stopWeComBot;
+    // F132 bugfix: live health getter for status endpoint
+    (connectorHubOpts as { getWeComBotAdapter?: () => unknown }).getWeComBotAdapter = handle.getWeComBotAdapter;
+    (connectorHubOpts as { permissionStore?: unknown }).permissionStore = handle.permissionStore;
+  }
+
+  let connectorGatewayHandle: Awaited<ReturnType<typeof startConnectorGateway>> = null;
+  let connectorReloadUnsub: (() => void) | null = null;
+  try {
+    const preconfiguredConnectorAutostart = isPreconfiguredConnectorAutostartEnabled(process.env);
+    if (!preconfiguredConnectorAutostart) {
+      app.log.info(
+        { nodeEnv: process.env.NODE_ENV ?? '(unset)' },
+        '[api] Preconfigured connector autostart disabled; starting connector gateway in QR-only mode',
+      );
+    }
+    const gatewayConfig = applyConnectorGatewayAutostartPolicy(loadConnectorGatewayConfig(), process.env);
+    connectorGatewayHandle = await startConnectorGateway(gatewayConfig, gatewayDeps);
+    if (connectorGatewayHandle) {
+      wireGatewayHooks(connectorGatewayHandle);
+      queueProcessor.setThreadMetaLookup(async (threadId) => {
+        const thread = await threadStore.get(threadId);
+        if (!thread) return undefined;
+        return {
+          threadShortId: threadId.slice(0, 15),
+          threadTitle: thread.title ?? undefined,
+          deepLinkUrl: buildThreadDeepLink(frontendBaseUrl, threadId),
+        };
+      });
+
+      app.log.info('[api] Connector gateway started');
+    }
+  } catch (err) {
+    app.log.warn(`[api] Connector gateway startup failed (best-effort): ${String(err)}`);
+  }
+
+  // F136 Phase 2: Always subscribe — enables self-healing when initial startup fails (P1-2)
+  const reloadSubscriber = createConnectorReloadSubscriber({
+    log: app.log,
+    debounceMs: 500,
+    async onRestart() {
+      app.log.info('[api] F136: Hot-reloading connector gateway...');
+      const newHandle = await restartConnectorGateway(connectorGatewayHandle, async () => {
+        const freshConfig = applyConnectorGatewayAutostartPolicy(loadConnectorGatewayConfig(), process.env);
+        return startConnectorGateway(freshConfig, gatewayDeps);
+      });
+      if (newHandle) {
+        connectorGatewayHandle = newHandle;
+        wireGatewayHooks(newHandle);
+      }
+      app.log.info('[api] F136: Connector gateway hot-reload complete');
+    },
+  });
+  connectorReloadUnsub = () => reloadSubscriber.unsubscribe();
+  app.log.info('[api] Connector hot-reload subscriber active');
+
+  // Graceful shutdown handler: persist Redis before exit
+  let shuttingDown = false;
+  const shutdown = async (signal: string): Promise<void> => {
+    if (shuttingDown) {
+      app.log.info(`[api] Received ${signal} while shutdown already in progress`);
+      return;
+    }
+    shuttingDown = true;
+
+    let exitCode = 0;
+    try {
+      app.log.info(`[api] Received ${signal}, shutting down gracefully...`);
+
+      // Log shutdown to audit log FIRST (before any cleanup that might fail)
+      try {
+        await auditLog.append({
+          type: AuditEventTypes.SERVER_SHUTDOWN,
+          data: { signal, graceful: true },
+        });
+      } catch {
+        // Audit log write failed, but continue with shutdown
+      }
+
+      // Trigger Redis BGSAVE to persist in-memory data before exit
+      if (redisClient) {
+        try {
+          app.log.info('[api] Triggering Redis BGSAVE before shutdown...');
+          await redisClient.bgsave();
+          // Give Redis a moment to start the background save
+          await new Promise((r) => setTimeout(r, 500));
+          app.log.info('[api] Redis BGSAVE triggered');
+        } catch (err) {
+          app.log.error(`[api] Redis BGSAVE failed: ${String(err)}`);
+        }
+      }
+
+      taskRunnerV2.stop();
+
+      // Stop event bus subscribers
+      agentCatalogSubscriber.unsubscribe();
+      accountBindingSubscriber.unsubscribe();
+      pushConfigUnsub?.();
+      pushConfigUnsub = null;
+      connectorReloadUnsub?.();
+      try {
+        await connectorGatewayHandle?.stop();
+      } catch (err) {
+        app.log.error(`[api] ConnectorGateway stop failed: ${String(err)}`);
+      }
+
+      // Stop preview gateway (F120)
+      try {
+        await previewGateway.stop();
+      } catch (err) {
+        app.log.error(`[api] PreviewGateway stop failed: ${String(err)}`);
+      }
+
+      // Close WebSocket connections
+      try {
+        socketManager?.close();
+      } catch (err) {
+        exitCode = 1;
+        app.log.error(`[api] SocketManager close failed: ${String(err)}`);
+      }
+
+      // F153 Phase E L3: Stop burn-rate monitor
+      burnRateMonitor?.stop();
+
+      // F152: Flush and shutdown OTel SDK before closing server
+      try {
+        await telemetryHandle.shutdown();
+      } catch (err) {
+        app.log.error(`[api] OTel shutdown failed: ${String(err)}`);
+      }
+
+      // Close Fastify server
+      await app.close();
+
+      try {
+        await apiInstanceLease?.release();
+      } catch (err) {
+        exitCode = 1;
+        app.log.error(`[api] API namespace lease release failed: ${String(err)}`);
+      }
+
+      app.log.info('[api] Shutdown complete');
+    } catch (err) {
+      exitCode = 1;
+      app.log.error(`[api] Shutdown failed: ${String(err)}`);
+    } finally {
+      if (forcedLeaseLossExitTimer) {
+        clearTimeout(forcedLeaseLossExitTimer);
+        forcedLeaseLossExitTimer = null;
+      }
+      process.exit(exitCode);
+    }
+  };
+  shutdownForLeaseLoss = shutdown;
+
+  process.once('SIGTERM', () => {
+    void shutdown('SIGTERM');
+  });
+  process.once('SIGINT', () => {
+    void shutdown('SIGINT');
+  });
+}
+
+main().catch((err) => {
+  console.error('[api] Fatal error:', err);
+  process.exit(1);
+});

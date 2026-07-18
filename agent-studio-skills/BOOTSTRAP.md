@@ -1,0 +1,100 @@
+# Agent Studio Skills Bootstrap
+
+<EXTREMELY_IMPORTANT>
+你已加载 Agent Studio Skills。路由规则定义在 `agent-studio-skills/manifest.yaml`。
+
+## Skills 列表（42 个）
+
+### 开发流程链
+```
+feat-lifecycle → Design Gate(设计确认) → writing-plans → worktree → tdd
+    → quality-gate → request-review → receive-review
+    → merge-gate → feat-lifecycle(完成)
+```
+
+| Skill | 触发场景 | SOP Step |
+|-------|----------|----------|
+| `feat-lifecycle` | 新功能立项/讨论/完成 | — |
+| `guide-authoring` | 编排场景引导 YAML / registry / 标签契约 | — |
+| `guide-interaction` | 判断是否需要交互引导，并按 Guide Matched/Pending/Active 等状态驱动回复 | — |
+| `collaborative-thinking` | brainstorm/多智能体讨论/收敛 | — |
+| `expert-panel` | 专家辩论团/竞品分析/技术趋势/showcase | — |
+| `writing-plans` | 写实施计划 | ① impl |
+| `worktree` | 创建隔离开发环境 | ① impl |
+| `tdd` | 写测试+实现（红绿重构） | ① impl |
+| `code-as-harness` | 重复摩擦/陌生任务→搜证据→诊断→代码修/建 harness | — |
+| `debugging` | 遇到 bug（系统化定位） | — |
+| `quality-gate` | 开发完了自检（愿景+spec+验证） | ② |
+| `request-review` | 发 review 请求给 reviewer | ③ |
+| `receive-review` | 处理 review 反馈（Red→Green） | ③ |
+| `merge-gate` | 门禁→PR→remote review→merge→清理 | ④⑤⑥ |
+| `open-source-teardown` | 热门开源项目/竞品 agent/runtime 的源码拆解、算法剥皮、营销水分和 tradeoff 判断 | — |
+| `cross-agent-handoff` | 跨智能体交接/传话（五件套） | — |
+| `deep-research` | 多源深度调研 | — |
+| `source-audit` | 外部数字/benchmark/因果/趋势等高风险 claim 的信源审计与 provenance | — |
+| `ttfund-skills` | 天天基金官方 Skills 网关：基金搜索/净值/持仓/经理/指数/黄金/债市/活期宝事实数据 | — |
+| `knowledge-engineering` | 外部项目文档重构/冷启动知识注入 | — |
+| `memory-navigation` | 项目记忆三入口路由（graph / recent / search） | — |
+| `memory-search-best-practices` | 记忆系统多刀检索 + recall coverage 策略（8 类题型 recipe） | — |
+| `writing-skills` | 写新 skill | — |
+| `pencil-design` | 设计 UI / .pen 文件 | — |
+| `rich-messaging` | 发语音/发图/发卡片/富媒体 | — |
+| `enterprise-workflow` | 企微/飞书文档、表格、待办、会议、日程一键创建 | — |
+| `schedule-tasks` | 定时任务/周期提醒/延迟执行 | — |
+| `hyperfocus-brake` | operator健康提醒/多智能体撒娇打断 | — |
+| `incident-response` | 闯祸了/不可挽回/人很难过 | — |
+| `image-generation` | 生成图片/画头像/AI 画图 | — |
+| `self-evolution` | scope 守护/流程改进/知识沉淀 | — |
+| `vision-rescue` | 任务绝境/反复摆动/投降修辞/放弃愿景 | — |
+| `bootcamp-guide` | operator 新手训练营引导 | — |
+| `cross-thread-sync` | 跨 thread 协同/通知/争用协调 | — |
+| `browser-preview` | 写前端/跑 dev server/看页面效果 | — |
+| `console-dev` | Console 前端开发的入口、设计体系、实现和验证门禁 | — |
+| `browser-automation` | 外部网站浏览/登录态流程/浏览器工具路由 | — |
+| `organize-threads` | 整理未分类 thread，建议合适标签 | — |
+| `workspace-navigator` | operator说"打开日志/看代码/打开设计图"等模糊指令 → 智能体自己找路径 → API 导航 | — |
+| `ppt-forge` | 做 PPT/演示文稿/视觉审查（多智能体流水线） | — |
+| `video-forge` | 做视频/showcase/教程视频/视频审查 | — |
+| `anime-forge` | 做动画短剧/角色 IP 短片/图生视频管线（素材是生成的不是录的） | — |
+
+### 参考文件（refs/，按需读取）
+
+| 文件 | 内容 |
+|------|------|
+| `refs/shared-rules.md` | 多智能体共用协作规则（单一真相源） |
+| `refs/decision-matrix.md` | 决策权漏斗矩阵 |
+| `refs/commit-signatures.md` | 智能体签名表 + @ 句柄 |
+| `refs/pr-template.md` | PR 模板 + remote review 触发模板 |
+| `refs/review-request-template.md` | Review 请求信模板 |
+| `refs/vision-evidence-workflow.md` | 前端截图/录屏证据流程（B1） |
+| `refs/requirements-checklist-template.md` | 需求点 checklist 模板（B3） |
+| `refs/f190-frontend-lessons.md` | F190 Console intake 的前端案例与红区教训 |
+| `refs/mcp-callbacks.md` | MCP callback surface 映射与 legacy HTTP fallback 边界 |
+| `refs/rich-blocks.md` | Rich block 创建指南 |
+| `refs/ppt-density-playbook.md` | PPT 密度填充手法（9 种手段 + 量化门禁） |
+| `refs/ppt-visual-review.md` | PPT 视觉审查 Gate（D1 布局+D2 审美） |
+| `refs/ppt-style-tile.md` | PPT 风格定调（核心页 CSS 变量） |
+
+## 关键规则
+
+1. **Skill 适用就必须加载，没有选择**
+2. **完整流程见 `docs/SOP.md`；机器真相源见 `sop-definitions/development.yaml`**
+3. **三条铁律**：Redis production Redis (sacred) / 同一个体不能 self-review / 不能冒充其他智能体
+4. **共用规则在 `refs/shared-rules.md`**（不在各智能体文件里重复）
+5. **Reviewer 选择是动态匹配**（`docs/SOP.md` 配对规则），禁止写死“reviewer 是主执行智能体”
+
+## 使用方式
+
+- **Claude**: Skills 自动触发（`~/.claude/skills/`）
+- **Codex**: 手动加载 `agent ~/.codex/skills/{skill-name}/SKILL.md`
+- **Gemini**: Skills 自动触发（`~/.gemini/skills/`）
+
+## 新增/修改 skill
+
+1. 在 `agent-studio-skills/{name}/` 创建 SKILL.md
+2. 在 `manifest.yaml` 添加路由条目
+3. 创建 symlink：`ln -s .../agent-studio-skills/{name} ~/.{claude,codex,gemini,kimi}/skills/{name}`（OpenCode 读 `~/.claude/`，自动覆盖）
+4. 运行 `pnpm check:skills` 验证
+
+IF A SKILL APPLIES TO YOUR TASK, YOU DO NOT HAVE A CHOICE. YOU MUST USE IT.
+</EXTREMELY_IMPORTANT>

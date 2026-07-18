@@ -1,0 +1,138 @@
+/**
+ * DARE Event Transformer
+ * DARE headless envelope → Agent Studio AgentMessage 映射
+ *
+ * DARE headless envelope (client-headless-event-envelope.v1):
+ *   { schema_version, ts, session_id, run_id, seq, event, data }
+ *
+ * Event mapping:
+ *   session.started  → session_init
+ *   tool.invoke      → tool_use
+ *   tool.result      → tool_result
+ *   tool.error       → tool_result (with error content)
+ *   task.completed   → text (rendered_output is the agent's final answer)
+ *   task.failed      → error
+ *   approval.pending → system_info
+ *   Others (log.*, transport.*, model.response, plan.*) → null (skip)
+ */
+
+import type { AgentId } from '@agent-studio/shared';
+import type { AgentMessage } from '../../types.js';
+
+const DARE_SCHEMA = 'client-headless-event-envelope.v1';
+
+interface DareEnvelope {
+  schema_version: string;
+  ts: number;
+  session_id: string;
+  run_id: string;
+  seq: number;
+  event: string;
+  data: Record<string, unknown>;
+}
+
+function isDareEnvelope(event: unknown): event is DareEnvelope {
+  if (typeof event !== 'object' || event === null) return false;
+  const e = event as Record<string, unknown>;
+  return e.schema_version === DARE_SCHEMA && typeof e.event === 'string';
+}
+
+function str(val: unknown, fallback = ''): string {
+  return typeof val === 'string' ? val : fallback;
+}
+
+export function transformDareEvent(event: unknown, agentId: AgentId | string): AgentMessage | null {
+  if (!isDareEnvelope(event)) return null;
+
+  const ts = typeof event.ts === 'number' ? Math.round(event.ts * 1000) : Date.now();
+  const data = event.data ?? {};
+
+  switch (event.event) {
+    case 'session.started':
+      return {
+        type: 'session_init',
+        agentId: agentId as AgentId,
+        sessionId: event.session_id,
+        timestamp: ts,
+      };
+
+    case 'tool.invoke': {
+      // F153 Phase J AC-J2: lift native tool_call_id to top-level toolUseId for
+      // ToolSpanTracker pairing with tool.result/tool.error.
+      const msg: AgentMessage = {
+        type: 'tool_use',
+        agentId: agentId as AgentId,
+        toolName: str(data.tool_name, 'unknown'),
+        timestamp: ts,
+      };
+      if (typeof data.tool_call_id === 'string') {
+        msg.toolUseId = data.tool_call_id;
+      }
+      return msg;
+    }
+
+    case 'tool.result': {
+      // F153 Phase J AC-J2: carry toolUseId + structured status (ok).
+      const msg: AgentMessage = {
+        type: 'tool_result',
+        agentId: agentId as AgentId,
+        toolName: str(data.tool_name),
+        content: `${str(data.tool_name)} completed`,
+        toolResultStatus: 'ok',
+        timestamp: ts,
+      };
+      if (typeof data.tool_call_id === 'string') msg.toolUseId = data.tool_call_id;
+      return msg;
+    }
+
+    case 'tool.error': {
+      // F153 Phase J AC-J2: carry toolUseId + structured status (error).
+      const msg: AgentMessage = {
+        type: 'tool_result',
+        agentId: agentId as AgentId,
+        toolName: str(data.tool_name),
+        content: `Error: ${str(data.error, 'tool execution failed')}`,
+        toolResultStatus: 'error',
+        timestamp: ts,
+      };
+      if (typeof data.tool_call_id === 'string') msg.toolUseId = data.tool_call_id;
+      return msg;
+    }
+
+    case 'task.completed':
+      return {
+        type: 'text',
+        agentId: agentId as AgentId,
+        content: str(data.rendered_output),
+        timestamp: ts,
+      };
+
+    case 'task.failed': {
+      let errorMsg: string;
+      if (typeof data.error === 'string') {
+        errorMsg = data.error;
+      } else if (Array.isArray(data.errors)) {
+        errorMsg = (data.errors as unknown[]).map(String).join('; ');
+      } else {
+        errorMsg = 'DARE task failed';
+      }
+      return {
+        type: 'error',
+        agentId: agentId as AgentId,
+        error: errorMsg,
+        timestamp: ts,
+      };
+    }
+
+    case 'approval.pending':
+      return {
+        type: 'system_info',
+        agentId: agentId as AgentId,
+        content: `DARE approval pending: ${str(data.tool_name, 'unknown tool')}`,
+        timestamp: ts,
+      };
+
+    default:
+      return null;
+  }
+}

@@ -1,0 +1,186 @@
+import type { AgentData } from '@/hooks/useAgentData';
+import {
+  type ClientId,
+  DEFAULT_ANTIGRAVITY_COMMAND_ARGS,
+  type HubAgentEditorFormState,
+  normalizeMentionPattern,
+  splitCommandArgs,
+  splitMentionPatterns,
+  splitStrengthTags,
+} from './hub-agent-editor.model';
+import { defaultMcpSupportForClient } from './hub-agent-editor.protocols';
+
+function trimText(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+/**
+ * Returns a hint string when the model does not follow "providerId/modelId" convention for opencode.
+ * Advisory only — callers should display as a warning, not block submission.
+ */
+export function hintModelFormatForClient(client: ClientId, model: string): string | null {
+  if (client !== 'opencode') return null;
+  const trimmed = model.trim();
+  const slashIndex = trimmed.indexOf('/');
+  if (slashIndex > 0 && slashIndex < trimmed.length - 1) return null;
+  return 'OpenCode 建议使用 providerId/modelId 格式（例如 openai/gpt-5.4）';
+}
+
+/** @deprecated Use {@link hintModelFormatForClient} — kept for backward compatibility. */
+export const validateModelFormatForClient = hintModelFormatForClient;
+
+function resolveFormAccountRef(form: HubAgentEditorFormState): string {
+  return trimText(form.accountRef);
+}
+
+function buildVoiceConfig(form: HubAgentEditorFormState) {
+  const voice = trimText(form.voiceVoice);
+  const langCode = trimText(form.voiceLangCode);
+  if (!voice) return undefined;
+  if (!langCode) return undefined;
+  const speed = Number.parseFloat(form.voiceSpeed);
+  const temperature = Number.parseFloat(form.voiceTemperature);
+  return {
+    voice,
+    langCode,
+    ...(Number.isFinite(speed) && speed > 0 ? { speed } : {}),
+    ...(trimText(form.voiceRefAudio) ? { refAudio: trimText(form.voiceRefAudio) } : {}),
+    ...(trimText(form.voiceRefText) ? { refText: trimText(form.voiceRefText) } : {}),
+    ...(trimText(form.voiceInstruct) ? { instruct: trimText(form.voiceInstruct) } : {}),
+    ...(Number.isFinite(temperature) && temperature >= 0 ? { temperature } : {}),
+  };
+}
+
+export function buildContextBudget(form: HubAgentEditorFormState) {
+  const values = [form.maxPromptTokens, form.maxContextTokens, form.maxMessages, form.maxContentLengthPerMsg].map(
+    (value) => value.trim(),
+  );
+  const filledCount = values.filter((value) => value.length > 0).length;
+  if (filledCount === 0) return undefined;
+  if (filledCount !== values.length) {
+    throw new Error('上下文预算要么全部留空，要么 4 项都填写');
+  }
+
+  const parsed = values.map((value) => Number.parseInt(value, 10));
+  if (parsed.some((value) => !Number.isFinite(value) || value <= 0)) {
+    throw new Error('上下文预算必须是正整数');
+  }
+
+  return {
+    maxPromptTokens: parsed[0]!,
+    maxContextTokens: parsed[1]!,
+    maxMessages: parsed[2]!,
+    maxContentLengthPerMsg: parsed[3]!,
+  };
+}
+
+export function buildAgentPayload(form: HubAgentEditorFormState, agent?: AgentData | null) {
+  const contextBudget = buildContextBudget(form);
+  const hasExistingBudget = Boolean(agent?.contextBudget);
+  const contextBudgetPatch =
+    contextBudget !== undefined ? { contextBudget } : agent && hasExistingBudget ? { contextBudget: null as null } : {};
+  const name = trimText(form.name);
+  const displayName = trimText(form.displayName) || name;
+  const createName = name || displayName;
+  const updateName = name || displayName || agent?.name || agent?.displayName || '';
+  const trimmedAccountRef = resolveFormAccountRef(form);
+  const accountRefPatch =
+    trimmedAccountRef.length > 0
+      ? { accountRef: trimmedAccountRef }
+      : agent?.accountRef
+        ? { accountRef: null as null }
+        : {};
+  const mcpSupportPatch =
+    agent && form.clientId !== agent.clientId ? { mcpSupport: defaultMcpSupportForClient(form.clientId) } : {};
+  const trimmedCliEffort = trimText(form.cliEffort);
+  const cliPatch =
+    trimmedCliEffort.length > 0
+      ? { cli: { effort: trimmedCliEffort } }
+      : agent?.cli?.effort
+        ? { cli: { effort: null as null } }
+        : {};
+  const voiceConfig = buildVoiceConfig(form);
+  const voiceConfigPatch: Record<string, unknown> =
+    voiceConfig !== undefined ? { voiceConfig } : agent?.voiceConfig ? { voiceConfig: null } : {};
+  const common = {
+    displayName,
+    variantLabel: trimText(form.variantLabel),
+    nickname: trimText(form.nickname),
+    avatar: trimText(form.avatar),
+    color: {
+      primary: trimText(form.colorPrimary),
+      secondary: trimText(form.colorSecondary),
+    },
+    mentionPatterns: Array.from(
+      new Set(splitMentionPatterns(form.mentionPatterns).map(normalizeMentionPattern).filter(Boolean)),
+    ),
+    roleDescription: trimText(form.roleDescription),
+    personality: trimText(form.personality),
+    teamStrengths: trimText(form.teamStrengths),
+    caution: trimText(form.caution) || null,
+    strengths: splitStrengthTags(form.strengths),
+    sessionChain: form.sessionChain === 'true',
+    ...contextBudgetPatch,
+    ...voiceConfigPatch,
+  };
+
+  if (form.clientId === 'antigravity') {
+    const commandArgsSource = trimText(form.commandArgs) || DEFAULT_ANTIGRAVITY_COMMAND_ARGS;
+    return {
+      ...common,
+      ...(agent ? { name: updateName } : { agentId: trimText(form.agentId), name: createName }),
+      clientId: 'antigravity' as const,
+      ...accountRefPatch,
+      ...mcpSupportPatch,
+      defaultModel: trimText(form.defaultModel),
+      commandArgs: splitCommandArgs(commandArgsSource),
+    };
+  }
+
+  return {
+    ...common,
+    ...(agent ? { name: updateName } : { agentId: trimText(form.agentId), name: createName }),
+    clientId: form.clientId,
+    ...accountRefPatch,
+    ...mcpSupportPatch,
+    ...cliPatch,
+    defaultModel: trimText(form.defaultModel),
+    cliConfigArgs: (form.cliConfigArgs ?? []).filter((arg) => arg.trim().length > 0),
+    ...(form.clientId === 'opencode' && trimText(form.provider)
+      ? { provider: trimText(form.provider) }
+      : agent?.provider
+        ? { provider: null as null }
+        : {}),
+  };
+}
+
+function normalizeOptionalText(value: unknown): string | null {
+  const trimmed = trimText(value);
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+export function buildAgentPatchPayload(form: HubAgentEditorFormState, agent: AgentData) {
+  const payload = buildAgentPayload(form, agent) as Record<string, unknown>;
+
+  if (form.clientId === agent.clientId) {
+    delete payload.clientId;
+  }
+  if (trimText(form.defaultModel) === trimText(agent.defaultModel)) {
+    delete payload.defaultModel;
+  }
+
+  const nextAccountRef = normalizeOptionalText(form.accountRef);
+  const currentAccountRef = normalizeOptionalText(agent.accountRef);
+  if (nextAccountRef === currentAccountRef) {
+    delete payload.accountRef;
+  }
+
+  const nextProvider =
+    form.clientId === 'opencode' && trimText(form.provider).length > 0 ? trimText(form.provider) : null;
+  const currentProvider = normalizeOptionalText(agent.provider);
+  if (nextProvider === currentProvider) {
+    delete payload.provider;
+  }
+
+  return payload;
+}

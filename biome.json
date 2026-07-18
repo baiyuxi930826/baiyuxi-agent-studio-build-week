@@ -1,0 +1,106 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.4.1/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "ignoreUnknown": true,
+    "includes": [
+      "**",
+      "!gitnexus",
+      "!.claude/skills",
+      "!assets/avatars",
+      "!assets/concierge",
+      "!assets/design-concepts",
+      "!assets/docs",
+      "!assets/hero-prism.svg",
+      "!assets/icons",
+      "!assets/logos",
+      "!assets/preview-v2.html",
+      "!assets/reference",
+      "!assets/screenshots",
+      "!assets/stickers",
+      "!diagrams",
+      "!docs/designs",
+      "!docs/features/assets",
+      "!docs/harness-feedback/bundles",
+      "!docs/videos"
+    ]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 120
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true,
+      "complexity": {
+        "noExcessiveCognitiveComplexity": "warn"
+      },
+      "a11y": {
+        "noLabelWithoutControl": "warn",
+        "noRedundantAlt": "warn",
+        "noStaticElementInteractions": "warn",
+        "noSvgWithoutTitle": "warn",
+        "useAltText": "warn",
+        "useAriaPropsForRole": "warn",
+        "useButtonType": "warn",
+        "useFocusableInteractive": "warn",
+        "useHtmlLang": "warn",
+        "useKeyWithClickEvents": "warn",
+        "useMediaCaption": "warn",
+        "useSemanticElements": "warn",
+        "useValidAnchor": "warn"
+      },
+      "performance": {
+        "noImgElement": "warn"
+      },
+      "suspicious": {
+        "noAssignInExpressions": "warn",
+        "noArrayIndexKey": "warn",
+        "noCommentText": "warn",
+        "noControlCharactersInRegex": "warn",
+        "noExplicitAny": "warn",
+        "noDoubleEquals": "warn",
+        "noImplicitAnyLet": "warn",
+        "noNonNullAssertedOptionalChain": "warn",
+        "noRedeclare": "warn",
+        "noUnknownAtRules": "warn",
+        "useIterableCallbackReturn": "warn"
+      },
+      "style": {
+        "noUnusedTemplateLiteral": "off",
+        "useImportType": "off",
+        "noParameterAssign": "off"
+      },
+      "correctness": {
+        "noEmptyPattern": "warn",
+        "noUnsafeFinally": "warn",
+        "noUnsafeOptionalChaining": "warn",
+        "noUnusedImports": "warn",
+        "noUnusedVariables": "warn",
+        "useExhaustiveDependencies": "warn",
+        "useYield": "warn"
+      }
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "single",
+      "trailingCommas": "all"
+    }
+  },
+  "assist": {
+    "enabled": true,
+    "actions": {
+      "source": {
+        "organizeImports": "on"
+      }
+    }
+  }
+}

@@ -1,0 +1,168 @@
+<#
+.SYNOPSIS
+  Baiyuxi Agent Studio (Agent Studio) - Windows Stop Script
+
+.DESCRIPTION
+  Stops Agent Studio services (API, Frontend, Redis) by port.
+
+.EXAMPLE
+  .\scripts\stop-windows.ps1
+#>
+
+$ErrorActionPreference = "Continue"
+
+function Write-Ok   { param([string]$msg) Write-Host "  [OK] $msg" -ForegroundColor Green }
+function Write-Warn { param([string]$msg) Write-Host "  [!!] $msg" -ForegroundColor Yellow }
+
+$ScriptPath = if ($PSCommandPath) { $PSCommandPath } elseif ($MyInvocation.MyCommand.Path) { $MyInvocation.MyCommand.Path } else { $null }
+$ScriptDir = if ($ScriptPath) { Split-Path -Parent $ScriptPath } else { $null }
+if ($ScriptDir) {
+    . (Join-Path $ScriptDir "install-windows-helpers.ps1")
+}
+$ProjectRoot = if ($ScriptDir) { Split-Path -Parent $ScriptDir } else { $null }
+$RunDir = if ($ProjectRoot) { Join-Path $ProjectRoot ".agent-studio/run/windows" } else { $null }
+
+Write-Host "Agent Studio - Stopping services" -ForegroundColor Cyan
+Write-Host "============================="
+
+# Load .env for port config
+$envFile = Join-Path (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)) ".env"
+$ApiPort = 3004
+$WebPort = 3003
+$RedisPort = 6399
+
+if (Test-Path $envFile) {
+    Get-Content $envFile | ForEach-Object {
+        $line = $_.Trim()
+        if ($line -and -not $line.StartsWith("#")) {
+            $parts = $line -split "=", 2
+            if ($parts.Count -eq 2) {
+                $key = $parts[0].Trim()
+                $val = $parts[1].Trim().Trim('"').Trim("'")
+                switch ($key) {
+                    "API_SERVER_PORT" { $ApiPort = [int]$val }
+                    "FRONTEND_PORT"   { $WebPort = [int]$val }
+                    "REDIS_PORT"      { $RedisPort = [int]$val }
+                }
+            }
+        }
+    }
+}
+
+$configuredRedisUrl = Get-InstallerEnvValueFromFile -EnvFile $envFile -Key "REDIS_URL"
+if (-not $configuredRedisUrl -and $env:REDIS_URL) {
+    $configuredRedisUrl = $env:REDIS_URL.Trim()
+}
+
+function Get-ManagedProcessId {
+    param([string]$ManagedPidFile)
+    if (-not $ManagedPidFile -or -not (Test-Path $ManagedPidFile)) {
+        return $null
+    }
+    try {
+        return [int](Get-Content $ManagedPidFile -TotalCount 1).Trim()
+    } catch {
+        return $null
+    }
+}
+
+function Get-ProcessCommandLine {
+    param([int]$ProcessId)
+    try {
+        $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop
+        return $processInfo.CommandLine
+    } catch {
+        return $null
+    }
+}
+
+function Test-AgentStudioOwnedProcess {
+    param([int]$ProcessId, [string]$AgentStudioProjectRoot)
+    if (-not $AgentStudioProjectRoot) {
+        return $false
+    }
+    $commandLine = Get-ProcessCommandLine -ProcessId $ProcessId
+    if (-not $commandLine) {
+        return $false
+    }
+    $normalizedRoot = $AgentStudioProjectRoot.TrimEnd('\', '/') + '\'
+    return ($commandLine -like "*$normalizedRoot*") -or ($commandLine -like "*$AgentStudioProjectRoot`"*") -or ($commandLine -like "*$AgentStudioProjectRoot'*")
+}
+
+function Stop-PortProcess {
+    param([int]$Port, [string]$Name, [string]$PidFile, [string]$ProjectRoot)
+    $connections = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    if ($connections) {
+        $managedPid = Get-ManagedProcessId -ManagedPidFile $PidFile
+        $stopped = $false
+        foreach ($conn in $connections) {
+            $isManagedPid = $managedPid -and ($conn.OwningProcess -eq $managedPid)
+            $isAgentStudioOwned = $isManagedPid -or (Test-AgentStudioOwnedProcess -ProcessId $conn.OwningProcess -AgentStudioProjectRoot $ProjectRoot)
+            if (-not $isAgentStudioOwned) {
+                Write-Warn "Skipping non-Baiyuxi Agent Studio $Name listener on port $Port (PID $($conn.OwningProcess))"
+                continue
+            }
+            Stop-Process -Id $conn.OwningProcess -Force -ErrorAction SilentlyContinue
+            $stopped = $true
+        }
+        if ($stopped) {
+            Remove-Item $PidFile -ErrorAction SilentlyContinue
+            Write-Ok "Stopped $Name (port $Port)"
+        } else {
+            Write-Warn "$Name (port $Port) - no Baiyuxi Agent Studio-owned listener found"
+        }
+    } else {
+        Write-Warn "$Name (port $Port) - not running"
+    }
+}
+
+$ApiPidFile = if ($RunDir) { Join-Path $RunDir "api-$ApiPort.pid" } else { $null }
+$WebPidFile = if ($RunDir) { Join-Path $RunDir "web-$WebPort.pid" } else { $null }
+
+Stop-PortProcess -Port $ApiPort -Name "API Server" -PidFile $ApiPidFile -ProjectRoot $ProjectRoot
+Stop-PortProcess -Port $WebPort -Name "Frontend" -PidFile $WebPidFile -ProjectRoot $ProjectRoot
+
+# Stop Redis if running on our managed port.
+# Only shut down Redis when:
+# 1. No external REDIS_URL is configured (we manage the instance), OR
+# 2. REDIS_URL points to our managed port (localhost:$RedisPort)
+$redisLayout = if ($ProjectRoot) { Resolve-PortableRedisLayout -ProjectRoot $ProjectRoot } else { $null }
+$redisPidFile = if ($redisLayout) { Join-Path $redisLayout.Data "redis-$RedisPort.pid" } else { $null }
+
+if ($configuredRedisUrl -and -not (Test-LocalRedisUrl -RedisUrl $configuredRedisUrl -RedisPort $RedisPort)) {
+    Write-Warn "Skipping local Redis shutdown because REDIS_URL points to an external host"
+} else {
+    try {
+        $redisConnections = Get-NetTCPConnection -LocalPort $RedisPort -State Listen -ErrorAction SilentlyContinue
+        if (-not $redisConnections) {
+            Write-Warn "Redis (port $RedisPort) - not running"
+        } else {
+            $managedRedisPid = Get-ManagedProcessId -ManagedPidFile $redisPidFile
+            $ownedRedisConnections = @()
+            foreach ($conn in $redisConnections) {
+                $isManagedPid = $managedRedisPid -and ($conn.OwningProcess -eq $managedRedisPid)
+                $isAgentStudioOwned = $isManagedPid -or (Test-AgentStudioOwnedProcess -ProcessId $conn.OwningProcess -AgentStudioProjectRoot $ProjectRoot)
+                if (-not $isAgentStudioOwned) {
+                    Write-Warn "Skipping non-Baiyuxi Agent Studio Redis listener on port $RedisPort (PID $($conn.OwningProcess))"
+                    continue
+                }
+                $ownedRedisConnections += $conn
+            }
+            if ($ownedRedisConnections.Count -eq 0) {
+                Write-Warn "Redis (port $RedisPort) - no Baiyuxi Agent Studio-owned listener found"
+            } else {
+                $shutdownUrl = if ($configuredRedisUrl) { $configuredRedisUrl } else { "redis://localhost:$RedisPort" }
+                if (Test-RedisReachable -RedisUrl $shutdownUrl) {
+                    Send-RedisShutdown -RedisUrl $shutdownUrl
+                    Write-Ok "Redis stopped (port $RedisPort)"
+                } else {
+                    Write-Warn "Redis (port $RedisPort) - not running"
+                }
+            }
+        }
+    } catch {
+        Write-Warn "Redis (port $RedisPort) - not running"
+    }
+}
+
+Write-Host "`nAll services stopped." -ForegroundColor Green

@@ -1,0 +1,1340 @@
+/**
+ * Redis Thread Store
+ * Redis-backed thread storage with same interface as in-memory ThreadStore.
+ *
+ * Redis 数据结构:
+ *   agent-studio:thread:{threadId}              → Hash (对话详情)
+ *   agent-studio:thread:{threadId}:participants  → Set (参与智能体)
+ *   agent-studio:threads:user:{userId}          → Sorted Set (用户对话列表, score=lastActiveAt)
+ *
+ * 默认持久化；用户可见状态禁止默认 TTL（LL-048）。
+ */
+
+import type { AgentId, ThreadPhase } from '@agent-studio/shared';
+import { generateThreadId } from '@agent-studio/shared';
+import type { RedisClient } from '@agent-studio/shared/utils';
+import type {
+  BootcampStateV1,
+  ConnectorHubStateV1,
+  ExternalRuntimeAnchorRuntime,
+  IThreadStore,
+  MentionActionabilityMode,
+  Thread,
+  ThreadMemoryV1,
+  ThreadMentionRoutingFeedback,
+  ThreadParticipantActivity,
+  ThreadRoutingPolicyV1,
+  VotingStateV1,
+} from '../ports/ThreadStore.js';
+import { buildExternalRuntimeAnchorThreadId, DEFAULT_THREAD_ID } from '../ports/ThreadStore.js';
+import { MessageKeys } from '../redis-keys/message-keys.js';
+import { ThreadKeys } from '../redis-keys/thread-keys.js';
+
+const DEFAULT_TTL = 0; // persistent — set >0 via env to enable expiry
+
+/**
+ * Atomic hash update guard:
+ * only applies HSET when the thread hash has a canonical `id` field.
+ * Prevents late updates from recreating orphan hashes after delete races.
+ */
+const HSET_IF_HAS_ID_LUA = `
+if redis.call('HEXISTS', KEYS[1], 'id') == 0 then
+  return 0
+end
+redis.call('HSET', KEYS[1], unpack(ARGV))
+return 1
+`;
+
+/**
+ * Atomic participants guard:
+ * only applies SADD when the thread detail hash has canonical `id`.
+ * Prevents delete/addParticipants race from recreating orphan participant sets.
+ */
+const SADD_IF_DETAIL_HAS_ID_LUA = `
+if redis.call('HEXISTS', KEYS[1], 'id') == 0 then
+  return 0
+end
+redis.call('SADD', KEYS[2], unpack(ARGV))
+return 1
+`;
+
+/**
+ * Cloud Codex P2 fix: Atomic participant activity update guard.
+ * Only updates activity when the thread detail hash has canonical `id`.
+ * KEYS[1] = detail key, KEYS[2] = participants key, KEYS[3] = activity key
+ * ARGV[1] = agentId, ARGV[2] = timestamp, ARGV[3] = ttl (or -1 for no expiration)
+ *
+ * Cloud Codex R2 P2 fix: Also refresh detail TTL to prevent detail expiring
+ * before participants/activity (which would cause routing to non-existent thread).
+ */
+const UPDATE_ACTIVITY_IF_DETAIL_HAS_ID_LUA = `
+if redis.call('HEXISTS', KEYS[1], 'id') == 0 then
+  return 0
+end
+redis.call('SADD', KEYS[2], ARGV[1])
+redis.call('HSET', KEYS[3], ARGV[1] .. ':lastMessageAt', ARGV[2])
+redis.call('HINCRBY', KEYS[3], ARGV[1] .. ':messageCount', 1)
+redis.call('HSET', KEYS[3], ARGV[1] .. ':healthy', ARGV[4])
+local ttl = tonumber(ARGV[3])
+if ttl > 0 then
+  redis.call('EXPIRE', KEYS[1], ttl)
+  redis.call('EXPIRE', KEYS[2], ttl)
+  redis.call('EXPIRE', KEYS[3], ttl)
+else
+  redis.call('PERSIST', KEYS[1])
+  redis.call('PERSIST', KEYS[2])
+  redis.call('PERSIST', KEYS[3])
+end
+return 1
+`;
+
+/**
+ * Atomically read and clear a one-shot mention-routing feedback payload.
+ * KEYS[1] = feedback hash key, ARGV[1] = agentId
+ */
+const HGETDEL_LUA = `
+local value = redis.call('HGET', KEYS[1], ARGV[1])
+if value then
+  redis.call('HDEL', KEYS[1], ARGV[1])
+end
+return value
+`;
+
+/**
+ * Atomic thread deletion: DEL detail + related keys + conditional tombstone.
+ * Prevents race where get() → recoverThreadFromMessages() resurrects between
+ * pipeline DEL and non-atomic tombstone SET.
+ * KEYS[1]=detail, KEYS[2]=participants, KEYS[3]=activity,
+ * KEYS[4]=mentionFeedback, KEYS[5]=tombstone [, KEYS[6]=userList]
+ * ARGV[1]=threadId (for optional ZREM from userList)
+ */
+const DELETE_THREAD_LUA = `
+local deleted = redis.call('DEL', KEYS[1])
+redis.call('DEL', KEYS[2], KEYS[3], KEYS[4])
+if #KEYS >= 6 then
+  redis.call('ZREM', KEYS[6], ARGV[1])
+end
+if deleted > 0 then
+  redis.call('SET', KEYS[5], '1')
+end
+return deleted
+`;
+
+/** R1 P2-1: Shared validation for ThreadMemoryV1 JSON — rejects incomplete/corrupt data. */
+function parseThreadMemoryJson(raw: string): ThreadMemoryV1 | null {
+  try {
+    const p = JSON.parse(raw);
+    if (
+      p &&
+      typeof p === 'object' &&
+      p.v === 1 &&
+      typeof p.summary === 'string' &&
+      Number.isFinite(p.sessionsIncorporated) &&
+      Number.isFinite(p.updatedAt)
+    ) {
+      return p as ThreadMemoryV1;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export class RedisThreadStore implements IThreadStore {
+  private static readonly LIST_REPAIR_COOLDOWN_MS = 5 * 60 * 1000;
+  private readonly redis: RedisClient;
+  /** null means no expiration. */
+  private readonly ttlSeconds: number | null;
+  /** Avoid re-scanning every request when a user genuinely only has one thread. */
+  private readonly lastListRepairAt = new Map<string, number>();
+
+  constructor(redis: RedisClient, options?: { ttlSeconds?: number }) {
+    this.redis = redis;
+    const raw = options?.ttlSeconds ?? DEFAULT_TTL;
+    if (!Number.isFinite(raw) || raw <= 0) {
+      this.ttlSeconds = null;
+    } else {
+      this.ttlSeconds = Math.floor(raw);
+    }
+  }
+
+  async create(
+    userId: string,
+    title?: string,
+    projectPath?: string,
+    parentThreadId?: string,
+    proposalAudit?: import('../ports/ThreadStore.js').ThreadProposalAudit,
+  ): Promise<Thread> {
+    const now = Date.now();
+    const thread: Thread = {
+      id: generateThreadId(),
+      projectPath: projectPath ?? 'default',
+      title: title ?? null,
+      createdBy: userId,
+      participants: [],
+      lastActiveAt: now,
+      createdAt: now,
+      ...(parentThreadId ? { parentThreadId } : {}),
+      ...(proposalAudit
+        ? {
+            createdFromProposalId: proposalAudit.createdFromProposalId,
+            sourceThreadId: proposalAudit.sourceThreadId,
+            approvedBy: proposalAudit.approvedBy,
+            approvedAt: proposalAudit.approvedAt,
+          }
+        : {}),
+    };
+
+    const key = ThreadKeys.detail(thread.id);
+    const pipeline = this.redis.multi();
+    pipeline.hset(key, this.serializeThread(thread));
+    if (this.ttlSeconds !== null) {
+      pipeline.expire(key, this.ttlSeconds);
+    }
+    pipeline.zadd(ThreadKeys.userList(userId), String(now), thread.id);
+    if (this.ttlSeconds !== null) {
+      pipeline.expire(ThreadKeys.userList(userId), this.ttlSeconds);
+    }
+    // F128: Maintain parent→children secondary index
+    if (parentThreadId) {
+      const childrenKey = ThreadKeys.children(parentThreadId);
+      pipeline.zadd(childrenKey, String(now), thread.id);
+      if (this.ttlSeconds !== null) {
+        pipeline.expire(childrenKey, this.ttlSeconds);
+      }
+    }
+    await pipeline.exec();
+
+    return thread;
+  }
+
+  async ensureThread(threadId: string, title: string): Promise<Thread> {
+    const key = ThreadKeys.detail(threadId);
+    const existingId = await this.redis.hget(key, 'id');
+    if (existingId) {
+      const data = await this.redis.hgetall(key);
+      return this.hydrateThread(data);
+    }
+
+    const now = Date.now();
+    const thread: Thread = {
+      id: threadId,
+      projectPath: 'default',
+      title,
+      createdBy: 'system',
+      participants: [],
+      lastActiveAt: now,
+      createdAt: now,
+    };
+
+    await this.redis.hset(key, this.serializeThread(thread));
+    // System threads are persistent — no TTL applied (W5: user state default persistent)
+    return thread;
+  }
+
+  async ensureExternalRuntimeAnchorThread(runtime: ExternalRuntimeAnchorRuntime, userId: string): Promise<Thread> {
+    const threadId = buildExternalRuntimeAnchorThreadId(runtime, userId);
+    const key = ThreadKeys.detail(threadId);
+    const existingId = await this.redis.hget(key, 'id');
+    if (existingId) {
+      const data = await this.redis.hgetall(key);
+      return this.hydrateThread(data);
+    }
+
+    const now = Date.now();
+    const thread: Thread = {
+      id: threadId,
+      projectPath: `external-runtime:${runtime}`,
+      title: `External runtime: ${runtime}`,
+      createdBy: 'system',
+      participants: [],
+      lastActiveAt: now,
+      createdAt: now,
+      externalRuntimeAnchorState: {
+        v: 1,
+        runtime,
+        userId,
+        createdAt: now,
+      },
+    };
+
+    await this.redis.hset(key, this.serializeThread(thread));
+    return thread;
+  }
+
+  async get(threadId: string): Promise<Thread | null> {
+    const data = await this.redis.hgetall(ThreadKeys.detail(threadId));
+    if (!data || !data.id) {
+      if (threadId === DEFAULT_THREAD_ID) {
+        return this.createDefaultThread();
+      }
+      return this.recoverThreadFromMessages(threadId);
+    }
+
+    const thread = this.hydrateThread(data);
+    // Load participants from Set
+    const members = await this.redis.smembers(ThreadKeys.participants(threadId));
+    thread.participants = members as AgentId[];
+    return thread;
+  }
+
+  async list(userId: string): Promise<Thread[]> {
+    const ids = await this.loadUserThreadIds(userId);
+
+    // Ensure default thread is included
+    const hasDefault = ids.includes(DEFAULT_THREAD_ID);
+    if (!hasDefault) ids.push(DEFAULT_THREAD_ID);
+
+    const threads: Thread[] = [];
+    for (const id of ids) {
+      const thread = await this.get(id);
+      if (thread?.externalRuntimeAnchorState) continue;
+      if (thread && !thread.deletedAt) threads.push(thread);
+    }
+
+    // Sort by lastActiveAt descending
+    threads.sort((a, b) => b.lastActiveAt - a.lastActiveAt);
+    return threads;
+  }
+
+  async repairIndex(userId?: string): Promise<{ repairedUsers: number; repairedMembers: number }> {
+    const indexedByUser = await this.collectIndexedThreadsFromDetails(userId);
+    let repairedUsers = 0;
+    let repairedMembers = 0;
+
+    for (const [ownerId, members] of indexedByUser) {
+      const userListKey = ThreadKeys.userList(ownerId);
+      const existingIds = new Set(await this.redis.zrange(userListKey, 0, -1));
+      const missing = [...members.entries()].filter(([threadId]) => !existingIds.has(threadId));
+      if (missing.length === 0) continue;
+
+      const zaddArgs: string[] = [];
+      for (const [threadId, score] of missing) {
+        zaddArgs.push(String(score), threadId);
+      }
+
+      const pipeline = this.redis.multi();
+      pipeline.zadd(userListKey, ...zaddArgs);
+      if (this.ttlSeconds === null) {
+        pipeline.persist(userListKey);
+      } else {
+        pipeline.expire(userListKey, this.ttlSeconds);
+      }
+      await pipeline.exec();
+
+      repairedUsers += 1;
+      repairedMembers += missing.length;
+    }
+
+    return { repairedUsers, repairedMembers };
+  }
+
+  async listByProject(userId: string, projectPath: string): Promise<Thread[]> {
+    const all = await this.list(userId);
+    return all.filter((t) => t.projectPath === projectPath);
+  }
+
+  async addParticipants(threadId: string, agentIds: AgentId[]): Promise<void> {
+    if (agentIds.length === 0) return;
+    const detailKey = ThreadKeys.detail(threadId);
+    const participantsKey = ThreadKeys.participants(threadId);
+    if (threadId === DEFAULT_THREAD_ID) {
+      const hasDefaultDetail = await this.redis.hexists(detailKey, 'id');
+      if (hasDefaultDetail === 0) {
+        await this.createDefaultThread();
+      }
+    }
+    const updated = (await this.redis.eval(
+      SADD_IF_DETAIL_HAS_ID_LUA,
+      2,
+      detailKey,
+      participantsKey,
+      ...agentIds,
+    )) as number;
+    if (updated === 0) return;
+
+    // Cloud Codex P1 fix: Do NOT update activity here.
+    // Activity should only be updated via updateParticipantActivity() after successful message append.
+    await this.applyKeyRetention([participantsKey]);
+  }
+
+  async getParticipants(threadId: string): Promise<AgentId[]> {
+    const members = await this.redis.smembers(ThreadKeys.participants(threadId));
+    return members as AgentId[];
+  }
+
+  /** F032 Phase C: Get participants with activity, sorted by lastMessageAt descending */
+  async getParticipantsWithActivity(threadId: string): Promise<ThreadParticipantActivity[]> {
+    const participants = await this.getParticipants(threadId);
+    if (participants.length === 0) return [];
+
+    const activityKey = ThreadKeys.activity(threadId);
+    const activityData = await this.redis.hgetall(activityKey);
+
+    const result: ThreadParticipantActivity[] = participants.map((agentId) => {
+      const lastMessageAt = parseInt(activityData[`${agentId}:lastMessageAt`] ?? '0', 10);
+      const messageCount = parseInt(activityData[`${agentId}:messageCount`] ?? '0', 10);
+      const healthyRaw = activityData[`${agentId}:healthy`];
+      const lastResponseHealthy = healthyRaw === undefined ? undefined : healthyRaw === '1';
+      return { agentId, lastMessageAt, messageCount, lastResponseHealthy };
+    });
+
+    // Sort by lastMessageAt descending (most recent first)
+    result.sort((a, b) => b.lastMessageAt - a.lastMessageAt);
+    return result;
+  }
+
+  /** F032 P1-2 fix: Update participant activity on every message */
+  async updateParticipantActivity(threadId: string, agentId: AgentId, healthy?: boolean): Promise<void> {
+    // Cloud Codex P2 fix: Use Lua script to atomically check thread existence
+    // and update activity with TTL refresh.
+    const detailKey = ThreadKeys.detail(threadId);
+    const participantsKey = ThreadKeys.participants(threadId);
+    const activityKey = ThreadKeys.activity(threadId);
+    const now = Date.now();
+    const ttl = this.ttlSeconds ?? -1;
+
+    await this.redis.eval(
+      UPDATE_ACTIVITY_IF_DETAIL_HAS_ID_LUA,
+      3,
+      detailKey,
+      participantsKey,
+      activityKey,
+      agentId,
+      String(now),
+      String(ttl),
+      healthy === false ? '0' : '1',
+    );
+  }
+
+  async updateTitle(threadId: string, title: string): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    await this.setDetailFields(key, 'title', title);
+  }
+
+  async updateProjectPath(threadId: string, projectPath: string): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    await this.setDetailFields(key, 'projectPath', projectPath);
+  }
+
+  async updatePin(threadId: string, pinned: boolean): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    await this.setDetailFields(key, 'pinned', String(pinned), 'pinnedAt', pinned ? String(Date.now()) : '0');
+  }
+
+  async updateFavorite(threadId: string, favorited: boolean): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    await this.setDetailFields(
+      key,
+      'favorited',
+      String(favorited),
+      'favoritedAt',
+      favorited ? String(Date.now()) : '0',
+    );
+  }
+
+  async updateThinkingMode(threadId: string, mode: 'debug' | 'play'): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    await this.setDetailFields(key, 'thinkingMode', mode);
+  }
+
+  async updateMentionActionabilityMode(threadId: string, mode: MentionActionabilityMode): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    // strict is default behavior; clearing keeps storage backward-compatible.
+    if (mode === 'strict') {
+      await this.deleteDetailFields(key, 'mentionActionabilityMode');
+      return;
+    }
+    await this.setDetailFields(key, 'mentionActionabilityMode', mode);
+  }
+
+  async updatePreferredAgents(threadId: string, agentIds: AgentId[]): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    // R5 fix: dedupe at write time to prevent duplicate invocations
+    const unique = [...new Set(agentIds)];
+    // Store as JSON array string; empty array → remove field
+    if (unique.length > 0) {
+      await this.setDetailFields(key, 'preferredAgents', JSON.stringify(unique));
+    } else {
+      // Remove the field entirely (clear preference)
+      await this.deleteDetailFields(key, 'preferredAgents');
+    }
+  }
+
+  async updatePhase(threadId: string, phase: ThreadPhase): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    await this.setDetailFields(key, 'phase', phase);
+  }
+
+  async linkBacklogItem(threadId: string, backlogItemId: string): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    await this.setDetailFields(key, 'backlogItemId', backlogItemId);
+  }
+
+  async setMentionRoutingFeedback(
+    threadId: string,
+    agentId: AgentId,
+    feedback: ThreadMentionRoutingFeedback,
+  ): Promise<void> {
+    const detailKey = ThreadKeys.detail(threadId);
+    const exists = await this.redis.hexists(detailKey, 'id');
+    if (exists === 0) return;
+
+    const feedbackKey = ThreadKeys.mentionRoutingFeedback(threadId);
+    await this.redis.hset(feedbackKey, agentId, JSON.stringify(feedback));
+    if (this.ttlSeconds !== null) {
+      await this.redis.expire(feedbackKey, this.ttlSeconds);
+    }
+  }
+
+  async consumeMentionRoutingFeedback(
+    threadId: string,
+    agentId: AgentId,
+  ): Promise<ThreadMentionRoutingFeedback | null> {
+    const feedbackKey = ThreadKeys.mentionRoutingFeedback(threadId);
+    const raw = (await this.redis.eval(HGETDEL_LUA, 1, feedbackKey, agentId)) as string | null;
+    if (!raw) return null;
+
+    try {
+      const parsed = JSON.parse(raw) as ThreadMentionRoutingFeedback;
+      if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.items)) {
+        return null;
+      }
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  async updateRoutingPolicy(threadId: string, policy: ThreadRoutingPolicyV1 | null): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    const scopes = policy?.scopes;
+    const hasScopes = scopes && Object.keys(scopes).length > 0;
+
+    if (!policy || policy.v !== 1 || !hasScopes) {
+      await this.deleteDetailFields(key, 'routingPolicy');
+      return;
+    }
+
+    await this.setDetailFields(key, 'routingPolicy', JSON.stringify(policy));
+  }
+
+  async getThreadMemory(threadId: string): Promise<ThreadMemoryV1 | null> {
+    const key = ThreadKeys.detail(threadId);
+    const raw = await this.redis.hget(key, 'threadMemory');
+    if (!raw) return null;
+    return parseThreadMemoryJson(raw);
+  }
+
+  async updateThreadMemory(threadId: string, memory: ThreadMemoryV1): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    await this.setDetailFields(key, 'threadMemory', JSON.stringify(memory));
+  }
+
+  async getVotingState(threadId: string): Promise<VotingStateV1 | null> {
+    const key = ThreadKeys.detail(threadId);
+    const raw = await this.redis.hget(key, 'votingState');
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as VotingStateV1;
+    } catch {
+      return null;
+    }
+  }
+
+  async updateVotingState(threadId: string, state: VotingStateV1 | null): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    if (state === null) {
+      await this.deleteDetailFields(key, 'votingState');
+    } else {
+      await this.setDetailFields(key, 'votingState', JSON.stringify(state));
+    }
+  }
+
+  async updateBootcampState(threadId: string, state: BootcampStateV1 | null): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    if (state === null) {
+      await this.deleteDetailFields(key, 'bootcampState');
+    } else {
+      await this.setDetailFields(key, 'bootcampState', JSON.stringify(state));
+    }
+  }
+
+  async updateFirstRunQuestState(
+    threadId: string,
+    state: import('../ports/ThreadStore.js').FirstRunQuestStateV1 | null,
+  ): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    if (state === null) {
+      await this.redis.hdel(key, 'firstRunQuestState');
+    } else {
+      await this.redis.eval(HSET_IF_HAS_ID_LUA, 1, key, 'firstRunQuestState', JSON.stringify(state));
+    }
+  }
+
+  async updateSystemKind(threadId: string, kind: 'connector_hub' | 'eval_domain' | null): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    if (kind === null) {
+      await this.deleteDetailFields(key, 'systemKind');
+    } else {
+      await this.setDetailFields(key, 'systemKind', kind);
+    }
+  }
+
+  /** F229: Set or clear threadKind marker for concierge thread. */
+  async updateThreadKind(threadId: string, kind: 'concierge' | null): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    if (kind === null) {
+      await this.deleteDetailFields(key, 'threadKind');
+    } else {
+      await this.setDetailFields(key, 'threadKind', kind);
+    }
+  }
+
+  async updateConnectorHubState(threadId: string, state: ConnectorHubStateV1 | null): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    if (state === null) {
+      await this.deleteDetailFields(key, 'connectorHubState');
+    } else {
+      await this.setDetailFields(key, 'connectorHubState', JSON.stringify(state));
+    }
+  }
+
+  async updatePreferredWorkspaceMode(
+    threadId: string,
+    mode: 'dev' | 'recall' | 'schedule' | 'tasks' | 'community' | 'artifacts' | null,
+  ): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    if (mode === null) {
+      await this.deleteDetailFields(key, 'preferredWorkspaceMode');
+    } else {
+      await this.setDetailFields(key, 'preferredWorkspaceMode', mode);
+    }
+  }
+
+  async updateBubbleDisplay(
+    threadId: string,
+    field: 'bubbleThinking' | 'bubbleCli',
+    value: 'global' | 'expanded' | 'collapsed',
+  ): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    if (value === 'global') {
+      await this.deleteDetailFields(key, field);
+    } else {
+      await this.setDetailFields(key, field, value);
+    }
+  }
+
+  async updateVoiceMode(threadId: string, voiceMode: boolean): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    if (voiceMode) {
+      await this.setDetailFields(key, 'voiceMode', '1');
+    } else {
+      await this.deleteDetailFields(key, 'voiceMode');
+    }
+  }
+
+  async updateLastActive(threadId: string): Promise<void> {
+    const now = String(Date.now());
+    const key = ThreadKeys.detail(threadId);
+    const updated = (await this.redis.eval(HSET_IF_HAS_ID_LUA, 1, key, 'lastActiveAt', now)) as number;
+    if (updated === 0) return;
+
+    // Update score in all user lists that contain this thread
+    const createdBy = await this.redis.hget(key, 'createdBy');
+    if (createdBy) {
+      await this.redis.zadd(ThreadKeys.userList(createdBy), now, threadId);
+      await this.applyKeyRetention([key, ThreadKeys.userList(createdBy)]);
+    }
+  }
+
+  /** F128: List child threads that have this thread as parentThreadId. Pipeline to avoid N+1. */
+  async getChildThreads(parentThreadId: string): Promise<Thread[]> {
+    const childIds = await this.redis.zrange(ThreadKeys.children(parentThreadId), 0, -1);
+    if (!childIds.length) return [];
+    // Pipeline: fetch all thread hashes + participant sets in one round-trip
+    const pipeline = this.redis.multi();
+    for (const id of childIds) {
+      pipeline.hgetall(ThreadKeys.detail(id));
+      pipeline.smembers(ThreadKeys.participants(id));
+    }
+    const results = await pipeline.exec();
+    if (!results) return [];
+    const children: Thread[] = [];
+    for (let i = 0; i < childIds.length; i++) {
+      const dataResult = results[i * 2];
+      const membersResult = results[i * 2 + 1];
+      if (!dataResult || dataResult[0]) continue; // error
+      const data = dataResult[1] as Record<string, string>;
+      if (!data || !data.id) continue;
+      const thread = this.hydrateThread(data);
+      thread.participants = ((membersResult?.[1] as string[]) ?? []) as import('@agent-studio/shared').AgentId[];
+      if (!thread.deletedAt) children.push(thread);
+    }
+    return children;
+  }
+
+  /** F095 Phase D: Soft-delete — set deletedAt timestamp. */
+  async softDelete(threadId: string): Promise<boolean> {
+    if (threadId === DEFAULT_THREAD_ID) return false;
+    const key = ThreadKeys.detail(threadId);
+    const existing = await this.redis.hget(key, 'id');
+    if (!existing) return false;
+    // Already soft-deleted?
+    const existingDeletedAt = await this.redis.hget(key, 'deletedAt');
+    if (existingDeletedAt && parseInt(existingDeletedAt, 10) > 0) return false;
+    await this.redis.hset(key, 'deletedAt', String(Date.now()));
+    // P3-4: Remove from parent's children index
+    const parentId = await this.redis.hget(key, 'parentThreadId');
+    if (parentId) {
+      await this.redis.zrem(ThreadKeys.children(parentId), threadId);
+    }
+    await this.applyKeyRetention([key]);
+    return true;
+  }
+
+  /** F095 Phase D: Restore a soft-deleted thread. */
+  async restore(threadId: string): Promise<boolean> {
+    const key = ThreadKeys.detail(threadId);
+    const existing = await this.redis.hget(key, 'id');
+    if (!existing) return false;
+    const existingDeletedAt = await this.redis.hget(key, 'deletedAt');
+    if (!existingDeletedAt || parseInt(existingDeletedAt, 10) <= 0) return false;
+    await this.redis.hset(key, 'deletedAt', '0');
+    // P2 (Codex review): softDelete strips the child from its parent's children ZSET; restore
+    // must put it back so getChildThreads() stays consistent after a soft-delete/restore cycle.
+    const [parentId, createdAt] = await Promise.all([
+      this.redis.hget(key, 'parentThreadId'),
+      this.redis.hget(key, 'createdAt'),
+    ]);
+    if (parentId) {
+      const score = createdAt && parseInt(createdAt, 10) > 0 ? createdAt : String(Date.now());
+      await this.redis.zadd(ThreadKeys.children(parentId), score, threadId);
+      if (this.ttlSeconds !== null) {
+        await this.redis.expire(ThreadKeys.children(parentId), this.ttlSeconds);
+      }
+    }
+    await this.applyKeyRetention([key]);
+    return true;
+  }
+
+  /** F192 cloud-review P1: Index a system thread into a user's sidebar list. */
+  async indexForUser(threadId: string, userId: string): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    const existing = await this.redis.hget(key, 'id');
+    if (!existing) return;
+    const lastActiveAt = (await this.redis.hget(key, 'lastActiveAt')) ?? String(Date.now());
+    await this.redis.zadd(ThreadKeys.userList(userId), lastActiveAt, threadId);
+    await this.applyKeyRetention([ThreadKeys.userList(userId)]);
+  }
+
+  /** F095 Phase D: List soft-deleted threads (trash bin). */
+  async listDeleted(userId: string): Promise<Thread[]> {
+    const ids = await this.loadUserThreadIds(userId);
+    const threads: Thread[] = [];
+    for (const id of ids) {
+      const thread = await this.get(id);
+      if (thread?.deletedAt) {
+        threads.push(thread);
+      }
+    }
+    threads.sort((a, b) => (b.deletedAt ?? 0) - (a.deletedAt ?? 0));
+    return threads;
+  }
+
+  async delete(threadId: string): Promise<boolean> {
+    if (threadId === DEFAULT_THREAD_ID) return false;
+
+    const key = ThreadKeys.detail(threadId);
+    const createdBy = await this.redis.hget(key, 'createdBy');
+
+    // Atomic Lua: DEL + tombstone in one round-trip — no race window for
+    // get() → recoverThreadFromMessages() to resurrect between DEL and SET.
+    const keys: string[] = [
+      key,
+      ThreadKeys.participants(threadId),
+      ThreadKeys.activity(threadId),
+      ThreadKeys.mentionRoutingFeedback(threadId),
+      ThreadKeys.tombstone(threadId),
+    ];
+    if (createdBy) {
+      keys.push(ThreadKeys.userList(createdBy));
+    }
+    const result = await this.redis.eval(DELETE_THREAD_LUA, keys.length, ...keys, threadId);
+    return (result as number) > 0;
+  }
+
+  private async createDefaultThread(): Promise<Thread> {
+    const now = Date.now();
+    const thread: Thread = {
+      id: DEFAULT_THREAD_ID,
+      projectPath: 'default',
+      title: null,
+      createdBy: 'system',
+      participants: [],
+      lastActiveAt: now,
+      createdAt: now,
+    };
+
+    const key = ThreadKeys.detail(DEFAULT_THREAD_ID);
+    await this.redis.hset(key, this.serializeThread(thread));
+    if (this.ttlSeconds !== null) {
+      await this.redis.expire(key, this.ttlSeconds);
+    }
+    return thread;
+  }
+
+  private async loadUserThreadIds(userId: string): Promise<string[]> {
+    let ids = await this.redis.zrevrange(ThreadKeys.userList(userId), 0, -1);
+    if (!this.canAttemptListRepair(userId, ids.length)) {
+      return ids;
+    }
+
+    this.lastListRepairAt.set(userId, Date.now());
+    const repaired = await this.repairIndex(userId);
+    if (repaired.repairedMembers === 0) {
+      return ids;
+    }
+    ids = await this.redis.zrevrange(ThreadKeys.userList(userId), 0, -1);
+    return ids;
+  }
+
+  private canAttemptListRepair(userId: string, indexedCount: number): boolean {
+    if (indexedCount > 1) return false;
+    const lastAttempt = this.lastListRepairAt.get(userId) ?? 0;
+    return Date.now() - lastAttempt >= RedisThreadStore.LIST_REPAIR_COOLDOWN_MS;
+  }
+
+  private async collectIndexedThreadsFromDetails(userId?: string): Promise<Map<string, Map<string, number>>> {
+    const matchPattern = `${this.keyPrefix}${ThreadKeys.detail('thread_*')}`;
+    let cursor = '0';
+    const indexedByUser = new Map<string, Map<string, number>>();
+
+    do {
+      const [nextCursor, rawKeys] = (await this.redis.scan(cursor, 'MATCH', matchPattern, 'COUNT', 200)) as [
+        string,
+        string[],
+      ];
+      cursor = nextCursor;
+
+      const detailKeys = rawKeys
+        .map((rawKey) => this.stripKeyPrefix(rawKey))
+        .filter((key) => /^thread:thread_[^:]+$/.test(key));
+      if (detailKeys.length === 0) continue;
+
+      const pipeline = this.redis.multi();
+      for (const key of detailKeys) {
+        pipeline.hgetall(key);
+      }
+      const results = await pipeline.exec();
+
+      for (let i = 0; i < detailKeys.length; i += 1) {
+        const data = results?.[i]?.[1];
+        if (!data || typeof data !== 'object') continue;
+        const hash = data as Record<string, string>;
+        if (!hash.id || !hash.createdBy || hash.createdBy === 'system') continue;
+        if (userId && hash.createdBy !== userId) continue;
+
+        const lastActiveAt = parseInt(hash.lastActiveAt ?? '0', 10);
+        const score = Number.isFinite(lastActiveAt) ? lastActiveAt : 0;
+        let members = indexedByUser.get(hash.createdBy);
+        if (!members) {
+          members = new Map<string, number>();
+          indexedByUser.set(hash.createdBy, members);
+        }
+        members.set(hash.id, score);
+      }
+    } while (cursor !== '0');
+
+    return indexedByUser;
+  }
+
+  private async recoverThreadFromMessages(threadId: string): Promise<Thread | null> {
+    // Don't resurrect intentionally hard-deleted threads
+    const tombstone = await this.redis.get(ThreadKeys.tombstone(threadId));
+    if (tombstone) return null;
+
+    const timelineKey = MessageKeys.thread(threadId);
+    const [firstIds, lastIds] = await Promise.all([
+      this.redis.zrange(timelineKey, 0, 4),
+      this.redis.zrevrange(timelineKey, 0, 4),
+    ]);
+    if (firstIds.length === 0 && lastIds.length === 0) {
+      return null;
+    }
+
+    const candidateIds = [...new Set([...firstIds, ...lastIds])];
+    const candidateMessages = await this.loadMessageSnapshots(candidateIds);
+    const firstMessage = firstIds.map((id) => candidateMessages.get(id)).find((msg) => msg !== null);
+    const lastMessage = lastIds.map((id) => candidateMessages.get(id)).find((msg) => msg !== null);
+    if (!firstMessage || !lastMessage) {
+      return null;
+    }
+
+    const participants = await this.recoverParticipants(threadId, candidateIds, candidateMessages);
+    const recovered: Thread = {
+      id: threadId,
+      projectPath: 'default',
+      title: this.deriveRecoveredTitle(firstMessage.content),
+      createdBy: firstMessage.userId,
+      participants,
+      createdAt: firstMessage.timestamp,
+      lastActiveAt: lastMessage.timestamp,
+      thinkingMode: 'debug',
+    };
+
+    const detailKey = ThreadKeys.detail(threadId);
+    const participantsKey = ThreadKeys.participants(threadId);
+    const userListKey = ThreadKeys.userList(recovered.createdBy);
+    const pipeline = this.redis.multi();
+    pipeline.hset(detailKey, this.serializeThread(recovered));
+    pipeline.zadd(userListKey, String(recovered.lastActiveAt), threadId);
+    if (participants.length > 0) {
+      pipeline.sadd(participantsKey, ...participants);
+    }
+    await pipeline.exec();
+    await this.applyKeyRetention([detailKey, participantsKey, userListKey]);
+    return recovered;
+  }
+
+  private async loadMessageSnapshots(messageIds: string[]): Promise<Map<string, RecoveredMessageSnapshot | null>> {
+    if (messageIds.length === 0) return new Map();
+    const pipeline = this.redis.multi();
+    for (const messageId of messageIds) {
+      pipeline.hgetall(MessageKeys.detail(messageId));
+    }
+    const results = await pipeline.exec();
+    const snapshots = new Map<string, RecoveredMessageSnapshot | null>();
+    for (let i = 0; i < messageIds.length; i += 1) {
+      const data = results?.[i]?.[1];
+      if (!data || typeof data !== 'object') {
+        snapshots.set(messageIds[i], null);
+        continue;
+      }
+      const hash = data as Record<string, string>;
+      if (!hash.id || !hash.userId) {
+        snapshots.set(messageIds[i], null);
+        continue;
+      }
+      snapshots.set(messageIds[i], {
+        id: hash.id,
+        userId: hash.userId,
+        agentId: hash.agentId || null,
+        content: hash.content ?? '',
+        timestamp: parseInt(hash.timestamp ?? '0', 10),
+      });
+    }
+    return snapshots;
+  }
+
+  private async recoverParticipants(
+    threadId: string,
+    messageIds: string[],
+    candidateMessages: Map<string, RecoveredMessageSnapshot | null>,
+  ): Promise<AgentId[]> {
+    const activityData = await this.redis.hgetall(ThreadKeys.activity(threadId));
+    const fromActivity = [
+      ...new Set(
+        Object.keys(activityData)
+          .map((key) => key.split(':')[0])
+          .filter(Boolean),
+      ),
+    ];
+    if (fromActivity.length > 0) {
+      return fromActivity as AgentId[];
+    }
+
+    const fromMessages = messageIds
+      .map((id) => candidateMessages.get(id))
+      .filter((message): message is RecoveredMessageSnapshot => Boolean(message?.agentId))
+      .map((message) => message.agentId as AgentId);
+    return [...new Set(fromMessages)];
+  }
+
+  private deriveRecoveredTitle(content: string): string | null {
+    const normalized = content.trim();
+    if (!normalized) return null;
+    return normalized.length > 30 ? `${normalized.slice(0, 30)}...` : normalized;
+  }
+
+  private async applyKeyRetention(keys: string[]): Promise<void> {
+    const uniqueKeys = [...new Set(keys.filter(Boolean))];
+    if (uniqueKeys.length === 0) return;
+    const pipeline = this.redis.multi();
+    for (const key of uniqueKeys) {
+      if (this.ttlSeconds === null) {
+        pipeline.persist(key);
+      } else {
+        pipeline.expire(key, this.ttlSeconds);
+      }
+    }
+    await pipeline.exec();
+  }
+
+  private async setDetailFields(key: string, ...fields: string[]): Promise<void> {
+    const updated = (await this.redis.eval(HSET_IF_HAS_ID_LUA, 1, key, ...fields)) as number;
+    if (updated === 0) return;
+    await this.applyKeyRetention([key]);
+  }
+
+  private async deleteDetailFields(key: string, ...fields: string[]): Promise<void> {
+    if (fields.length === 0) return;
+    await this.redis.hdel(key, ...fields);
+    await this.applyKeyRetention([key]);
+  }
+
+  private get keyPrefix(): string {
+    return (this.redis.options as { keyPrefix?: string }).keyPrefix ?? '';
+  }
+
+  private stripKeyPrefix(rawKey: string): string {
+    const prefix = this.keyPrefix;
+    return prefix && rawKey.startsWith(prefix) ? rawKey.slice(prefix.length) : rawKey;
+  }
+
+  private serializeThread(thread: Thread): Record<string, string> {
+    const result: Record<string, string> = {
+      id: thread.id,
+      projectPath: thread.projectPath,
+      title: thread.title ?? '',
+      createdBy: thread.createdBy,
+      lastActiveAt: String(thread.lastActiveAt),
+      createdAt: String(thread.createdAt),
+      pinned: String(thread.pinned ?? false),
+      pinnedAt: String(thread.pinnedAt ?? 0),
+      favorited: String(thread.favorited ?? false),
+      favoritedAt: String(thread.favoritedAt ?? 0),
+      thinkingMode: thread.thinkingMode ?? 'debug',
+    };
+    if (thread.phase) {
+      result.phase = thread.phase;
+    }
+    if (thread.backlogItemId) {
+      result.backlogItemId = thread.backlogItemId;
+    }
+    if (thread.preferredAgents && thread.preferredAgents.length > 0) {
+      result.preferredAgents = JSON.stringify(thread.preferredAgents);
+    }
+    if (thread.mentionActionabilityMode === 'relaxed') {
+      result.mentionActionabilityMode = 'relaxed';
+    }
+    if (thread.routingPolicy) {
+      result.routingPolicy = JSON.stringify(thread.routingPolicy);
+    }
+    if (thread.threadMemory) {
+      result.threadMemory = JSON.stringify(thread.threadMemory);
+    }
+    if (thread.voiceMode) {
+      result.voiceMode = '1';
+    }
+    if (thread.deletedAt) {
+      result.deletedAt = String(thread.deletedAt);
+    }
+    if (thread.bootcampState) {
+      result.bootcampState = JSON.stringify(thread.bootcampState);
+    }
+    // F128: Parent thread for orchestration tracking
+    if (thread.parentThreadId) {
+      result.parentThreadId = thread.parentThreadId;
+    }
+    // F128: Proposal audit metadata (only present on threads created via approve flow)
+    if (thread.createdFromProposalId) {
+      result.createdFromProposalId = thread.createdFromProposalId;
+    }
+    if (thread.sourceThreadId) {
+      result.sourceThreadId = thread.sourceThreadId;
+    }
+    if (thread.approvedBy) {
+      result.approvedBy = thread.approvedBy;
+    }
+    if (thread.approvedAt) {
+      result.approvedAt = String(thread.approvedAt);
+    }
+    if (thread.firstRunQuestState) {
+      result.firstRunQuestState = JSON.stringify(thread.firstRunQuestState);
+    }
+    if (thread.systemKind) {
+      result.systemKind = thread.systemKind;
+    }
+    if (thread.connectorHubState) {
+      result.connectorHubState = JSON.stringify(thread.connectorHubState);
+    }
+    if (thread.externalRuntimeAnchorState) {
+      result.externalRuntimeAnchorState = JSON.stringify(thread.externalRuntimeAnchorState);
+    }
+    if (thread.preferredWorkspaceMode) {
+      result.preferredWorkspaceMode = thread.preferredWorkspaceMode;
+    }
+    if (thread.labels && thread.labels.length > 0) {
+      result.labels = JSON.stringify(thread.labels);
+    }
+    // F229: Concierge thread marker (set separately via updateThreadKind; also persisted here for
+    // cold-create paths where the full thread object is serialized before updateThreadKind is called)
+    if (thread.threadKind) {
+      result.threadKind = thread.threadKind;
+    }
+    return result;
+  }
+
+  private hydrateThread(data: Record<string, string>): Thread {
+    const pinnedAt = parseInt(data.pinnedAt ?? '0', 10);
+    const favoritedAt = parseInt(data.favoritedAt ?? '0', 10);
+    const result: Thread = {
+      id: data.id ?? '',
+      projectPath: data.projectPath ?? 'default',
+      title: data.title || null,
+      createdBy: data.createdBy ?? 'unknown',
+      participants: [], // Loaded separately from Set
+      lastActiveAt: parseInt(data.lastActiveAt ?? '0', 10),
+      createdAt: parseInt(data.createdAt ?? '0', 10),
+      pinned: data.pinned === 'true',
+      pinnedAt: pinnedAt || null,
+      favorited: data.favorited === 'true',
+      favoritedAt: favoritedAt || null,
+      thinkingMode: (data.thinkingMode === 'debug' ? 'debug' : 'play') as 'debug' | 'play',
+    };
+    if (data.mentionActionabilityMode === 'relaxed') {
+      result.mentionActionabilityMode = 'relaxed';
+    }
+    const phase = this.parsePhase(data.phase);
+    if (phase) {
+      result.phase = phase;
+    }
+    if (data.backlogItemId) {
+      result.backlogItemId = data.backlogItemId;
+    }
+    if (data.preferredAgents) {
+      try {
+        const parsed = JSON.parse(data.preferredAgents);
+        // Cloud P1: guard against valid-but-non-array JSON (e.g. '{}', '"str"')
+        if (Array.isArray(parsed)) {
+          result.preferredAgents = parsed as AgentId[];
+        }
+      } catch {
+        /* ignore malformed JSON — treat as no preference */
+      }
+    }
+
+    if (data.routingPolicy) {
+      try {
+        const parsed = JSON.parse(data.routingPolicy);
+        // Minimal validation: object with v===1
+        if (parsed && typeof parsed === 'object' && parsed.v === 1) {
+          result.routingPolicy = parsed as ThreadRoutingPolicyV1;
+        }
+      } catch {
+        /* ignore malformed JSON — treat as no policy */
+      }
+    }
+    if (data.threadMemory) {
+      const mem = parseThreadMemoryJson(data.threadMemory);
+      if (mem) result.threadMemory = mem;
+    }
+    if (data.voiceMode === '1') {
+      result.voiceMode = true;
+    }
+    if (data.bubbleThinking === 'expanded' || data.bubbleThinking === 'collapsed') {
+      result.bubbleThinking = data.bubbleThinking;
+    }
+    if (data.bubbleCli === 'expanded' || data.bubbleCli === 'collapsed') {
+      result.bubbleCli = data.bubbleCli;
+    }
+    const deletedAt = parseInt(data.deletedAt ?? '0', 10);
+    if (deletedAt > 0) {
+      result.deletedAt = deletedAt;
+    }
+    if (data.bootcampState) {
+      try {
+        const parsed = JSON.parse(data.bootcampState);
+        if (parsed && typeof parsed === 'object' && parsed.v === 1) {
+          result.bootcampState = parsed as BootcampStateV1;
+        }
+      } catch {
+        /* ignore malformed JSON */
+      }
+    }
+    // F128: Parent thread for orchestration tracking
+    if (data.parentThreadId) {
+      result.parentThreadId = data.parentThreadId;
+    }
+    // F128: Proposal audit metadata
+    if (data.createdFromProposalId) {
+      result.createdFromProposalId = data.createdFromProposalId;
+    }
+    if (data.sourceThreadId) {
+      result.sourceThreadId = data.sourceThreadId;
+    }
+    if (data.approvedBy) {
+      result.approvedBy = data.approvedBy;
+    }
+    const approvedAt = parseInt(data.approvedAt ?? '0', 10);
+    if (approvedAt > 0) {
+      result.approvedAt = approvedAt;
+    }
+    if (data.firstRunQuestState) {
+      try {
+        const parsed = JSON.parse(data.firstRunQuestState);
+        if (parsed && typeof parsed === 'object' && parsed.v === 1) {
+          result.firstRunQuestState = parsed as import('../ports/ThreadStore.js').FirstRunQuestStateV1;
+        }
+      } catch {
+        /* ignore malformed JSON */
+      }
+    }
+    if (data.systemKind && (data.systemKind === 'connector_hub' || data.systemKind === 'eval_domain')) {
+      result.systemKind = data.systemKind as 'connector_hub' | 'eval_domain';
+    }
+    if (data.connectorHubState) {
+      try {
+        const parsed = JSON.parse(data.connectorHubState);
+        if (parsed && typeof parsed === 'object' && parsed.v === 1) {
+          result.connectorHubState = parsed as ConnectorHubStateV1;
+        }
+      } catch {
+        /* ignore malformed JSON */
+      }
+    }
+    if (data.externalRuntimeAnchorState) {
+      try {
+        const parsed = JSON.parse(data.externalRuntimeAnchorState);
+        if (
+          parsed &&
+          typeof parsed === 'object' &&
+          parsed.v === 1 &&
+          parsed.runtime === 'antigravity-desktop' &&
+          typeof parsed.userId === 'string' &&
+          typeof parsed.createdAt === 'number'
+        ) {
+          result.externalRuntimeAnchorState = parsed;
+        }
+      } catch {
+        /* ignore malformed JSON */
+      }
+    }
+    const validModes = new Set(['dev', 'recall', 'schedule', 'tasks', 'community', 'artifacts']);
+    if (data.preferredWorkspaceMode && validModes.has(data.preferredWorkspaceMode)) {
+      result.preferredWorkspaceMode = data.preferredWorkspaceMode as Thread['preferredWorkspaceMode'];
+    }
+    if (data.labels) {
+      try {
+        const parsed = JSON.parse(data.labels);
+        if (Array.isArray(parsed)) {
+          result.labels = parsed as string[];
+        }
+      } catch {
+        /* ignore malformed JSON */
+      }
+    }
+    // F229: Restore concierge thread marker (written by updateThreadKind; validate value)
+    if (data.threadKind === 'concierge') {
+      result.threadKind = 'concierge';
+    }
+    return result;
+  }
+
+  async updateLabels(threadId: string, labelIds: string[]): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    await this.redis.hset(key, { labels: JSON.stringify(labelIds) });
+  }
+
+  async updateMemberSessionStrategy(
+    threadId: string,
+    agentId: string,
+    strategy: 'resume' | 'reborn' | null,
+  ): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    if (strategy === null || strategy === 'resume') {
+      await this.redis.hdel(key, `memberSS:${agentId}`);
+    } else {
+      await this.redis.hset(key, { [`memberSS:${agentId}`]: strategy });
+      // #836 P2: Clear stale pending continuations when switching to reborn.
+      // Capsules sealed before the reborn period contain pre-reborn session
+      // context; consuming them after reborn is cleared would resume from
+      // stale state. Lua script atomically scans and deletes matching fields.
+      if (strategy === 'reborn') {
+        const prefix = `pendCont:${agentId}:`;
+        await this.redis.eval(
+          `local cursor = "0"
+           repeat
+             local r = redis.call("HSCAN", KEYS[1], cursor, "MATCH", ARGV[1])
+             cursor = r[1]
+             local data = r[2]
+             for i = 1, #data, 2 do
+               redis.call("HDEL", KEYS[1], data[i])
+             end
+           until cursor == "0"`,
+          1,
+          key,
+          `${prefix}*`,
+        );
+      }
+    }
+  }
+
+  /** #836: Check if agent uses reborn strategy in this thread. */
+  async getMemberSessionStrategy(
+    threadId: string,
+    agentId: string,
+    _userId: string,
+  ): Promise<'resume' | 'reborn' | undefined> {
+    const key = ThreadKeys.detail(threadId);
+    const raw = await this.redis.hget(key, `memberSS:${agentId}`);
+    return raw === 'resume' || raw === 'reborn' ? raw : undefined;
+  }
+
+  async isRebornSession(threadId: string, agentId: string): Promise<boolean> {
+    const key = ThreadKeys.detail(threadId);
+    const raw = await this.redis.hget(key, `memberSS:${agentId}`);
+    return raw === 'reborn';
+  }
+
+  async setPendingContinuation(
+    threadId: string,
+    agentId: string,
+    userId: string,
+    entry: { capsule: Record<string, unknown>; createdAt: number },
+  ): Promise<void> {
+    // #813 P2 fix: per-agent hash field (atomic HSET, no read-modify-write race).
+    // Cloud Codex P1: scope by userId to prevent cross-user continuation leakage
+    // in shared threads. Field key: `pendCont:<agentId>:<userId>`.
+    const key = ThreadKeys.detail(threadId);
+    await this.redis.hset(key, { [`pendCont:${agentId}:${userId}`]: JSON.stringify(entry) });
+  }
+
+  async consumePendingContinuation(
+    threadId: string,
+    agentId: string,
+    userId: string,
+  ): Promise<{ capsule: Record<string, unknown>; createdAt: number } | null> {
+    // Cloud Codex P2: atomic read-and-delete via Lua script to prevent
+    // concurrent same-thread/agent/user invocations from both consuming the capsule.
+    const key = ThreadKeys.detail(threadId);
+    const field = `pendCont:${agentId}:${userId}`;
+    const raw = (await this.redis.eval(
+      `local v = redis.call('hget', KEYS[1], ARGV[1])
+       if v then redis.call('hdel', KEYS[1], ARGV[1]) end
+       return v`,
+      1,
+      key,
+      field,
+    )) as string | null;
+    if (!raw) return null;
+    return JSON.parse(raw) as { capsule: Record<string, unknown>; createdAt: number };
+  }
+
+  private parsePhase(raw: string | undefined): ThreadPhase | undefined {
+    if (!raw) return undefined;
+    if (raw === 'coding' || raw === 'research' || raw === 'brainstorm') {
+      return raw;
+    }
+    return undefined;
+  }
+}
+
+type RecoveredMessageSnapshot = {
+  id: string;
+  userId: string;
+  agentId: string | null;
+  content: string;
+  timestamp: number;
+};

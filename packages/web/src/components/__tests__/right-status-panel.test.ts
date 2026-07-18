@@ -1,0 +1,367 @@
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { describe, expect, it, vi } from 'vitest';
+import { RightStatusPanel, type RightStatusPanelProps } from '@/components/RightStatusPanel';
+
+const TEST_CATS = [
+  {
+    id: 'opus',
+    displayName: 'Ethan（任务主控与实现）',
+    color: { primary: '#9B7EBD', secondary: '#E8D5F5' },
+    mentionPatterns: ['@opus'],
+    clientId: 'anthropic',
+    defaultModel: 'claude-opus-4-6',
+    avatar: '',
+    roleDescription: '',
+    personality: '',
+  },
+  {
+    id: 'codex',
+    displayName: 'Owen（验证与审查）',
+    color: { primary: '#5B8C5A', secondary: '#D5E8D4' },
+    mentionPatterns: ['@codex'],
+    clientId: 'openai',
+    defaultModel: 'gpt-5.5',
+    avatar: '',
+    roleDescription: '',
+    personality: '',
+  },
+];
+
+vi.mock('@/hooks/useAgentData', () => ({
+  formatAgentName: (agent: { displayName: string; variantLabel?: string }) =>
+    agent.variantLabel ? `${agent.displayName}（${agent.variantLabel}）` : agent.displayName,
+  useAgentData: () => ({
+    agents: TEST_CATS,
+    isLoading: false,
+    hasFetched: true,
+    getAgentById: (id: string) => TEST_CATS.find((agent) => agent.id === id),
+    getAgentsByRole: () => new Map(),
+    refresh: async () => TEST_CATS,
+  }),
+}));
+
+function render(props: RightStatusPanelProps): string {
+  return renderToStaticMarkup(React.createElement(RightStatusPanel, props));
+}
+
+describe('RightStatusPanel', () => {
+  it('renders status title, mode, and active agents', () => {
+    const html = render({
+      intentMode: 'execute',
+      targetAgents: ['opus', 'codex'],
+      agentStatuses: {
+        opus: 'streaming',
+        codex: 'done',
+      },
+      agentInvocations: {},
+      threadId: 'test-thread',
+      messageSummary: {
+        total: 12,
+        assistant: 7,
+        system: 3,
+        evidence: 2,
+        followup: 1,
+      },
+    });
+
+    expect(html).toContain('状态栏');
+    expect(html).toContain('当前模式');
+    expect(html).toContain('执行');
+    expect(html).toContain('角色状态');
+    expect(html).toContain('消息统计');
+    expect(html).toContain('Ethan（任务主控与实现）');
+    expect(html).toContain('Owen（验证与审查）');
+    expect(html).toContain('12');
+  });
+
+  it('AC-Z15 R7: ideate mode preserves targetAgents UNION across all panels (cloud Codex P2)', () => {
+    // co-creator alpha catch + cloud Codex round-3 P2: ideate 多角色场景下 ParallelStatusBar
+    // 用 UNION 显示，但 RightStatusPanel/MobileStatusSheet 用 slot-first，agent 完成清 slot 后
+    // 卡片消失 → 跨 panel state coherence regression（顶部双卡，侧边/移动端单卡）。
+    // 修法：所有 panel 都把 intentMode 传给 deriveActiveAgents，UNION 全程一致。
+    const html = render({
+      intentMode: 'ideate',
+      targetAgents: ['opus', 'codex'],
+      agentStatuses: { opus: 'streaming', codex: 'done' },
+      agentInvocations: {},
+      activeInvocations: {
+        'inv-opus-1': { agentId: 'opus', mode: 'ideate' },
+        // codex slot 已清（完成），但 ideate UNION 应保留卡片
+      },
+      hasActiveInvocation: true,
+      threadId: 'thread-z15-r7',
+      messageSummary: {
+        total: 4,
+        assistant: 2,
+        system: 1,
+        evidence: 1,
+        followup: 0,
+      },
+    });
+
+    // GREEN after R7: ideate UNION → 两个角色都在
+    // RED before R7: slot-first → 只剩 opus，codex 卡片掉了
+    expect(html).toContain('Ethan（任务主控与实现）');
+    expect(html).toContain('Owen（验证与审查）');
+  });
+
+  it('prefers activeInvocations over stale targetAgents when provided by ChatContainer', () => {
+    const html = render({
+      intentMode: 'execute',
+      targetAgents: ['codex'],
+      agentStatuses: { codex: 'pending', dare: 'streaming' },
+      agentInvocations: {},
+      activeInvocations: {
+        'inv-dare-1': { agentId: 'dare', mode: 'execute' },
+      },
+      hasActiveInvocation: true,
+      threadId: 'thread-slot-priority',
+      messageSummary: {
+        total: 2,
+        assistant: 1,
+        system: 1,
+        evidence: 0,
+        followup: 0,
+      },
+    });
+
+    expect(html).toContain('dare');
+    expect(html).not.toContain('Owen（验证与审查）');
+  });
+
+  it('shows "空闲" when no target agents', () => {
+    const html = render({
+      intentMode: null,
+      targetAgents: [],
+      agentStatuses: {},
+      agentInvocations: {},
+      threadId: 'test-thread',
+      messageSummary: {
+        total: 0,
+        assistant: 0,
+        system: 0,
+        evidence: 0,
+        followup: 0,
+      },
+    });
+
+    expect(html).toContain('空闲');
+  });
+
+  it('renders copyable invocation and session ids in active agents', () => {
+    const invocationId = 'inv-1234567890abcdef';
+    const sessionId = 'sess-1234567890abcdef';
+    const html = render({
+      intentMode: 'execute',
+      targetAgents: ['codex'],
+      agentStatuses: { codex: 'streaming' },
+      agentInvocations: {
+        codex: {
+          invocationId,
+          sessionId,
+          startedAt: Date.now(),
+        },
+      },
+      threadId: 'thread-123',
+      messageSummary: {
+        total: 1,
+        assistant: 1,
+        system: 0,
+        evidence: 0,
+        followup: 0,
+      },
+    });
+
+    expect(html).toContain('角色状态');
+    // IDs are now behind a collapsible toggle (default collapsed in SSR)
+    expect(html).toContain('▸ IDs');
+    // The agent name and invocation section still render
+    expect(html).toContain('Owen（验证与审查）');
+  });
+
+  it('shows history agents that are not in current targetAgents', () => {
+    const html = render({
+      intentMode: 'execute',
+      targetAgents: ['opus'],
+      agentStatuses: { opus: 'streaming' },
+      agentInvocations: {
+        opus: { startedAt: Date.now() },
+        codex: { startedAt: Date.now() - 60000, durationMs: 5000 },
+      },
+      threadId: 'thread-456',
+      messageSummary: {
+        total: 5,
+        assistant: 3,
+        system: 2,
+        evidence: 0,
+        followup: 0,
+      },
+    });
+
+    expect(html).toContain('角色状态');
+    expect(html).toContain('历史参与');
+    expect(html).toContain('Ethan（任务主控与实现）');
+  });
+
+  it('shows non-target agent in 角色状态 when it has task progress', () => {
+    const html = render({
+      intentMode: 'execute',
+      targetAgents: ['opus'],
+      agentStatuses: { opus: 'streaming', codex: 'pending' },
+      agentInvocations: {
+        opus: { startedAt: Date.now() },
+        codex: {
+          startedAt: Date.now() - 120000,
+          taskProgress: {
+            tasks: [{ id: 'c-1', subject: 'Review PR', status: 'in_progress', activeForm: 'Reviewing PR' }],
+            lastUpdate: Date.now(),
+            snapshotStatus: 'running',
+          },
+        },
+      },
+      threadId: 'thread-codex-plan',
+      messageSummary: {
+        total: 8,
+        assistant: 5,
+        system: 3,
+        evidence: 0,
+        followup: 0,
+      },
+    });
+
+    expect(html).toContain('角色状态');
+    expect(html).toContain('Owen（验证与审查）');
+    // F055: task progress now in Agent祟祟 panel, not in 角色状态
+    expect(html).toContain('Agent祟祟');
+    expect(html).toContain('Reviewing PR');
+  });
+
+  it('keeps completed snapshots out of 角色状态', () => {
+    const html = render({
+      intentMode: 'execute',
+      targetAgents: ['opus'],
+      agentStatuses: { opus: 'streaming', codex: 'done' },
+      agentInvocations: {
+        opus: { startedAt: Date.now() },
+        codex: {
+          startedAt: Date.now() - 120000,
+          taskProgress: {
+            tasks: [{ id: 'c-1', subject: 'Review PR', status: 'completed' }],
+            lastUpdate: Date.now(),
+            snapshotStatus: 'completed',
+          },
+        },
+      },
+      threadId: 'thread-codex-completed',
+      messageSummary: {
+        total: 8,
+        assistant: 5,
+        system: 3,
+        evidence: 0,
+        followup: 0,
+      },
+    });
+
+    expect(html).toContain('角色状态');
+    expect(html).toContain('Ethan（任务主控与实现）');
+    // F055: completed plan folds in Agent祟祟
+    expect(html).toContain('Agent祟祟');
+    expect(html).toContain('已完成 (1)');
+  });
+
+  it('keeps interrupted snapshots in Agent祟祟 with continue action', () => {
+    const html = render({
+      intentMode: 'execute',
+      targetAgents: ['opus'],
+      agentStatuses: { opus: 'streaming', codex: 'done' },
+      agentInvocations: {
+        opus: { startedAt: Date.now() },
+        codex: {
+          startedAt: Date.now() - 120000,
+          taskProgress: {
+            tasks: [{ id: 'c-1', subject: 'Review PR', status: 'in_progress', activeForm: 'Reviewing PR' }],
+            lastUpdate: Date.now(),
+            snapshotStatus: 'interrupted',
+          },
+        },
+      },
+      threadId: 'thread-codex-interrupted',
+      messageSummary: {
+        total: 8,
+        assistant: 5,
+        system: 3,
+        evidence: 0,
+        followup: 0,
+      },
+    });
+
+    expect(html).toContain('Agent祟祟');
+    expect(html).toContain('Owen（验证与审查）');
+    expect(html).toContain('已中断');
+    expect(html).toContain('继续');
+  });
+
+  it('renders task progress in Agent祟祟 panel', () => {
+    const html = render({
+      intentMode: 'execute',
+      targetAgents: ['opus'],
+      agentStatuses: { opus: 'streaming' },
+      agentInvocations: {
+        opus: {
+          startedAt: Date.now(),
+          taskProgress: {
+            tasks: [
+              { id: 'task-0', subject: 'Fix auth bug', status: 'completed' },
+              { id: 'task-1', subject: 'Add caching', status: 'in_progress', activeForm: 'Adding caching' },
+              { id: 'task-2', subject: 'Write tests', status: 'pending' },
+            ],
+            lastUpdate: Date.now(),
+          },
+        },
+      },
+      threadId: 'thread-789',
+      messageSummary: {
+        total: 3,
+        assistant: 2,
+        system: 1,
+        evidence: 0,
+        followup: 0,
+      },
+    });
+
+    expect(html).toContain('Agent祟祟');
+    expect(html).toContain('1/3');
+    expect(html).toContain('Fix auth bug');
+    expect(html).toContain('Adding caching');
+    expect(html).toContain('Write tests');
+  });
+
+  // baiyuxi-agent-studio#28: resize width prop regression tests
+  it('renders with custom width via style attribute', () => {
+    const html = render({
+      intentMode: null,
+      targetAgents: [],
+      agentStatuses: {},
+      agentInvocations: {},
+      threadId: 'test-thread',
+      messageSummary: { total: 0, assistant: 0, system: 0, evidence: 0, followup: 0 },
+      width: 350,
+    });
+
+    expect(html).toContain('width:350px');
+  });
+
+  it('falls back to 288px when width is omitted', () => {
+    const html = render({
+      intentMode: null,
+      targetAgents: [],
+      agentStatuses: {},
+      agentInvocations: {},
+      threadId: 'test-thread',
+      messageSummary: { total: 0, assistant: 0, system: 0, evidence: 0, followup: 0 },
+    });
+
+    expect(html).toContain('width:304px');
+  });
+});

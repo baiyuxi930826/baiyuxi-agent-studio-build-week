@@ -1,0 +1,202 @@
+'use client';
+
+import { useEffect } from 'react';
+import { useVoiceInput } from '@/hooks/useVoiceInput';
+import { LoadingIcon } from './icons/LoadingIcon';
+import { MicIcon } from './icons/MicIcon';
+import { SendIcon } from './icons/SendIcon';
+import { StopRecordingIcon } from './icons/StopRecordingIcon';
+
+interface ChatInputActionButtonProps {
+  onTranscript: (text: string) => void;
+  onSend: () => void;
+  /** F39: Queue-mode send (content will be queued behind running invocation) */
+  onQueueSend?: () => void;
+  /** F39: Force-mode send (cancel running + execute immediately) */
+  onForceSend?: () => void;
+  onStop?: () => void;
+  disabled?: boolean;
+  sendDisabled?: boolean;
+  /** Whether the thread has an active invocation (broader than disabled/isLoading) */
+  hasActiveInvocation?: boolean;
+  hasText: boolean;
+}
+
+/** Queue send icon — arrow into a stack/list */
+function QueueSendIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 20 20" fill="currentColor">
+      <path d="M3 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h7a1 1 0 110 2H4a1 1 0 01-1-1z" />
+      <path d="M15 11l3 3-3 3z" fillRule="evenodd" clipRule="evenodd" />
+    </svg>
+  );
+}
+
+/** Renders the action button states:
+ *  1. Stop generation (disabled + active invocation)
+ *  2. Stop recording
+ *  3. Transcribing
+ *  4. Queue send (F39: active invocation + has text)
+ *  5. Normal send (has text)
+ *  6. Mic (default)
+ *
+ *  Plus voice recording status overlays (REC badge, error).
+ *  Keyboard shortcut: Option+V toggles recording. */
+export function ChatInputActionButton({
+  onTranscript,
+  onSend,
+  onQueueSend,
+  onForceSend,
+  onStop,
+  disabled,
+  sendDisabled,
+  hasActiveInvocation,
+  hasText,
+}: ChatInputActionButtonProps) {
+  const voice = useVoiceInput();
+  const isSendDisabled = Boolean(disabled || sendDisabled);
+
+  useEffect(() => {
+    if (voice.transcript) onTranscript(voice.transcript);
+  }, [voice.transcript, onTranscript]);
+
+  // Global keyboard shortcut: Option+V (Alt+V) toggles voice recording
+  const { state: voiceState, startRecording, stopRecording } = voice;
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.altKey && e.code === 'KeyV') {
+        e.preventDefault();
+        if (voiceState === 'recording') {
+          stopRecording();
+        } else if (voiceState === 'idle' && !disabled) {
+          startRecording();
+        }
+      }
+    };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [voiceState, startRecording, stopRecording, disabled]);
+
+  // F39: Whether we're in queue mode (agent running + user has typed)
+  const isQueueMode = Boolean(hasActiveInvocation && hasText && !disabled);
+
+  return (
+    <>
+      {/* Voice recording status (absolute, attaches to ancestor .relative) */}
+      {voice.state === 'recording' && (
+        <div className="absolute top-0 right-4 -mt-6 flex items-center gap-2">
+          {voice.partialTranscript && (
+            <div className="px-2 py-0.5 bg-studio-surface-sunken text-studio text-xs rounded-lg max-w-[240px] truncate opacity-80">
+              {voice.partialTranscript}
+            </div>
+          )}
+          <div className="px-2 py-0.5 bg-conn-red-text text-[var(--studio-accent-foreground)] text-xs rounded-full animate-pulse whitespace-nowrap">
+            REC {Math.floor(voice.duration / 60)}:{String(voice.duration % 60).padStart(2, '0')}
+          </div>
+        </div>
+      )}
+      {voice.error && (
+        <div className="absolute top-0 left-4 -mt-6 px-3 py-1 bg-conn-red-bg text-conn-red-text text-xs rounded-lg">
+          {voice.error}
+        </div>
+      )}
+
+      {/* Stop button: visible alongside queue send (primary stop covers disabled state) */}
+      {hasActiveInvocation && !disabled && onStop && (
+        <button
+          onClick={() => onStop()}
+          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-conn-red-text text-[var(--studio-surface)] transition-colors hover:bg-conn-red-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-conn-red-text/40"
+          title="停止生成"
+          aria-label="Stop generation"
+        >
+          <svg className="w-4 h-4" viewBox="0 0 20 20" fill="currentColor">
+            <rect x="4" y="4" width="12" height="12" rx="2" />
+          </svg>
+        </button>
+      )}
+
+      {/* Primary action button priority chain */}
+      {disabled && onStop && hasActiveInvocation ? (
+        /* Backward compat: when explicitly disabled during active invocation, Stop is the only primary action */
+        <button
+          onClick={() => onStop()}
+          className="p-3 rounded-lg bg-conn-red-text text-[var(--studio-surface)] hover:bg-conn-red-hover transition-colors"
+          title="停止生成"
+          aria-label="Stop generation"
+        >
+          <svg className="w-5 h-5" viewBox="0 0 20 20" fill="currentColor">
+            <rect x="4" y="4" width="12" height="12" rx="2" />
+          </svg>
+        </button>
+      ) : voice.state === 'recording' ? (
+        <button
+          onClick={voice.stopRecording}
+          className="p-3 rounded-lg bg-conn-red-text text-[var(--studio-surface)] hover:bg-conn-red-hover transition-colors animate-pulse"
+          title="停止录音"
+          aria-label="Stop recording"
+        >
+          <StopRecordingIcon className="w-5 h-5" />
+        </button>
+      ) : voice.state === 'transcribing' ? (
+        <button
+          disabled
+          className="p-3 rounded-lg bg-studio-surface-sunken text-studio-muted cursor-wait"
+          title="转写中"
+          aria-label="Transcribing"
+        >
+          <LoadingIcon className="w-5 h-5" />
+        </button>
+      ) : isQueueMode && onQueueSend ? (
+        /* F39: Queue send — agent is running, user typed, queue the message */
+        <div className="flex items-center gap-1">
+          <button
+            onClick={onQueueSend}
+            disabled={isSendDisabled}
+            className="p-3 rounded-lg bg-[var(--color-cocreator-primary)] text-[var(--studio-surface)] hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            aria-label="排队发送"
+            title="排队发送 — Agent 空闲后处理"
+          >
+            <QueueSendIcon className="w-5 h-5" />
+          </button>
+          {onForceSend && (
+            <button
+              onClick={onForceSend}
+              disabled={isSendDisabled}
+              className="p-2 rounded-lg text-xs text-conn-red-text hover:bg-conn-red-bg disabled:opacity-40 transition-colors"
+              aria-label="强制发送"
+              title="强制发送 — 中断当前角色"
+            >
+              <svg className="w-4 h-4" viewBox="0 0 20 20" fill="currentColor">
+                <path
+                  fillRule="evenodd"
+                  d="M11.3 1.046A1 1 0 0112 2v5h4a1 1 0 01.82 1.573l-7 10A1 1 0 018 18v-5H4a1 1 0 01-.82-1.573l7-10a1 1 0 011.12-.381z"
+                  clipRule="evenodd"
+                />
+              </svg>
+            </button>
+          )}
+        </div>
+      ) : hasText ? (
+        <button
+          onClick={onSend}
+          disabled={isSendDisabled}
+          className="p-3 rounded-lg bg-studio-accent text-[var(--studio-surface)] hover:bg-studio-interactive disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          title="发送消息"
+          aria-label="Send message"
+        >
+          <SendIcon className="w-5 h-5" />
+        </button>
+      ) : (
+        <button
+          onClick={voice.startRecording}
+          disabled={disabled}
+          className="p-3 rounded-lg text-studio-muted hover:text-studio-accent hover:bg-studio-surface disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          aria-label="Start voice input (⌥V)"
+          title="语音输入 (⌥V)"
+        >
+          <MicIcon className="w-5 h-5" />
+        </button>
+      )}
+    </>
+  );
+}

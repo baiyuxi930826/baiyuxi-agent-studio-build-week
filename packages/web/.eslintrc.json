@@ -1,0 +1,13 @@
+{
+  "root": true,
+  "extends": ["next/core-web-vitals", "next/typescript"],
+  "plugins": ["studio"],
+  "rules": {
+    "studio/no-hardcoded-colors": "warn"
+  },
+  "settings": {
+    "studio": {
+      "note": "F056 Phase A-0: Design system governance. See docs/features/F056-agent-studio-design-language.md"
+    }
+  }
+}

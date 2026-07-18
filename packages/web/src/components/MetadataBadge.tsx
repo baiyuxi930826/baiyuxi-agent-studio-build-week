@@ -1,0 +1,81 @@
+'use client';
+
+import { useState } from 'react';
+import type { ChatMessageMetadata } from '@/stores/chatStore';
+import { formatCost, formatTokenCount } from './status-helpers';
+
+interface MetadataBadgeProps {
+  metadata: ChatMessageMetadata;
+}
+
+function cachePercent(input?: number, cacheRead?: number): number | null {
+  if (!cacheRead || !input) return null;
+  return Math.round((cacheRead / input) * 100);
+}
+
+export function MetadataBadge({ metadata }: MetadataBadgeProps) {
+  const [expanded, setExpanded] = useState(false);
+
+  // Read usage from message metadata (message-scoped, not per-agent aggregate)
+  const usage = metadata.usage;
+
+  const hasTokens = usage && (usage.inputTokens != null || usage.outputTokens != null || usage.totalTokens != null);
+  const cachePct = usage ? cachePercent(usage.inputTokens, usage.cacheReadTokens) : null;
+
+  return (
+    <button
+      onClick={() => setExpanded((v) => !v)}
+      className="mt-1 text-micro text-studio-muted hover:text-studio-secondary transition-colors cursor-pointer select-none flex items-center gap-0 flex-wrap"
+    >
+      <span>
+        {metadata.model || 'unknown'} · {metadata.provider || 'unknown'}
+      </span>
+
+      {hasTokens && (
+        <span className="ml-1 animate-fade-in">
+          <span className="text-studio-muted"> · </span>
+          {usage.inputTokens != null && (
+            <span className="tabular-nums">
+              {formatTokenCount(usage.inputTokens)}
+              <span className="text-studio-muted">↓</span>
+            </span>
+          )}
+          {usage.outputTokens != null && (
+            <span className="tabular-nums ml-0.5">
+              {formatTokenCount(usage.outputTokens)}
+              <span className="text-studio-muted">↑</span>
+            </span>
+          )}
+          {!usage.inputTokens && !usage.outputTokens && usage.totalTokens != null && (
+            <span className="tabular-nums">
+              {formatTokenCount(usage.totalTokens)}
+              <span className="text-studio-muted">tok</span>
+            </span>
+          )}
+          {cachePct != null && cachePct > 0 && (
+            <>
+              <span className="text-studio-muted"> · </span>
+              <span className="text-conn-emerald-text/80 tabular-nums">cached {cachePct}%</span>
+            </>
+          )}
+          {usage.costUsd != null && (
+            <>
+              <span className="text-studio-muted"> · </span>
+              <span
+                className="text-conn-amber-text animate-cost-glow tabular-nums"
+                title={usage.costEstimated ? '估算值 (基于定价表)' : undefined}
+              >
+                {usage.costEstimated ? '~' : ''}
+                {formatCost(usage.costUsd)}
+              </span>
+            </>
+          )}
+        </span>
+      )}
+
+      {expanded && metadata.sessionId && (
+        <span className="ml-1 text-studio-muted">· {metadata.sessionId.slice(0, 12)}...</span>
+      )}
+    </button>
+  );
+}

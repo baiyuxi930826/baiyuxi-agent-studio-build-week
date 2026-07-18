@@ -1,0 +1,29 @@
+{
+  "name": "baiyuxi-agent-studio-build-week",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenAI Build Week edition of an evidence-driven multi-agent engineering workspace",
+  "scripts": {
+    "preinstall": "node scripts/check-node-runtime.mjs",
+    "dev": "pnpm -r --parallel --if-present run dev",
+    "build": "pnpm -r --workspace-concurrency=1 --if-present run build",
+    "check": "pnpm --filter @agent-studio/shared lint && pnpm --filter @agent-studio/finance lint && pnpm --filter @agent-studio/mcp-server lint && pnpm --filter @agent-studio/api lint && pnpm --filter @agent-studio/web exec tsc --noEmit",
+    "test": "pnpm test:build-week",
+    "test:build-week": "pnpm --filter @agent-studio/api run build && pnpm --filter @agent-studio/api exec node --import ./test/helpers/setup-agent-registry.js --test test/threads-endpoint.test.js test/agent-catalog-store.test.js test/codex-event-transform.test.js test/mcp-config-adapters.test.js",
+    "start:api": "pnpm --filter @agent-studio/api start",
+    "start:web": "pnpm --filter @agent-studio/web start",
+    "clean": "pnpm -r --if-present run clean"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.1",
+    "@types/node": "^20.11.0",
+    "dependency-cruiser": "^17.3.8",
+    "typescript": "^5.3.3",
+    "yaml": "^2.8.1"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "packageManager": "pnpm@9.15.4"
+}

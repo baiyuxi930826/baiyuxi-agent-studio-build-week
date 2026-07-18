@@ -1,0 +1,14 @@
+# Notices and Attribution
+
+Baiyuxi Agent Studio Build Week Edition contains software derived from Clowder AI:
+
+- Upstream project: https://github.com/zts212653/clowder-ai
+- Upstream common-ancestor commit: `9ac16836b6368948b170c72e736197579d2c8003`
+- Upstream license: MIT
+- Upstream copyright: Copyright (c) 2026 Clowder AI Contributors
+
+The Build Week edition contains modifications by Baiyuxi Agent Studio Contributors. Those modifications are also distributed under the MIT License unless a file or directory states otherwise.
+
+Clowder AI names, cat logos, avatars, characters, and other brand assets are not included in this edition and are not licensed by the MIT License. This project is an independent derivative work and is not endorsed by or affiliated with the Clowder AI maintainers.
+
+Third-party packages remain subject to their respective licenses.

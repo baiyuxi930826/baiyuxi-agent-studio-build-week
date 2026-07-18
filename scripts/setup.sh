@@ -1,0 +1,565 @@
+#!/bin/bash
+
+# ============================================================
+# Baiyuxi Agent Studio / Baiyuxi Agent Studio — Interactive Setup
+# Agent Studio交互式安装向导
+#
+# Usage: ./scripts/setup.sh [--install-missing] [--npm-registry=URL] [--pip-index-url=URL] [--pip-extra-index-url=URL] [--hf-endpoint=URL]
+# ============================================================
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/download-source-overrides.sh"
+cd "$PROJECT_DIR"
+
+# Parse args
+INSTALL_MISSING=false
+for arg in "$@"; do
+    case $arg in
+        --install-missing) INSTALL_MISSING=true ;;
+        *)
+            parse_manual_download_source_arg "$arg" || true
+            ;;
+    esac
+done
+apply_manual_download_source_overrides
+
+sync_agent_hooks_best_effort() {
+    echo "  Syncing Agent CLI hooks..."
+    local log_file
+    log_file="$(mktemp)"
+    if pnpm exec tsx scripts/sync-system-prompts.ts --apply --agent-hooks-only >"$log_file" 2>&1; then
+        echo -e "  ${GREEN}✓${NC} Agent CLI hooks synced"
+    else
+        echo -e "  ${YELLOW}⚠${NC} Agent CLI hook sync failed — continuing; Hub health check can repair it later"
+        tail -5 "$log_file" 2>/dev/null | sed 's/^/    /' || true
+    fi
+    rm -f "$log_file"
+}
+
+echo ""
+echo -e "${BOLD}▶ Baiyuxi Agent Studio — Interactive Setup${NC}"
+echo -e "${BOLD}Agent Studio — 交互式安装向导${NC}"
+echo "=================================="
+echo ""
+print_manual_download_source_summary
+[ -n "${AGENT_STUDIO_NPM_REGISTRY:-}${AGENT_STUDIO_PIP_INDEX_URL:-}${AGENT_STUDIO_PIP_EXTRA_INDEX_URL:-}${AGENT_STUDIO_HF_ENDPOINT:-}" ] && echo ""
+
+# ── Step 1: Check prerequisites ─────────────────────────────
+
+echo -e "${CYAN}[1/5] Checking prerequisites / 检查前置依赖...${NC}"
+echo ""
+
+MISSING=()
+
+if command -v node &>/dev/null; then
+    NODE_VER=$(node -v)
+    echo -e "  ${GREEN}✓${NC} Node.js $NODE_VER"
+    # Check minimum version (v20+)
+    MAJOR=$(echo "$NODE_VER" | sed 's/v//' | cut -d. -f1)
+    if [ "$MAJOR" -lt 20 ]; then
+        echo -e "  ${YELLOW}⚠ Node.js v20+ recommended (you have $NODE_VER)${NC}"
+    fi
+else
+    echo -e "  ${RED}✗${NC} Node.js not found"
+    MISSING+=("Node.js (v20+) — https://nodejs.org/")
+fi
+
+if command -v pnpm &>/dev/null; then
+    echo -e "  ${GREEN}✓${NC} pnpm $(pnpm -v)"
+else
+    echo -e "  ${RED}✗${NC} pnpm not found"
+    MISSING+=("pnpm — npm install -g pnpm")
+fi
+
+if command -v git &>/dev/null; then
+    echo -e "  ${GREEN}✓${NC} git $(git --version | awk '{print $3}')"
+else
+    echo -e "  ${RED}✗${NC} git not found"
+    MISSING+=("git — https://git-scm.com/")
+fi
+
+HAS_PYTHON=false
+if command -v python3 &>/dev/null; then
+    echo -e "  ${GREEN}✓${NC} Python3 $(python3 --version 2>&1 | awk '{print $2}')"
+    HAS_PYTHON=true
+else
+    echo -e "  ${YELLOW}○${NC} Python3 not found (optional — needed for voice features)"
+fi
+
+HAS_REDIS=false
+if command -v redis-server &>/dev/null; then
+    echo -e "  ${GREEN}✓${NC} Redis $(redis-server --version | grep -oE 'v=[0-9.]+' | cut -d= -f2)"
+    HAS_REDIS=true
+else
+    echo -e "  ${YELLOW}○${NC} Redis not found (optional — can use --memory mode)"
+fi
+
+if [ ${#MISSING[@]} -gt 0 ]; then
+    echo ""
+    echo -e "${RED}Missing required dependencies:${NC}"
+    for dep in "${MISSING[@]}"; do
+        echo -e "  - $dep"
+    done
+    echo ""
+    echo "Please install the above and re-run this script."
+    exit 1
+fi
+
+# ── Step 2: Install packages ────────────────────────────────
+
+echo ""
+echo -e "${CYAN}[2/5] Installing packages / 安装依赖包...${NC}"
+echo ""
+
+if [ -d "node_modules" ]; then
+    echo -e "  ${YELLOW}○${NC} node_modules exists, running install anyway..."
+fi
+pnpm install --frozen-lockfile 2>&1 | tail -3
+echo -e "  ${GREEN}✓${NC} Packages installed"
+
+# ── Step 3: Choose optional features ────────────────────────
+
+echo ""
+echo -e "${CYAN}[3/5] Optional features / 可选功能${NC}"
+echo ""
+echo "Baiyuxi Agent Studio works out of the box. Add model API keys via UI after launch."
+echo "Agent Studio开箱即用。启动后在前端 UI 添加模型 API Key。"
+echo ""
+echo "The following features are optional. Choose what you want:"
+echo "以下功能均为可选，选择你需要的："
+echo ""
+
+# --- Voice Input (ASR) ---
+ENABLE_ASR=false
+echo -e "${BOLD}  [A] Voice Input / 语音输入 (ASR)${NC}"
+echo "      Talk to agents with your voice instead of typing."
+echo "      用语音和智能体对话，免打字。"
+echo ""
+if [ "$HAS_PYTHON" = true ]; then
+    echo "      Engine: Qwen3-ASR (primary) / Whisper (fallback)"
+    echo "      Requirements / 要求:"
+    echo "        - ~2GB disk for model download / 需要约 2GB 磁盘下载模型"
+    echo "        - 4GB+ RAM recommended / 建议 4GB+ 内存"
+    echo "        - GPU optional but faster / GPU 可选但更快"
+    echo ""
+    if [ "$INSTALL_MISSING" = true ]; then
+        ENABLE_ASR=true
+        echo -e "      ${GREEN}✓${NC} Voice input enabled (--install-missing)"
+    else
+        read -p "      Enable voice input? (y/N): " -n 1 -r
+        echo ""
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            ENABLE_ASR=true
+            echo -e "      ${GREEN}✓${NC} Voice input enabled"
+        fi
+    fi
+else
+    echo -e "      ${YELLOW}⚠ Requires Python3 (not installed). Skipping.${NC}"
+fi
+echo ""
+
+# --- Voice Output (TTS) ---
+ENABLE_TTS=false
+echo -e "${BOLD}  [B] Voice Output / 语音输出 (TTS)${NC}"
+echo "      Hear agents speak! Multiple engines available."
+echo "      听智能体说话！支持多种引擎。"
+echo ""
+if [ "$HAS_PYTHON" = true ]; then
+    echo "      Engines: Kokoro (best quality) / edge-tts (no download) / Qwen3-TTS"
+    echo "      Requirements / 要求:"
+    echo "        - Kokoro: ~500MB model download / Kokoro 需约 500MB 下载"
+    echo "        - edge-tts: no download, uses Microsoft online API / 无需下载"
+    echo "        - 2GB+ RAM for Kokoro, minimal for edge-tts"
+    echo ""
+    if [ "$INSTALL_MISSING" = true ]; then
+        ENABLE_TTS=true
+        echo -e "      ${GREEN}✓${NC} Voice output enabled (--install-missing)"
+    else
+        read -p "      Enable voice output? (y/N): " -n 1 -r
+        echo ""
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            ENABLE_TTS=true
+            echo -e "      ${GREEN}✓${NC} Voice output enabled"
+        fi
+    fi
+else
+    echo -e "      ${YELLOW}⚠ Requires Python3 (not installed). Skipping.${NC}"
+fi
+echo ""
+
+# --- LLM Post-processing ---
+ENABLE_LLM_PP=false
+echo -e "${BOLD}  [C] Speech Correction / 语音纠正 (LLM Post-processing)${NC}"
+echo "      Improves ASR accuracy using a small language model."
+echo "      用小语言模型提升语音识别准确率。"
+echo ""
+if [ "$HAS_PYTHON" = true ] && [ "$ENABLE_ASR" = true ]; then
+    echo "      Engine: Qwen3-4B"
+    echo "      Requirements / 要求:"
+    echo "        - ~4GB disk for model / 约 4GB 磁盘"
+    echo "        - 8GB+ RAM / 8GB+ 内存"
+    echo "        - GPU strongly recommended / 强烈建议 GPU"
+    echo ""
+    if [ "$INSTALL_MISSING" = true ]; then
+        ENABLE_LLM_PP=true
+        echo -e "      ${GREEN}✓${NC} Speech correction enabled (--install-missing)"
+    else
+        read -p "      Enable speech correction? (y/N): " -n 1 -r
+        echo ""
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            ENABLE_LLM_PP=true
+            echo -e "      ${GREEN}✓${NC} Speech correction enabled"
+        fi
+    fi
+elif [ "$ENABLE_ASR" = false ]; then
+    echo -e "      ${YELLOW}○ Skipped (requires Voice Input above)${NC}"
+else
+    echo -e "      ${YELLOW}⚠ Requires Python3 (not installed). Skipping.${NC}"
+fi
+echo ""
+
+# --- API Gateway Proxy ---
+ENABLE_PROXY=false
+ENABLE_EMBED=false
+echo -e "${BOLD}  [D] Semantic Retrieval / 语义检索 (Embedding)${NC}"
+echo "      Enable local vector rerank for the memory system."
+echo "      为记忆系统启用本地向量 rerank。"
+echo ""
+if [ "$HAS_PYTHON" = true ]; then
+    echo "      Engine: Qwen3-Embedding-0.6B (MLX primary, sentence-transformers fallback)"
+    echo "      Requirements / 要求:"
+    echo "        - ~350MB disk for first model download / 首次模型下载约 350MB"
+    echo "        - 4GB+ RAM recommended / 建议 4GB+ 内存"
+    echo "        - Apple Silicon recommended / Apple Silicon 体验最佳"
+    echo ""
+    if [ "$INSTALL_MISSING" = true ]; then
+        ENABLE_EMBED=true
+        echo -e "      ${GREEN}✓${NC} Semantic retrieval enabled (--install-missing)"
+    else
+        read -p "      Enable semantic retrieval? (y/N): " -n 1 -r
+        echo ""
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            ENABLE_EMBED=true
+            echo -e "      ${GREEN}✓${NC} Semantic retrieval enabled"
+        fi
+    fi
+else
+    echo -e "      ${YELLOW}⚠ Requires Python3 (not installed). Skipping.${NC}"
+fi
+echo ""
+
+# --- API Gateway Proxy ---
+ENABLE_PROXY=false
+echo -e "${BOLD}  [E] API Gateway Proxy / API 网关代理${NC}"
+echo "      Route Claude API calls through a custom gateway."
+echo "      通过自定义网关路由 Claude API 调用。"
+echo ""
+echo "      Use this if you need to go through a load balancer or"
+echo "      third-party API provider instead of direct Anthropic access."
+echo "      如需通过负载均衡或第三方 API 提供商访问，而非直连 Anthropic。"
+echo ""
+if [ "$INSTALL_MISSING" = true ]; then
+    ENABLE_PROXY=true
+    echo -e "      ${GREEN}✓${NC} API proxy enabled (--install-missing)"
+else
+    read -p "      Enable API proxy? (y/N): " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        ENABLE_PROXY=true
+        echo -e "      ${GREEN}✓${NC} API proxy enabled"
+    fi
+fi
+echo ""
+
+# ── Step 4: Generate .env ───────────────────────────────────
+
+echo -e "${CYAN}[4/5] Generating .env / 生成配置文件...${NC}"
+echo ""
+
+if [ -f .env ]; then
+    echo -e "  ${YELLOW}⚠${NC} .env already exists. Creating .env.new instead."
+    echo "     Review and merge manually: diff .env .env.new"
+    ENV_FILE=".env.new"
+else
+    ENV_FILE=".env"
+fi
+
+agent > "$ENV_FILE" <<ENVEOF
+# Generated by Baiyuxi Agent Studio setup.sh — $(date +%Y-%m-%d)
+# 由 setup.sh 自动生成
+
+# ── Core 核心 ────────────────────────────────────────────────
+FRONTEND_PORT=3003
+API_SERVER_PORT=3004
+NEXT_PUBLIC_API_URL=http://localhost:3004
+REDIS_PORT=6399
+REDIS_URL=redis://localhost:6399
+
+# ── API Gateway Proxy 反向代理 ───────────────────────────────
+ANTHROPIC_PROXY_ENABLED=$([ "$ENABLE_PROXY" = true ] && echo "1" || echo "0")
+# ANTHROPIC_PROXY_PORT=9877
+ENVEOF
+
+if [ "$ENABLE_ASR" = true ]; then
+    agent >> "$ENV_FILE" <<ENVEOF
+
+# ── Voice Input (ASR) 语音输入 ───────────────────────────────
+ASR_ENABLED=1
+WHISPER_URL=http://localhost:9876
+NEXT_PUBLIC_WHISPER_URL=http://localhost:9876
+ENVEOF
+else
+    agent >> "$ENV_FILE" <<ENVEOF
+
+# ── Voice Input (ASR) 语音输入 ───────────────────────────────
+ASR_ENABLED=0
+ENVEOF
+fi
+
+if [ "$ENABLE_TTS" = true ]; then
+    agent >> "$ENV_FILE" <<ENVEOF
+
+# ── Voice Output (TTS) 语音输出 ──────────────────────────────
+TTS_ENABLED=1
+TTS_URL=http://localhost:9879
+TTS_CACHE_DIR=./data/tts-cache
+ENVEOF
+else
+    agent >> "$ENV_FILE" <<ENVEOF
+
+# ── Voice Output (TTS) 语音输出 ──────────────────────────────
+TTS_ENABLED=0
+ENVEOF
+fi
+
+if [ "$ENABLE_LLM_PP" = true ]; then
+    agent >> "$ENV_FILE" <<ENVEOF
+
+# ── Speech Correction 语音纠正 ───────────────────────────────
+LLM_POSTPROCESS_ENABLED=1
+NEXT_PUBLIC_LLM_POSTPROCESS_URL=http://localhost:9878
+ENVEOF
+else
+    agent >> "$ENV_FILE" <<ENVEOF
+
+# ── Speech Correction 语音纠正 ───────────────────────────────
+LLM_POSTPROCESS_ENABLED=0
+ENVEOF
+fi
+
+if [ "$ENABLE_EMBED" = true ]; then
+    agent >> "$ENV_FILE" <<ENVEOF
+
+# ── Semantic Retrieval 语义检索（Embedding）────────────────
+EMBED_MODE=on
+# EMBED_PORT=9880
+# EMBED_URL=http://127.0.0.1:9880
+ENVEOF
+else
+    agent >> "$ENV_FILE" <<ENVEOF
+
+# ── Semantic Retrieval 语义检索（Embedding）────────────────
+EMBED_MODE=off
+# EMBED_PORT=9880
+# EMBED_URL=http://127.0.0.1:9880
+ENVEOF
+fi
+
+echo -e "  ${GREEN}✓${NC} $ENV_FILE generated"
+
+# ── Step 4b: Install sidecar venvs (--install-missing) ──────
+
+# Creates venvs + installs pip deps for each enabled sidecar.
+# Extracted as a function so tests can verify behavior independently.
+install_sidecar_venvs() {
+    local venv_base="${HOME}/.agent-studio"
+
+    # ASR venv
+    local asr_venv="$venv_base/asr-venv"
+    if [ ! -d "$asr_venv" ]; then
+        echo "  Creating ASR venv: $asr_venv ..."
+        python3 -m venv "$asr_venv"
+    else
+        echo "  Updating ASR venv: $asr_venv ..."
+    fi
+    "$asr_venv/bin/pip" install --quiet -U pip
+    "$asr_venv/bin/pip" install --quiet mlx-audio fastapi uvicorn python-multipart
+
+    # TTS venv
+    local tts_venv="$venv_base/tts-venv"
+    if [ ! -d "$tts_venv" ]; then
+        echo "  Creating TTS venv: $tts_venv ..."
+        python3 -m venv "$tts_venv"
+    else
+        echo "  Updating TTS venv: $tts_venv ..."
+    fi
+    "$tts_venv/bin/pip" install --quiet -U pip
+    "$tts_venv/bin/pip" install --quiet mlx-audio 'misaki[zh]' fastapi uvicorn 'httpx[socks]' num2words spacy phonemizer
+
+    # LLM post-processing venv
+    local llm_venv="$venv_base/llm-venv"
+    if [ ! -d "$llm_venv" ]; then
+        echo "  Creating LLM venv: $llm_venv ..."
+        python3 -m venv "$llm_venv"
+    else
+        echo "  Updating LLM venv: $llm_venv ..."
+    fi
+    "$llm_venv/bin/pip" install --quiet -U pip
+    "$llm_venv/bin/pip" install --quiet mlx-vlm "httpx[socks]" torchvision fastapi uvicorn pydantic
+
+    # Embedding venv
+    local embed_venv="$venv_base/embed-venv"
+    if [ ! -d "$embed_venv" ]; then
+        echo "  Creating Embedding venv: $embed_venv ..."
+        python3 -m venv "$embed_venv"
+    else
+        echo "  Updating Embedding venv: $embed_venv ..."
+    fi
+    "$embed_venv/bin/pip" install --quiet -U pip
+    if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+        "$embed_venv/bin/pip" install --quiet mlx mlx-embeddings fastapi uvicorn numpy 'transformers<5' 'huggingface-hub<1.0'
+    else
+        "$embed_venv/bin/pip" install --quiet sentence-transformers torch fastapi uvicorn numpy
+    fi
+}
+
+if [ "$INSTALL_MISSING" = true ] && [ "$HAS_PYTHON" = true ]; then
+    echo ""
+    echo -e "${CYAN}[4b/5] Installing sidecar venvs / 安装语音服务依赖...${NC}"
+    echo ""
+    install_sidecar_venvs
+    echo -e "  ${GREEN}✓${NC} Sidecar venvs installed"
+fi
+
+sync_agent_hooks_best_effort
+
+# ── Step 5: Summary ─────────────────────────────────────────
+
+echo ""
+echo -e "${CYAN}[5/5] Setup complete! / 安装完成！${NC}"
+echo ""
+echo "=================================="
+echo -e "${GREEN}🎉 Baiyuxi Agent Studio is ready!${NC}"
+echo ""
+echo "  Enabled features / 已启用功能:"
+echo "    ✓ Core (API + Frontend + Redis)"
+[ "$ENABLE_ASR" = true ] && echo "    ✓ Voice Input (ASR)"
+[ "$ENABLE_TTS" = true ] && echo "    ✓ Voice Output (TTS)"
+[ "$ENABLE_LLM_PP" = true ] && echo "    ✓ Speech Correction (LLM)"
+[ "$ENABLE_EMBED" = true ] && echo "    ✓ Semantic Retrieval (Embedding)"
+[ "$ENABLE_PROXY" = true ] && echo "    ✓ API Gateway Proxy"
+echo ""
+echo "  Next steps / 下一步:"
+echo "    1. Open http://localhost:3003 → Hub → System Settings → Account Configuration"
+echo "       打开 http://localhost:3003 → Hub → 系统配置 → 账号配置，添加模型 API Key"
+echo ""
+if [ "$HAS_REDIS" = true ]; then
+    echo "    2. Start: pnpm start"
+    echo "       启动: pnpm start"
+else
+    echo "    2. Start (no Redis): pnpm start --memory"
+    echo "       启动（无 Redis）: pnpm start --memory"
+fi
+echo ""
+echo "    3. Open http://localhost:3003"
+echo "       打开 http://localhost:3003"
+echo ""
+
+if [ "$ENABLE_ASR" = true ] || [ "$ENABLE_TTS" = true ] || [ "$ENABLE_LLM_PP" = true ] || [ "$ENABLE_EMBED" = true ]; then
+    if [ "$INSTALL_MISSING" = true ]; then
+        echo -e "  ${GREEN}✓${NC} Sidecar venvs pre-installed. Models download on first use."
+        echo "  Sidecar venv 已预装。模型将在首次使用时下载。"
+    else
+        echo -e "  ${YELLOW}Note:${NC} Sidecar models will be downloaded on first use."
+        echo "  Sidecar 模型将在首次使用时自动下载。"
+    fi
+    echo ""
+fi
+
+echo "  Documentation / 文档: SETUP.md"
+echo "  Issues: https://github.com/baiyuxi930826/baiyuxi-agent-studio-build-week/issues"
+echo ""
+
+# ─── F239 Phase B: stale HOME-level skill link detection (ADR-025 第 8 条) ───
+# Pre-flight scan only — never auto-runs cleanup (per ADR-025: 不自动删除).
+# Tells the user how many legacy HOME-level skill symlinks point at this repo
+# and how to review/remove them.
+#
+# Source detection: legacy HOME symlinks were created by sync-skills.sh using
+# MAIN_REPO from `git worktree list` (cloud P2 round 2 PR #2328). Setup may be
+# run from a linked worktree where `pwd/agent-studio-skills` is the worktree-local
+# copy, not the main one. Both candidate sources are tracked and stale links
+# matching either are counted.
+STALE_COUNT=0
+SKILLS_SRC_MAIN=""
+SKILLS_SRC_LOCAL=""
+MAIN_REPO="$(git worktree list --porcelain 2>/dev/null | head -1 | sed 's/^worktree //' || true)"
+if [ -n "$MAIN_REPO" ] && [ -d "$MAIN_REPO/agent-studio-skills" ]; then
+  SKILLS_SRC_MAIN="$(cd "$MAIN_REPO/agent-studio-skills" && pwd -P)"
+fi
+if [ -d "$(pwd)/agent-studio-skills" ]; then
+  SKILLS_SRC_LOCAL="$(cd "$(pwd)/agent-studio-skills" && pwd -P)"
+fi
+SKILLS_SRC_REAL="${SKILLS_SRC_MAIN:-$SKILLS_SRC_LOCAL}"
+if [ -n "$SKILLS_SRC_REAL" ]; then
+  for provider in claude codex gemini kimi; do
+    provider_dir="$HOME/.${provider}/skills"
+    [ -d "$provider_dir" ] || continue
+    for entry in "$provider_dir"/*; do
+      [ -L "$entry" ] || continue
+      target="$(readlink "$entry" 2>/dev/null)" || continue
+      case "$target" in
+        /*) real_target="$target" ;;
+        *)  real_target="$provider_dir/$target" ;;
+      esac
+      # Canonicalize when target exists; for dangling symlinks the realpath
+      # cannot resolve so fall back to the unresolved string (which cannot
+      # match SKILLS_SRC_REAL → entry preserved). Avoids `cd ...` chain that
+      # would trip `set -e` on dangling user-owned symlinks (砚砚 review).
+      canon_target=""
+      if [ -d "$real_target" ]; then
+        canon_target="$(cd "$real_target" 2>/dev/null && pwd -P)"
+      elif [ -e "$real_target" ] || [ -L "$real_target" ]; then
+        rt_dir="$(dirname "$real_target")"
+        if [ -d "$rt_dir" ]; then
+          canon_target="$(cd "$rt_dir" 2>/dev/null && pwd -P)/$(basename "$real_target")"
+        fi
+      fi
+      [ -z "$canon_target" ] && canon_target="$real_target"
+      # Match against EITHER main-repo source or worktree-local source; legacy
+      # HOME symlinks may point at either depending on when/where they were created.
+      matched=0
+      case "$canon_target" in
+        "$SKILLS_SRC_REAL"/*|"$SKILLS_SRC_REAL") matched=1 ;;
+      esac
+      if [ "$matched" = "0" ] && [ -n "$SKILLS_SRC_MAIN" ] && [ "$SKILLS_SRC_MAIN" != "$SKILLS_SRC_REAL" ]; then
+        case "$canon_target" in
+          "$SKILLS_SRC_MAIN"/*|"$SKILLS_SRC_MAIN") matched=1 ;;
+        esac
+      fi
+      if [ "$matched" = "0" ] && [ -n "$SKILLS_SRC_LOCAL" ] && [ "$SKILLS_SRC_LOCAL" != "$SKILLS_SRC_REAL" ]; then
+        case "$canon_target" in
+          "$SKILLS_SRC_LOCAL"/*|"$SKILLS_SRC_LOCAL") matched=1 ;;
+        esac
+      fi
+      [ "$matched" = "1" ] && STALE_COUNT=$((STALE_COUNT + 1))
+    done
+  done
+fi
+if [ "$STALE_COUNT" -gt 0 ]; then
+  echo "  Note: found $STALE_COUNT stale HOME-level skill symlinks pointing at this repo."
+  echo "        Run \`pnpm clean:stale-skill-links\` to review them (dry-run default)."
+  echo "        Re-run with the apply flag to remove. (ADR-025 第 8 条: 不自动删除)"
+  echo ""
+fi

@@ -1,0 +1,1341 @@
+/**
+ * Capabilities Route — F041 统一能力看板 API
+ *
+ * GET  /api/capabilities — 返回看板聚合视图 (CapabilityBoardResponse)
+ * PATCH /api/capabilities — 开关单个能力 (global or per-agent override)
+ * POST /api/capabilities/mcp/preview — 安装预览 (dry-run)
+ * POST /api/capabilities/mcp/install — 新增/覆盖 MCP
+ * DELETE /api/capabilities/mcp/:id — 软删除/硬删除 MCP
+ * GET /api/capabilities/audit — 审计日志
+ *
+ * F041 Re-open fixes:
+ * - Skill descriptions from SKILL.md frontmatter
+ * - Source classification: project-level skills → 'agent-studio'
+ * - Agent family grouping metadata for frontend
+ */
+
+import { existsSync } from 'node:fs';
+import { readdir, readFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import type {
+  AgentFamily,
+  CapabilityBoardItem,
+  CapabilityBoardResponse,
+  CapabilityEntry,
+  CapabilityPatchRequest,
+  McpToolInfo,
+  MountRules,
+  SkillHealthSummary,
+} from '@agent-studio/shared';
+import { agentRegistry, STANDARD_MOUNT_POINT_IDS } from '@agent-studio/shared';
+import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
+import { appendAuditEntry } from '../config/capabilities/capability-audit.js';
+import {
+  bootstrapCapabilities,
+  type DiscoveryPaths,
+  deduplicateDiscoveredMcpServers,
+  discoverExternalMcpServers,
+  generateCliConfigs,
+  healAgentStudioMcpTopology,
+  readCapabilitiesConfig,
+  resolveServersForAgent,
+  toCapabilityEntry,
+  withCapabilityLock,
+  writeCapabilitiesConfig,
+} from '../config/capabilities/capability-orchestrator.js';
+import { sanitizeCapabilityForResponse } from '../config/capabilities/capability-redaction.js';
+import {
+  requireCapabilityWriteOwner,
+  requireLocalCapabilityWriteRequest,
+  resolveCapabilityWriteSessionUserId,
+} from '../config/capabilities/capability-write-guards.js';
+import { GovernanceRegistry } from '../config/governance/governance-registry.js';
+import { validateSkillName } from '../config/governance/skill-sync.js';
+import { readMountRules } from '../config/mount/mount-rules-store.js';
+import { resourceCapId } from '../domains/plugin/PluginRegistry.js';
+import { parsePluginManifest } from '../domains/plugin/plugin-manifest.js';
+import { parseManifestSkillMeta, readSkillMeta, type SkillMeta } from '../skills/skill-meta.js';
+import { syncAll } from '../skills/skill-sync-all.js';
+import { type MountConflict, syncProject } from '../skills/skill-sync-engine.js';
+import { pathsEqual, validateProjectPath } from '../utils/project-path.js';
+import { resolveUserId } from '../utils/request-identity.js';
+import {
+  buildMountPointDirCandidates,
+  buildSkillMountTargets,
+  isSkillMountedAtPoint,
+  resolveMainRepoPath,
+} from '../utils/skill-mount.js';
+import { resolveAgentStudioSkillsSource } from '../utils/skill-source.js';
+import { type McpProbeResult, probeMcpCapability } from './mcp-probe.js';
+
+// ────────── Capability config helpers ──────────
+
+function enabledMountTargetIds(rules: MountRules): string[] {
+  return [
+    ...STANDARD_MOUNT_POINT_IDS.filter((id) => rules.mountPoints[id].enabled),
+    ...(rules.customPaths ?? []).map((cp) => cp.alias),
+  ];
+}
+
+function currentSkillMountTargetIds(cap: CapabilityEntry, rules: MountRules): string[] {
+  if (Array.isArray(cap.mountPaths)) return cap.mountPaths;
+  const isEnabled = cap.globalEnabled ?? cap.enabled;
+  return isEnabled ? enabledMountTargetIds(rules) : [];
+}
+
+function findAgentStudioSkillCapability(
+  config: { capabilities: CapabilityEntry[] } | null | undefined,
+  skillId: string,
+): CapabilityEntry | null {
+  return (
+    config?.capabilities.find(
+      (entry) => entry.type === 'skill' && entry.id === skillId && entry.source === 'agent-studio' && !entry.pluginId,
+    ) ?? null
+  );
+}
+
+function createAgentStudioSkillCapabilityFromGlobalPolicy(
+  skillId: string,
+  globalCap: CapabilityEntry | null,
+): CapabilityEntry {
+  const globalEnabled = globalCap ? (globalCap.globalEnabled ?? globalCap.enabled) : true;
+  const entry: CapabilityEntry = {
+    id: skillId,
+    type: 'skill',
+    enabled: globalEnabled,
+    globalEnabled,
+    source: 'agent-studio',
+  };
+  if (!globalCap) return entry;
+  // P2: Only copy mountPaths for disabled skills (empty array = disabled state signal).
+  // Do NOT copy non-empty mountPaths — that would freeze specific mount point policy
+  // as a project-level override, preventing future global cascade changes.
+  if (!globalEnabled) {
+    entry.mountPaths = [];
+  }
+  return entry;
+}
+
+function findCapabilityPatchTargetIndex(
+  config: { capabilities: CapabilityEntry[] },
+  body: CapabilityPatchRequest,
+): number {
+  const hasSourceDiscriminator = body.source === 'agent-studio' || body.source === 'external';
+  const hasPluginDiscriminator = typeof body.pluginId === 'string';
+  if (hasSourceDiscriminator || hasPluginDiscriminator) {
+    const explicitIndex = config.capabilities.findIndex((entry) => {
+      if (entry.id !== body.capabilityId || entry.type !== body.capabilityType) return false;
+      if (hasSourceDiscriminator && entry.source !== body.source) return false;
+      if (hasPluginDiscriminator) return entry.pluginId === body.pluginId;
+      return !entry.pluginId;
+    });
+    if (explicitIndex !== -1) return explicitIndex;
+  }
+  if (body.capabilityType === 'skill') {
+    const firstPartyIndex = config.capabilities.findIndex(
+      (entry) =>
+        entry.id === body.capabilityId && entry.type === 'skill' && entry.source === 'agent-studio' && !entry.pluginId,
+    );
+    if (firstPartyIndex !== -1) return firstPartyIndex;
+  }
+  return config.capabilities.findIndex((entry) => entry.id === body.capabilityId && entry.type === body.capabilityType);
+}
+
+// ────────── Helpers ──────────
+
+const MODULE_REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../../..');
+const CANONICAL_PLUGINS_DIR = join(MODULE_REPO_ROOT, 'plugins');
+
+/**
+ * Returns subdirectory names.
+ * - ENOENT (dir missing) → [] (normal — not all providers have skill dirs)
+ * - Other errors (EACCES, EIO) → null (real scan failure — unsafe to prune)
+ */
+async function listSubdirs(dir: string, exclude?: string[]): Promise<string[] | null> {
+  try {
+    const entries = await readdir(dir, { withFileTypes: true });
+    return entries
+      .filter((e) => (e.isDirectory() || e.isSymbolicLink()) && !(exclude ?? []).includes(e.name))
+      .map((e) => e.name);
+  } catch (err: unknown) {
+    if (err && typeof err === 'object' && 'code' in err && (err as { code: string }).code === 'ENOENT') {
+      return [];
+    }
+    return null;
+  }
+}
+
+/**
+ * Returns subdirectory names that contain a readable SKILL.md.
+ * This prevents non-skill folders (e.g. agent-studio-skills/refs) from being
+ * treated as skills and synced into capabilities.json / Hub UI.
+ */
+async function listSkillSubdirs(dir: string, exclude?: string[]): Promise<string[] | null> {
+  const subdirs = await listSubdirs(dir, exclude);
+  if (subdirs == null) return null;
+  const names: string[] = [];
+  for (const name of subdirs) {
+    try {
+      await readFile(join(dir, name, 'SKILL.md'), 'utf-8');
+      names.push(name);
+    } catch {
+      // Not a skill dir (or unreadable), skip
+    }
+  }
+  return names;
+}
+
+async function collectDeclaredPluginSkillIds(
+  pluginsDir: string,
+  declaredSkillIds: Map<string, Set<string>>,
+): Promise<boolean> {
+  const pluginDirs = await listSubdirs(pluginsDir);
+  if (pluginDirs === null) return false;
+
+  for (const dirName of pluginDirs) {
+    const manifestPath = join(pluginsDir, dirName, 'plugin.yaml');
+    if (!existsSync(manifestPath)) continue;
+
+    try {
+      const manifest = parsePluginManifest(manifestPath);
+      if (manifest.id !== dirName) continue;
+      const skillIds = new Set(
+        manifest.resources
+          .filter((resource) => resource.type === 'skill')
+          .map((resource) => resourceCapId(manifest.id, resource)),
+      );
+      declaredSkillIds.set(manifest.id, skillIds);
+    } catch {}
+  }
+
+  return true;
+}
+
+async function readDeclaredPluginSkillIds(projectRoot: string): Promise<Map<string, Set<string>> | null> {
+  const declaredSkillIds = new Map<string, Set<string>>();
+  const pluginsDirs = [CANONICAL_PLUGINS_DIR];
+  const projectPluginsDir = join(projectRoot, 'plugins');
+  if (resolve(projectPluginsDir) !== resolve(CANONICAL_PLUGINS_DIR)) {
+    pluginsDirs.push(projectPluginsDir);
+  }
+
+  for (const pluginsDir of pluginsDirs) {
+    const ok = await collectDeclaredPluginSkillIds(pluginsDir, declaredSkillIds);
+    if (!ok) return null;
+  }
+
+  return declaredSkillIds;
+}
+
+function isDeclaredPluginSkill(
+  cap: CapabilityEntry,
+  allSkillNames: Set<string>,
+  declaredPluginSkillIds: Map<string, Set<string>> | null,
+): boolean {
+  if (!cap.pluginId) return false;
+  if (declaredPluginSkillIds === null) return true;
+  const declaredIds = declaredPluginSkillIds.get(cap.pluginId);
+  if (!declaredIds) return allSkillNames.has(cap.id);
+  return declaredIds.has(cap.id);
+}
+
+function shouldKeepSkillCapability(
+  cap: CapabilityEntry,
+  allSkillNames: Set<string>,
+  declaredPluginSkillIds: Map<string, Set<string>> | null,
+): boolean {
+  if (cap.type !== 'skill') return true;
+  if (cap.pluginId) return isDeclaredPluginSkill(cap, allSkillNames, declaredPluginSkillIds);
+  return allSkillNames.has(cap.id);
+}
+
+/** Walk up from CWD to find pnpm-workspace.yaml — the monorepo root. */
+function findMonorepoRoot(): string {
+  let dir = process.cwd();
+  while (dir !== dirname(dir)) {
+    if (existsSync(resolve(dir, 'pnpm-workspace.yaml'))) return dir;
+    dir = dirname(dir);
+  }
+  return process.cwd();
+}
+
+const PROJECT_ROOT = findMonorepoRoot();
+
+function getProjectRoot(): string {
+  return PROJECT_ROOT;
+}
+
+export async function buildKnownProjectPaths(
+  agentStudioRoot: string,
+  projectRoot: string,
+  _registry?: GovernanceRegistry,
+): Promise<string[]> {
+  // F228: Only return agentStudioRoot + projectRoot as server-known paths.
+  // The full project list is assembled client-side by merging these with
+  // thread-derived project paths (same source as the 新建对話 picker).
+  // Previously this scanned the governance registry, but test entries and
+  // temporary worktrees accumulated 100+ phantom projects in the dropdown.
+  const paths: string[] = [];
+  const addPath = (path: string): void => {
+    if (!paths.some((existing) => pathsEqual(existing, path))) paths.push(path);
+  };
+  addPath(agentStudioRoot);
+  addPath(projectRoot);
+  return paths;
+}
+
+export function shouldPropagateManagedSkillToggle(
+  scope: 'global' | 'project',
+  shouldWritebackManagedSkill: boolean,
+  _projectRoot: string,
+  _agentStudioRoot: string,
+): boolean {
+  if (!shouldWritebackManagedSkill) return false;
+  // F228: Only global scope cascades. Project scope (even on agentStudioRoot) only
+  // modifies mountPaths — it never changes globalEnabled, so no cascade needed.
+  return scope === 'global';
+}
+
+function canReadSensitiveMcpConfig(request: FastifyRequest): boolean {
+  const sessionUserId = resolveCapabilityWriteSessionUserId(request);
+  return !!sessionUserId && !requireCapabilityWriteOwner(sessionUserId, { requireConfiguredOwner: true });
+}
+
+function buildBoardMcpServer(
+  cap: CapabilityEntry,
+  options?: { includeLaunchFields?: boolean },
+): CapabilityBoardItem['mcpServer'] | undefined {
+  const sanitized = sanitizeCapabilityForResponse(cap);
+  const server = sanitized?.mcpServer;
+  if (!server) return undefined;
+
+  const boardServer: CapabilityBoardItem['mcpServer'] = {
+    ...(server.transport && { transport: server.transport }),
+    ...(server.resolver && { resolver: server.resolver }),
+  };
+  if (options?.includeLaunchFields) {
+    if (server.command) boardServer.command = server.command;
+    if (Array.isArray(server.args)) boardServer.args = [...server.args];
+    if (server.url) boardServer.url = server.url;
+  }
+  if (server.env) boardServer.env = { ...server.env };
+  if (server.headers) boardServer.headers = { ...server.headers };
+
+  const envKeys = Object.keys(cap.mcpServer?.env ?? {});
+  if (envKeys.length > 0) boardServer.envKeys = envKeys;
+  return boardServer;
+}
+
+/**
+ * Resolve Agent Studio skills source from module location (stable), not selected project path.
+ * This avoids false "未挂载" when projectPath points to another repo (e.g. agent-studio-runtime).
+ */
+function resolveAgentStudioSkillsSourceDir(): string {
+  let dir = dirname(fileURLToPath(import.meta.url));
+  while (dir !== dirname(dir)) {
+    const candidate = join(dir, 'agent-studio-skills', 'manifest.yaml');
+    if (existsSync(candidate)) return join(dir, 'agent-studio-skills');
+    dir = dirname(dir);
+  }
+  return join(getProjectRoot(), 'agent-studio-skills');
+}
+
+const AGENT_STUDIO_SKILLS_SRC = resolveAgentStudioSkillsSourceDir();
+
+/**
+ * Discovery reads project-local CLI configs for providers that are project scoped.
+ * Antigravity is the exception: its MCP config is global under ~/.gemini/antigravity.
+ */
+function getDiscoveryPaths(projectRoot: string) {
+  return {
+    claudeConfig: join(projectRoot, '.mcp.json'),
+    codexConfig: join(projectRoot, '.codex', 'config.toml'),
+    geminiConfig: join(projectRoot, '.gemini', 'settings.json'),
+    kimiConfig: join(projectRoot, '.kimi', 'mcp.json'),
+    antigravityConfig: join(homedir(), '.gemini', 'antigravity', 'mcp_config.json'),
+  };
+}
+
+function getCliConfigPaths(projectRoot: string) {
+  return {
+    anthropic: join(projectRoot, '.mcp.json'),
+    openai: join(projectRoot, '.codex', 'config.toml'),
+    google: join(projectRoot, '.gemini', 'settings.json'),
+    kimi: join(projectRoot, '.kimi', 'mcp.json'),
+    antigravity: join(homedir(), '.gemini', 'antigravity', 'mcp_config.json'),
+  };
+}
+
+interface SkillScanPlan {
+  key: string;
+  provider: 'anthropic' | 'openai' | 'google' | 'kimi' | 'custom';
+  path: string;
+  exclude?: string[];
+}
+
+export async function scanProviderSkillDirs(plans: SkillScanPlan[]): Promise<{
+  mountPointSkills: Record<string, string[]>;
+  providerSkills: Record<string, string[]>;
+  scanResults: Record<string, string[] | null>;
+  scansOk: boolean;
+}> {
+  const mountPointSkills: Record<string, string[]> = {};
+  const scanResults: Record<string, string[] | null> = {};
+
+  for (const plan of plans) {
+    if (!mountPointSkills[plan.provider]) mountPointSkills[plan.provider] = [];
+  }
+
+  const results = await Promise.all(
+    plans.map(async (plan) => {
+      const names = await listSkillSubdirs(plan.path, plan.exclude);
+      return { plan, names };
+    }),
+  );
+
+  let scansOk = true;
+  for (const { plan, names } of results) {
+    scanResults[plan.key] = names;
+    if (names === null) {
+      scansOk = false;
+      continue;
+    }
+    mountPointSkills[plan.provider] = [...new Set([...(mountPointSkills[plan.provider] ?? []), ...names])];
+  }
+
+  return { mountPointSkills, providerSkills: mountPointSkills, scanResults, scansOk };
+}
+/** Known MCP server descriptions */
+const MCP_DESCRIPTIONS: Record<string, string> = {
+  'agent-studio-collab': 'Agent 能力协作工具 — 消息、上下文、任务、权限等（协作核心）',
+  'agent-studio-memory': 'Agent 记忆工具 — 证据检索、反思、会话链回放',
+  'agent-studio-signals': '信号猎手工具 — inbox 检索、搜索、摘要',
+  'agent-studio-finance': '金融事实工具 — 只读查询基金与宏观数据，返回 source/asOf/confidence/snapshot_id',
+};
+const MAX_CONCURRENT_MCP_PROBES = 4;
+const DOCKER_GATEWAY_DESCRIPTION_BASE =
+  'Docker MCP Gateway（聚合器）— 工具来自启用的子 server，不等于 Docker 本体工具集。';
+
+function isDockerGatewayCapability(cap: CapabilityEntry): boolean {
+  const command = cap.mcpServer?.command?.toLowerCase();
+  const args = cap.mcpServer?.args?.map((arg) => arg.toLowerCase()) ?? [];
+  return command === 'docker' && args[0] === 'mcp' && args[1] === 'gateway' && args[2] === 'run';
+}
+
+function inferDockerGatewayFamilies(tools: McpToolInfo[] | undefined): string[] {
+  if (!tools || tools.length === 0) return [];
+  const names = tools.map((tool) => tool.name);
+  const families: string[] = [];
+  if (names.some((name) => name.startsWith('browser_'))) families.push('playwright(browser_*)');
+  if (names.some((name) => name === 'search' || name === 'listNamespaces' || name === 'getRepositoryInfo')) {
+    families.push('dockerhub');
+  }
+  if (names.some((name) => name === 'docker' || name.startsWith('mcp-') || name === 'code-mode')) {
+    families.push('docker-gateway');
+  }
+  return families;
+}
+
+export function describeMcpCapability(cap: CapabilityEntry, tools?: McpToolInfo[]): string | undefined {
+  const known = MCP_DESCRIPTIONS[cap.id];
+  if (known) return known;
+  if (!isDockerGatewayCapability(cap)) return undefined;
+  const families = inferDockerGatewayFamilies(tools);
+  return families.length > 0
+    ? `${DOCKER_GATEWAY_DESCRIPTION_BASE} 当前探测到：${families.join(' / ')}`
+    : DOCKER_GATEWAY_DESCRIPTION_BASE;
+}
+
+/**
+ * Build agent family grouping from agentRegistry.
+ * Groups agentIds by roleId (e.g. lead-architect → [opus, opus-45, sonnet]).
+ */
+function buildAgentFamilies(): AgentFamily[] {
+  const familyMap = new Map<string, { name: string; agentIds: string[] }>();
+
+  for (const agentId of agentRegistry.getAllIds()) {
+    const entry = agentRegistry.tryGet(agentId as string);
+    if (!entry) continue;
+    const roleId = entry.config.roleId ?? 'unknown';
+    const roleName = entry.config.roleDisplayName ?? roleId;
+
+    let family = familyMap.get(roleId);
+    if (!family) {
+      family = { name: roleName, agentIds: [] };
+      familyMap.set(roleId, family);
+    }
+    family.agentIds.push(agentId as string);
+  }
+
+  return Array.from(familyMap.entries()).map(([id, f]) => ({
+    id,
+    name: f.name,
+    agentIds: f.agentIds.sort(),
+  }));
+}
+
+// ────────── Route Plugin ──────────
+
+export const capabilitiesRoutes: FastifyPluginAsync = async (app) => {
+  // ── GET /api/capabilities ──
+  app.get('/api/capabilities', async (request, reply) => {
+    const userId = resolveUserId(request);
+    if (!userId) {
+      reply.status(401);
+      return { error: 'Identity required (session cookie or X-Agent-Studio-User header)' };
+    }
+
+    // Multi-project: accept ?projectPath=... to manage capabilities for any project
+    const query = request.query as { projectPath?: string; probe?: string | boolean };
+    const probeEnabled = query.probe === true || query.probe === 'true' || query.probe === '1';
+    const includeMcpLaunchFields = canReadSensitiveMcpConfig(request);
+    let projectRoot = getProjectRoot();
+    if (query.projectPath) {
+      const validated = await validateProjectPath(query.projectPath);
+      if (!validated) {
+        reply.status(400);
+        return { error: 'Invalid project path: must be an existing directory under allowed roots' };
+      }
+      projectRoot = validated;
+    }
+
+    const home = homedir();
+    const mainRoot = getProjectRoot();
+    const mountRules = await readMountRules(projectRoot, mainRoot);
+    const enabledMountPoints = STANDARD_MOUNT_POINT_IDS.filter((id) => mountRules.mountPoints[id].enabled);
+    const mountPointDirCandidates = buildMountPointDirCandidates(projectRoot, home, mountRules);
+    const customMountTargets = buildSkillMountTargets(projectRoot, home, mountRules).filter(
+      (target) => target.kind === 'custom',
+    );
+    const agentStudioRepoRoot = await resolveMainRepoPath();
+
+    // 1. Load or bootstrap capabilities.json
+    let config = await readCapabilitiesConfig(projectRoot);
+    const existingCapabilitiesCount = config?.capabilities.length ?? null;
+    if (!config) {
+      // Multi-project: when bootstrapping a non-agent-studio project, still point the
+      // Agent Studio MCP server to THIS repo (host), not the managed project root.
+      config = await bootstrapCapabilities(projectRoot, getDiscoveryPaths(projectRoot), {
+        agentStudioRepoRoot,
+      });
+    } else {
+      const healed = healAgentStudioMcpTopology(config, { agentStudioRepoRoot });
+      config = healed.config;
+      if (healed.migrated) {
+        await writeCapabilitiesConfig(projectRoot, config);
+      }
+    }
+    const isExternalProject = !pathsEqual(projectRoot, mainRoot);
+    // Always load global config for external projects so newly discovered skills
+    // inherit global disabled state (per-skill, not all-or-nothing bootstrap gate)
+    const globalConfig = isExternalProject ? await readCapabilitiesConfig(mainRoot) : null;
+
+    // Always regenerate CLI configs so that config changes (e.g. new env
+    // placeholders for Gemini MCP) are applied to existing environments
+    // without requiring a full re-bootstrap.  writeXxxMcpConfig functions
+    // are idempotent merge-writers, so repeated calls are safe and cheap.
+    try {
+      await generateCliConfigs(config, getCliConfigPaths(projectRoot));
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      if (code !== 'EPERM' && code !== 'EACCES') throw error;
+    }
+
+    // 2. Discover skills (filesystem scan — separate from MCP)
+    // null = scan failed (readdir/read error); [] = directory exists but empty.
+    // Use listSkillSubdirs() for provider dirs so stale/broken symlinks do not
+    // resurrect deleted skills in the board.
+    const projectSkillsDir = join(projectRoot, mountRules.mountPoints.claude.path);
+    const skillScanPlans: SkillScanPlan[] = [
+      { key: 'claude-project', provider: 'anthropic', path: projectSkillsDir },
+      { key: 'claude-user', provider: 'anthropic', path: join(home, '.claude', 'skills') },
+      {
+        key: 'codex-project',
+        provider: 'openai',
+        path: join(projectRoot, mountRules.mountPoints.codex.path),
+        exclude: ['.system'],
+      },
+      { key: 'codex-user', provider: 'openai', path: join(home, '.codex', 'skills'), exclude: ['.system'] },
+      { key: 'gemini-project', provider: 'google', path: join(projectRoot, mountRules.mountPoints.gemini.path) },
+      { key: 'gemini-user', provider: 'google', path: join(home, '.gemini', 'skills') },
+      { key: 'kimi-project', provider: 'kimi', path: join(projectRoot, mountRules.mountPoints.kimi.path) },
+      { key: 'kimi-user', provider: 'kimi', path: join(home, '.kimi', 'skills') },
+      // F228 P2: Scan custom mount targets so their skills appear in discovery/allSkillNames.
+      ...customMountTargets.map((target) => ({
+        key: `custom-${target.id}`,
+        provider: 'custom' as const,
+        path: target.candidates[0]!,
+      })),
+    ];
+    const { mountPointSkills, scanResults, scansOk: allScansOk } = await scanProviderSkillDirs(skillScanPlans);
+    const claudeProjectSkills = scanResults['claude-project'];
+    const codexProjectSkills = scanResults['codex-project'];
+    const geminiProjectSkills = scanResults['gemini-project'];
+    const projectKimiSkills = scanResults['kimi-project'];
+
+    // F041 bug fix: Also scan agent-studio-skills/ for project-level skill detection.
+    const agentStudioSkillsDir = AGENT_STUDIO_SKILLS_SRC;
+    const agentStudioOwnSkills = await listSkillSubdirs(agentStudioSkillsDir);
+    const hasProjectAgentStudioSkillsDir = existsSync(agentStudioSkillsDir);
+    const mountedSkillNames = new Set(Object.values(mountPointSkills).flat());
+    const hasMountedAgentStudioSkillEvidence = (agentStudioOwnSkills ?? []).some((skillName) =>
+      mountedSkillNames.has(skillName),
+    );
+    // Per-skill global policy: always inherit for external projects (not gated on
+    // "no existing capabilities" — a project with one mounted skill should still
+    // respect global disables for newly discovered skills)
+
+    // F228 P2: Include custom mount target skills in project-level discovery
+    const customProjectSkills = customMountTargets.flatMap((target) => scanResults[`custom-${target.id}`] ?? []);
+    const projectSkillNames = new Set([
+      ...(claudeProjectSkills ?? []),
+      ...(codexProjectSkills ?? []),
+      ...(geminiProjectSkills ?? []),
+      ...(projectKimiSkills ?? []),
+      ...(agentStudioOwnSkills ?? []),
+      ...customProjectSkills,
+    ]);
+
+    // 3. Sync discovered skills into capabilities.json
+    const allSkillNames = new Set<string>();
+    for (const skills of Object.values(mountPointSkills)) {
+      for (const s of skills) allSkillNames.add(s);
+    }
+    // Cloud P2: include source-only Agent Studio skills (present in agent-studio-skills/ but not mounted
+    // into any provider directory yet) so mount health can detect missing mounts.
+    if (agentStudioOwnSkills !== null) {
+      for (const s of agentStudioOwnSkills) allSkillNames.add(s);
+    }
+
+    let configDirty = false;
+    // Add newly discovered skills
+    for (const skillName of allSkillNames) {
+      const isAgentStudio = agentStudioOwnSkills !== null && agentStudioOwnSkills.includes(skillName);
+      const exists = config.capabilities.some(
+        (c) =>
+          c.type === 'skill' && c.id === skillName && (!isAgentStudio || (c.source === 'agent-studio' && !c.pluginId)),
+      );
+      if (!exists) {
+        config.capabilities.push(
+          isAgentStudio
+            ? createAgentStudioSkillCapabilityFromGlobalPolicy(
+                skillName,
+                findAgentStudioSkillCapability(globalConfig, skillName),
+              )
+            : {
+                id: skillName,
+                type: 'skill',
+                enabled: true,
+                source: 'external',
+              },
+        );
+        configDirty = true;
+      }
+    }
+    // Also fix source for existing skills that were incorrectly classified
+    for (const cap of config.capabilities) {
+      if (cap.type !== 'skill') continue;
+      if (cap.pluginId || cap.source === 'external') continue;
+      const shouldBeAgentStudio = agentStudioOwnSkills !== null && agentStudioOwnSkills.includes(cap.id);
+      // Upgrade is safe when we have evidence; downgrade is only safe when scans succeeded.
+      if (shouldBeAgentStudio && cap.source !== 'agent-studio') {
+        cap.source = 'agent-studio';
+        configDirty = true;
+      } else if (
+        !shouldBeAgentStudio &&
+        cap.source === 'agent-studio' &&
+        agentStudioOwnSkills !== null &&
+        claudeProjectSkills !== null &&
+        codexProjectSkills !== null &&
+        geminiProjectSkills !== null &&
+        projectKimiSkills !== null
+      ) {
+        cap.source = 'external';
+        configDirty = true;
+      }
+    }
+    // Prune stale skills no longer on filesystem.
+    // Guard: only prune when ALL provider scans succeeded (no null returns).
+    if (allScansOk) {
+      const declaredPluginSkillIds = await readDeclaredPluginSkillIds(projectRoot);
+      const before = config.capabilities.length;
+      config.capabilities = config.capabilities.filter((c) =>
+        shouldKeepSkillCapability(c, allSkillNames, declaredPluginSkillIds),
+      );
+      if (config.capabilities.length !== before) configDirty = true;
+    }
+
+    // Re-discover project-level + user-level MCP servers on each GET.
+    // Adds newly configured servers to capabilities.json without re-bootstrap.
+    const projectLevelPaths = getDiscoveryPaths(projectRoot);
+    const userLevelPaths: DiscoveryPaths = {
+      claudeConfig: join(home, '.claude', 'mcp.json'),
+      codexConfig: join(home, '.codex', 'config.toml'),
+      geminiConfig: join(home, '.gemini', 'settings.json'),
+      kimiConfig: join(home, '.kimi', 'mcp.json'),
+      antigravityConfig: join(home, '.gemini', 'antigravity', 'mcp_config.json'),
+    };
+    const [projectLevelServers, userLevelServers] = await Promise.all([
+      discoverExternalMcpServers(projectLevelPaths),
+      discoverExternalMcpServers(userLevelPaths),
+    ]);
+    const discoveredServers = deduplicateDiscoveredMcpServers([...projectLevelServers, ...userLevelServers]);
+    // Skip legacy Agent Studio names — a stale 'agent-studio' entry in user config should
+    // not be re-added alongside the split 'agent-studio-*' built-in entries.
+    // F193/F207 split-only: include supplemental built-ins so discovery doesn't
+    // re-add stale user-level entries alongside managed split servers.
+    const AGENT_STUDIO_BUILTIN_NAMES = new Set([
+      'agent-studio',
+      'agent-studio-collab',
+      'agent-studio-memory',
+      'agent-studio-signals',
+      'agent-studio-limb',
+      'agent-studio-finance',
+    ]);
+    for (const server of discoveredServers) {
+      if (AGENT_STUDIO_BUILTIN_NAMES.has(server.name)) continue;
+      const exists = config.capabilities.some((c) => c.type === 'mcp' && c.id === server.name);
+      if (!exists) {
+        config.capabilities.push(toCapabilityEntry(server));
+        configDirty = true;
+      }
+    }
+
+    if (configDirty) {
+      await writeCapabilitiesConfig(projectRoot, config);
+    }
+
+    // 4. Build skill metadata lookup (description + triggers + category)
+    // Categories + registration must be parsed from the SAME root used for mount checks.
+    const mainSkillsSrc = await resolveAgentStudioSkillsSource();
+    // Use dir existence (not skill count) to avoid treating existing-but-empty as "missing".
+    const mountSkillsSrc =
+      agentStudioOwnSkills !== null && hasProjectAgentStudioSkillsDir ? agentStudioSkillsDir : mainSkillsSrc;
+
+    const manifestMetaMap = await parseManifestSkillMeta(mountSkillsSrc);
+    const skillMetaMap = new Map<string, SkillMeta>();
+
+    const skillDirCandidates: { name: string; dir: string }[] = [];
+    for (const name of allSkillNames) {
+      skillDirCandidates.push({ name, dir: join(projectSkillsDir, name) });
+      skillDirCandidates.push({ name, dir: join(projectRoot, '.codex', 'skills', name) });
+      skillDirCandidates.push({ name, dir: join(projectRoot, '.gemini', 'skills', name) });
+      skillDirCandidates.push({ name, dir: join(home, '.claude', 'skills', name) });
+      skillDirCandidates.push({ name, dir: join(home, '.codex', 'skills', name) });
+      skillDirCandidates.push({ name, dir: join(home, '.gemini', 'skills', name) });
+      skillDirCandidates.push({ name, dir: join(home, '.kimi', 'skills', name) });
+      skillDirCandidates.push({ name, dir: join(projectRoot, '.kimi', 'skills', name) });
+    }
+
+    const metaResults = await Promise.all(
+      skillDirCandidates.map(async ({ name, dir }) => ({
+        name,
+        meta: await readSkillMeta(dir),
+      })),
+    );
+    for (const { name, meta } of metaResults) {
+      if (meta.description && !skillMetaMap.has(name)) {
+        skillMetaMap.set(name, meta);
+      }
+    }
+
+    // 5. Build board items from capabilities.json
+    const agentIds = agentRegistry.getAllIds().map((id) => id as string);
+    const items: CapabilityBoardItem[] = [];
+
+    // MCP capabilities
+    for (const cap of config.capabilities) {
+      if (cap.type !== 'mcp') continue;
+      const agents: Record<string, boolean> = {};
+      for (const agentId of agentIds) {
+        const servers = resolveServersForAgent(config, agentId);
+        const server = servers.find((s) => s.name === cap.id);
+        agents[agentId] = server?.enabled ?? false;
+      }
+      const mcpItem: CapabilityBoardItem = {
+        id: cap.id,
+        type: 'mcp',
+        source: cap.source,
+        enabled: cap.enabled,
+        agents,
+        mcpServer: buildBoardMcpServer(cap, { includeLaunchFields: includeMcpLaunchFields }),
+        layer: 'L1',
+        pluginId: cap.pluginId,
+        ...(cap.ecosystem && { ecosystem: cap.ecosystem }),
+        ...(cap.lockVersion && { lockVersion: cap.lockVersion }),
+      };
+      const mcpDesc = describeMcpCapability(cap);
+      if (mcpDesc) mcpItem.description = mcpDesc;
+      items.push(mcpItem);
+    }
+
+    // Skill capabilities (from capabilities.json, presence from filesystem)
+    for (const cap of config.capabilities) {
+      if (cap.type !== 'skill') continue;
+      const agents: Record<string, boolean> = {};
+      for (const agentId of agentIds) {
+        const entry = agentRegistry.tryGet(agentId);
+        const provider = entry?.config.clientId ?? 'unknown';
+        const presentForProvider = (mountPointSkills[provider] ?? []).includes(cap.id);
+        if (!presentForProvider) continue; // Sparse agents: omit irrelevant agents so frontend filter works
+        const override = cap.overrides?.find((o) => o.agentId === agentId);
+        const enabled = override ? override.enabled : (cap.globalEnabled ?? cap.enabled);
+        agents[agentId] = enabled;
+      }
+      const skillItem: CapabilityBoardItem = {
+        id: cap.id,
+        type: 'skill',
+        source: cap.source,
+        enabled: cap.globalEnabled ?? cap.enabled,
+        globalEnabled: cap.globalEnabled ?? cap.enabled,
+        agents,
+        layer: cap.source === 'external' ? 'L3' : 'L2',
+        pluginId: cap.pluginId,
+        mountPaths: cap.mountPaths,
+      };
+      const meta =
+        cap.source === 'agent-studio'
+          ? (manifestMetaMap.get(cap.id) ?? skillMetaMap.get(cap.id))
+          : skillMetaMap.get(cap.id);
+      if (meta?.description) skillItem.description = meta.description;
+      if (meta?.triggers) skillItem.triggers = meta.triggers;
+      // Category from manifest.yaml (F228: moved from BOOTSTRAP.md)
+      const manifestCategory = manifestMetaMap.get(cap.id)?.category;
+      if (manifestCategory) skillItem.category = manifestCategory;
+      else if (meta?.category) skillItem.category = meta.category;
+      items.push(skillItem);
+    }
+
+    // Optional MCP probe: fill connectionStatus + tools via tools/list.
+    if (probeEnabled) {
+      const mcpCaps = config.capabilities.filter((cap) => cap.type === 'mcp');
+      const mcpItemById = new Map(
+        items
+          .filter((item): item is CapabilityBoardItem & { type: 'mcp' } => item.type === 'mcp')
+          .map((item) => [item.id, item] as const),
+      );
+      const probeEntries: Array<readonly [string, McpProbeResult]> = [];
+      const probeOne = async (cap: (typeof mcpCaps)[number]): Promise<readonly [string, McpProbeResult]> => {
+        const boardItem = mcpItemById.get(cap.id);
+        const anyAgentEnabled = boardItem ? Object.values(boardItem.agents).some(Boolean) : cap.enabled;
+        if (!anyAgentEnabled) {
+          return [cap.id, { connectionStatus: 'unknown' }] as const;
+        }
+        const probe = await probeMcpCapability(cap, { projectRoot });
+        return [cap.id, probe] as const;
+      };
+      for (let i = 0; i < mcpCaps.length; i += MAX_CONCURRENT_MCP_PROBES) {
+        const chunk = mcpCaps.slice(i, i + MAX_CONCURRENT_MCP_PROBES);
+        const chunkEntries = await Promise.all(chunk.map(probeOne));
+        probeEntries.push(...chunkEntries);
+      }
+      const probeMap = new Map(probeEntries);
+      for (const item of items) {
+        if (item.type !== 'mcp') continue;
+        const probe = probeMap.get(item.id);
+        if (!probe) continue;
+        item.connectionStatus = probe.connectionStatus;
+        if (probe.tools) item.tools = probe.tools;
+        const cap = mcpCaps.find((entry) => entry.id === item.id);
+        if (cap) {
+          const dynamicDesc = describeMcpCapability(cap, probe.tools);
+          if (dynamicDesc) item.description = dynamicDesc;
+        }
+      }
+    }
+
+    // 6. Mount health check for agent-studio skills
+    // Multi-project: validate mounts against the selected project's agent-studio-skills
+    // if it exists; otherwise fall back to host repo's agent-studio-skills.
+
+    const mountSourceNames = new Set(
+      mountSkillsSrc === agentStudioSkillsDir
+        ? (agentStudioOwnSkills ?? [])
+        : ((await listSkillSubdirs(mountSkillsSrc)) ?? []),
+    );
+    const agentStudioSkillItems = items.filter((i) => i.type === 'skill' && i.source === 'agent-studio' && !i.pluginId);
+    const customMountsBySkill = new Map<string, boolean[]>();
+    await Promise.all(
+      agentStudioSkillItems.map(async (item) => {
+        const [claude, codex, gemini, kimi] = await Promise.all([
+          isSkillMountedAtPoint(mountPointDirCandidates.claude, mountSkillsSrc, item.id, mainSkillsSrc),
+          isSkillMountedAtPoint(mountPointDirCandidates.codex, mountSkillsSrc, item.id, mainSkillsSrc),
+          isSkillMountedAtPoint(mountPointDirCandidates.gemini, mountSkillsSrc, item.id, mainSkillsSrc),
+          isSkillMountedAtPoint(mountPointDirCandidates.kimi, mountSkillsSrc, item.id, mainSkillsSrc),
+        ]);
+        const customMounts = await Promise.all(
+          customMountTargets.map((target) =>
+            isSkillMountedAtPoint(target.candidates, mountSkillsSrc, item.id, mainSkillsSrc),
+          ),
+        );
+        item.mounts = { claude, codex, gemini, kimi };
+        customMountsBySkill.set(item.id, customMounts);
+      }),
+    );
+
+    // Registration consistency: capabilities.json vs source dir
+    // Source directory = truth for "which skills exist"
+    // capabilities.json = truth for "which skills are configured"
+    const capSkillNames = new Set(
+      config.capabilities
+        .filter((c) => c.type === 'skill' && c.source === 'agent-studio' && !c.pluginId)
+        .map((c) => c.id),
+    );
+    const unregistered = [...mountSourceNames].filter((n) => !capSkillNames.has(n));
+    const phantom = [...capSkillNames].filter((n) => !mountSourceNames.has(n));
+    const mountRequiredAgentStudioSkillItems = agentStudioSkillItems.filter((item) =>
+      Array.isArray(item.mountPaths) ? item.mountPaths.length > 0 : item.enabled,
+    );
+    let allMounted = mountRequiredAgentStudioSkillItems.every((item) => {
+      if (!item.mounts) return false;
+      const declaredMountPaths = Array.isArray(item.mountPaths) ? new Set(item.mountPaths) : null;
+      const requiredMountPoints = declaredMountPaths
+        ? STANDARD_MOUNT_POINT_IDS.filter(
+            (mountPointId) => declaredMountPaths.has(mountPointId) && mountRules.mountPoints[mountPointId].enabled,
+          )
+        : enabledMountPoints;
+      const requiredCustomTargetIds = declaredMountPaths
+        ? new Set(customMountTargets.filter((target) => declaredMountPaths.has(target.id)).map((target) => target.id))
+        : new Set(customMountTargets.map((target) => target.id));
+      const customMounts = customMountsBySkill.get(item.id) ?? [];
+      return (
+        requiredMountPoints.every((mountPointId) => item.mounts?.[mountPointId]) &&
+        customMountTargets.every((target, index) => !requiredCustomTargetIds.has(target.id) || customMounts[index])
+      );
+    });
+    // If we have expected agent-studio skills (source dir non-empty) but discovered none,
+    // treat as unhealthy (likely broken mounts).
+    if (agentStudioSkillItems.length === 0 && mountSourceNames.size > 0) allMounted = false;
+    const skillHealth: SkillHealthSummary = {
+      allMounted,
+      registrationConsistent: unregistered.length === 0 && phantom.length === 0,
+      unregistered,
+      phantom,
+    };
+
+    // 7. F070: Governance health for external projects
+    const agentStudioRoot = getProjectRoot();
+    const registry = new GovernanceRegistry(agentStudioRoot);
+    let governanceHealth: CapabilityBoardResponse['governanceHealth'];
+    if (projectRoot !== agentStudioRoot) {
+      governanceHealth = await registry.checkHealth(projectRoot);
+    }
+
+    // Known project paths: main project + governance registry entries + queried project.
+    // Thread-derived projects are merged client-side via getProjectPaths(threads),
+    // mirroring the project discovery pattern in DirectoryPickerModal.
+    const knownProjectPaths = await buildKnownProjectPaths(agentStudioRoot, projectRoot, registry);
+
+    // 8. Build response with agent family + project metadata
+    const response: CapabilityBoardResponse = {
+      items,
+      agentFamilies: buildAgentFamilies(),
+      projectPath: projectRoot,
+      knownProjectPaths,
+      skillHealth,
+    };
+    if (governanceHealth) {
+      response.governanceHealth = governanceHealth;
+    }
+
+    return response;
+  });
+
+  // ── PATCH /api/capabilities ──
+  app.patch('/api/capabilities', async (request, reply) => {
+    const userId = resolveCapabilityWriteSessionUserId(request);
+    if (!userId) {
+      reply.status(401);
+      return { error: 'Identity required (session cookie)' };
+    }
+    const localError = requireLocalCapabilityWriteRequest(request);
+    if (localError) {
+      reply.status(localError.status);
+      return { error: localError.error };
+    }
+    const ownerError = requireCapabilityWriteOwner(userId, {
+      allowMissingOwner: true,
+    });
+    if (ownerError) {
+      reply.status(ownerError.status);
+      return { error: ownerError.error };
+    }
+
+    const body = request.body as CapabilityPatchRequest | undefined;
+    if (!body || !body.capabilityId || !body.capabilityType || !body.scope || typeof body.enabled !== 'boolean') {
+      reply.status(400);
+      return {
+        error:
+          'Required: capabilityId, capabilityType (mcp|skill), scope, enabled (boolean). Skill scope: "global"|"project". MCP scope: "global"|"agent".',
+      };
+    }
+    if (body.source !== undefined && body.source !== 'agent-studio' && body.source !== 'external') {
+      reply.status(400);
+      return { error: 'source must be "agent-studio" or "external" when provided' };
+    }
+    if (body.pluginId !== undefined && typeof body.pluginId !== 'string') {
+      reply.status(400);
+      return { error: 'pluginId must be a string when provided' };
+    }
+
+    // F228: Validate scope per capability type.
+    // Skills: "global" (enable/disable everywhere) or "project" (mount/unmount for one project).
+    // MCP: "global" or "agent" (per-agent override).
+    const validSkillScopes = new Set(['global', 'project']);
+    const validMcpScopes = new Set(['global', 'agent']);
+    const validScopes = body.capabilityType === 'skill' ? validSkillScopes : validMcpScopes;
+    if (!validScopes.has(body.scope)) {
+      reply.status(400);
+      return {
+        error: `Invalid scope "${body.scope}" for ${body.capabilityType}. ${body.capabilityType === 'skill' ? 'Skills accept "global" or "project".' : 'MCP accepts "global" or "agent".'}`,
+      };
+    }
+
+    if (body.scope === 'agent' && !body.agentId) {
+      reply.status(400);
+      return { error: 'agentId required when scope is "agent"' };
+    }
+
+    // F228: mountPointId is only valid for skill toggles (project or global scope)
+    if (body.mountPointId && (body.capabilityType !== 'skill' || body.scope === 'agent')) {
+      reply.status(400);
+      return { error: 'mountPointId is only supported for skill scope="project" or scope="global" toggles' };
+    }
+
+    // Multi-project: accept projectPath in body.
+    // scope=global always mutates the main project's global config; projectPath
+    // only selects the project for project/agent scoped toggles.
+    const mainProjectRoot = getProjectRoot();
+    let selectedProjectRoot = mainProjectRoot;
+    if (body.projectPath) {
+      const validated = await validateProjectPath(body.projectPath);
+      if (!validated) {
+        reply.status(400);
+        return { error: 'Invalid project path: must be an existing directory under allowed roots' };
+      }
+      selectedProjectRoot = validated;
+    }
+    const projectRoot = body.scope === 'global' ? mainProjectRoot : selectedProjectRoot;
+
+    return withCapabilityLock(projectRoot, async () => {
+      const rawConfig = await readCapabilitiesConfig(projectRoot);
+      if (!rawConfig) {
+        reply.status(404);
+        return { error: 'capabilities.json not found. Run GET first to bootstrap.' };
+      }
+
+      // F193 Phase C (cloud round 8 P2 #4): heal BEFORE locating + mutating
+      // the toggle target. Otherwise toggling legacy `agent-studio` in a pre-
+      // Phase-C config would mutate an entry that the subsequent heal removes,
+      // and the audit/response would report a capability not present in the
+      // written finalConfig. Healing first ensures the toggle operates on
+      // the canonical post-Phase-C state.
+      const agentStudioRepoRoot = await resolveMainRepoPath();
+      const config = healAgentStudioMcpTopology(rawConfig, { agentStudioRepoRoot }).config;
+
+      const capIndex = findCapabilityPatchTargetIndex(config, body);
+      if (capIndex === -1) {
+        reply.status(404);
+        return {
+          error: `Capability "${body.capabilityId}" (type=${body.capabilityType}) not found in canonical config (may have been migrated by F193 Phase C — try the corresponding split server id)`,
+        };
+      }
+
+      const cap = config.capabilities[capIndex]!;
+
+      // Plugin-owned capabilities must be toggled through /api/plugins/:id/enable|disable
+      // to keep lifecycle state (symlinks, limb nodes, CLI configs) consistent.
+      if (cap.pluginId) {
+        reply.status(409);
+        return {
+          error: `Capability "${body.capabilityId}" is managed by plugin "${cap.pluginId}". Use /api/plugins/${cap.pluginId}/enable or /disable instead.`,
+        };
+      }
+
+      const beforeSnapshot = structuredClone(cap);
+      const shouldWritebackManagedSkill =
+        body.capabilityType === 'skill' &&
+        (body.scope === 'global' || body.scope === 'project') &&
+        cap.source === 'agent-studio';
+
+      if (shouldWritebackManagedSkill) {
+        try {
+          validateSkillName(body.capabilityId);
+        } catch (err) {
+          reply.status(400);
+          return { error: (err as Error).message };
+        }
+      }
+
+      // Update config: globalEnabled (skill) / enabled (mcp) + mountPaths
+      if (body.scope === 'global' || body.scope === 'project') {
+        if (body.mountPointId && shouldWritebackManagedSkill) {
+          // Per-mount-point toggle: validate + update mountPaths
+          const mountRules = await readMountRules(projectRoot, getProjectRoot());
+          const validMountPoints = new Set<string>([
+            ...STANDARD_MOUNT_POINT_IDS.filter((id) => mountRules.mountPoints[id].enabled),
+            ...(mountRules.customPaths ?? []).map((cp) => cp.alias),
+          ]);
+          if (!validMountPoints.has(body.mountPointId)) {
+            reply.status(400);
+            return {
+              error: `mountPointId "${body.mountPointId}" is not an enabled mount point in current mount rules`,
+            };
+          }
+          const current = currentSkillMountTargetIds(cap, mountRules);
+          cap.mountPaths = body.enabled
+            ? [...new Set([...current, body.mountPointId])]
+            : current.filter((p) => p !== body.mountPointId);
+          // F228: project scope only changes mountPaths. enabled/globalEnabled
+          // are global/legacy state and must not be mutated by project toggles.
+          // Project enabled state is derived from mountPaths.
+          const derived = (cap.mountPaths ?? []).length > 0;
+          if (body.scope === 'global') {
+            cap.enabled = derived;
+            cap.globalEnabled = derived;
+          }
+        } else if (shouldWritebackManagedSkill) {
+          // Whole-skill toggle (skill)
+          // F228: project scope only changes mountPaths. enabled/globalEnabled
+          // are global/legacy state and must not be mutated by project toggles.
+          // Project enabled state is derived from mountPaths.
+          if (body.scope === 'global') {
+            cap.enabled = body.enabled;
+            cap.globalEnabled = body.enabled;
+          }
+          // Both scopes update mountPaths
+          const mountRules = await readMountRules(projectRoot, getProjectRoot());
+          cap.mountPaths = body.enabled ? enabledMountTargetIds(mountRules) : [];
+        } else {
+          // Non-skill (MCP/limb): write enabled as before
+          cap.enabled = body.enabled;
+        }
+      } else {
+        // scope === 'agent' (MCP only — skills already rejected above)
+        if (!cap.overrides) cap.overrides = [];
+        const existing = cap.overrides.find((o) => o.agentId === body.agentId!);
+        if (existing) existing.enabled = body.enabled;
+        else cap.overrides.push({ agentId: body.agentId!, enabled: body.enabled });
+        if (body.enabled === cap.enabled) {
+          cap.overrides = cap.overrides.filter((o) => o.agentId !== body.agentId!);
+          if (cap.overrides.length === 0) delete cap.overrides;
+        }
+      }
+
+      try {
+        await writeCapabilitiesConfig(projectRoot, config);
+        await generateCliConfigs(config, getCliConfigPaths(projectRoot));
+      } catch (persistErr) {
+        // Rollback cap to pre-toggle state so config + CLI configs stay consistent
+        for (const key of Object.keys(cap)) {
+          if (!(key in beforeSnapshot)) delete (cap as unknown as Record<string, unknown>)[key];
+        }
+        Object.assign(cap, beforeSnapshot);
+        await writeCapabilitiesConfig(projectRoot, config).catch(() => {});
+        throw persistErr;
+      }
+
+      // Filesystem reconciliation via syncProject/syncAll
+      let localSyncConflicts: MountConflict[] = [];
+      const propagationConflicts: MountConflict[] = [];
+      const propagationWarnings: string[] = [];
+
+      if (shouldWritebackManagedSkill) {
+        const mountRules = await readMountRules(projectRoot, getProjectRoot());
+        const skillsSource = await resolveAgentStudioSkillsSource();
+
+        // R14 P2-2: external projects need global cascade policy
+        let cascadeDisabledSkills: Set<string> | undefined;
+        let globalMountPathsBySkill: Map<string, readonly string[]> | undefined;
+        if (body.scope === 'global' && !pathsEqual(projectRoot, getProjectRoot())) {
+          const globalConfig = await readCapabilitiesConfig(getProjectRoot());
+          const globalManagedCaps =
+            globalConfig?.capabilities.filter(
+              (c) => c.type === 'skill' && c.source === 'agent-studio' && !c.pluginId,
+            ) ?? [];
+          const disabled = new Set<string>();
+          const mountMap = new Map<string, readonly string[]>();
+          for (const gc of globalManagedCaps) {
+            if (!(gc.globalEnabled ?? gc.enabled)) disabled.add(gc.id);
+            if (Array.isArray(gc.mountPaths)) mountMap.set(gc.id, gc.mountPaths);
+          }
+          if (disabled.size > 0) cascadeDisabledSkills = disabled;
+          if (mountMap.size > 0) globalMountPathsBySkill = mountMap;
+        }
+
+        try {
+          // Sync this project's filesystem
+          const localMountPathsBySkill =
+            body.scope === 'project' && Array.isArray(cap.mountPaths)
+              ? new Map<string, readonly string[]>([[cap.id, cap.mountPaths]])
+              : undefined;
+          const syncResult = await syncProject(projectRoot, skillsSource, {
+            mountRules,
+            force: false,
+            cascadeDisabledSkills,
+            mountPathsBySkill: localMountPathsBySkill,
+            globalMountPathsBySkill,
+          });
+          localSyncConflicts = syncResult.conflicts;
+
+          // Global scope: cascade to all external projects
+          if (
+            shouldPropagateManagedSkillToggle(
+              body.scope as 'global' | 'project',
+              shouldWritebackManagedSkill,
+              projectRoot,
+              getProjectRoot(),
+            )
+          ) {
+            const allResult = await syncAll(getProjectRoot(), skillsSource, { mountRules, force: false });
+            propagationWarnings.push(...allResult.warnings);
+            for (const [, projResult] of allResult.perProject) {
+              propagationConflicts.push(...projResult.conflicts);
+            }
+          }
+        } catch (syncErr) {
+          // Rollback config to pre-toggle state so UI/config stays consistent with filesystem
+          // Delete properties added during toggle that weren't in snapshot (e.g. mountPaths)
+          for (const key of Object.keys(cap)) {
+            if (!(key in beforeSnapshot)) delete (cap as unknown as Record<string, unknown>)[key];
+          }
+          Object.assign(cap, beforeSnapshot);
+          await writeCapabilitiesConfig(projectRoot, config).catch(() => {});
+          await generateCliConfigs(config, getCliConfigPaths(projectRoot)).catch(() => {});
+          throw syncErr;
+        }
+      }
+
+      // F228: per-mount-point enable with conflict is treated as partial success
+      // (same as whole-skill enable). Config records user intent; conflict is
+      // reported via propagationConflicts and shown by drift-check. No rollback.
+
+      const allSyncConflicts = [...localSyncConflicts, ...propagationConflicts];
+      // F228: only return conflicts relevant to the toggled skill.
+      // syncProject reconciles ALL skills, but the caller only cares about
+      // the skill they just toggled — other conflicts are already visible
+      // in the drift/conflict checker.
+      const syncConflicts = allSyncConflicts.filter((c) => c.skillName === body.capabilityId);
+
+      await appendAuditEntry(projectRoot, {
+        timestamp: new Date().toISOString(),
+        userId,
+        action: 'toggle',
+        capabilityId: body.capabilityId,
+        before: beforeSnapshot,
+        after: cap,
+      });
+
+      if (propagationWarnings.length > 0) {
+        reply.status(500);
+        const opLabel = body.mountPointId
+          ? `mount point toggle (${body.mountPointId})`
+          : body.enabled
+            ? 'enable'
+            : 'disable';
+        return {
+          ok: false,
+          error: `Global ${opLabel} persisted locally but failed to propagate to ${propagationWarnings.length} project(s).`,
+          capability: sanitizeCapabilityForResponse(cap),
+          failedProjects: propagationWarnings,
+          propagationConflicts: syncConflicts.length > 0 ? syncConflicts : undefined,
+        };
+      }
+      if (syncConflicts.length > 0) {
+        return { ok: true, capability: sanitizeCapabilityForResponse(cap), propagationConflicts: syncConflicts };
+      }
+      return { ok: true, capability: sanitizeCapabilityForResponse(cap) };
+    });
+  });
+
+  // ── F146: MCP write-path routes (preview/install/delete/audit) ──
+  await app.register((await import('./capabilities-mcp-write.js')).capabilitiesMcpWriteRoutes, {
+    getProjectRoot,
+    getCliConfigPaths,
+  });
+
+  // ── POST /api/governance/confirm — F070: First-time confirmation ──
+  app.post('/api/governance/confirm', async (request, reply) => {
+    const userId = resolveUserId(request);
+    if (!userId) {
+      reply.status(401);
+      return { error: 'Identity required' };
+    }
+
+    const body = request.body as { projectPath?: string } | undefined;
+    if (!body?.projectPath) {
+      reply.status(400);
+      return { error: 'Required: projectPath' };
+    }
+
+    const validated = await validateProjectPath(body.projectPath);
+    if (!validated) {
+      reply.status(400);
+      return { error: 'Invalid project path' };
+    }
+
+    const agentStudioRoot = getProjectRoot();
+    if (validated === agentStudioRoot) {
+      reply.status(400);
+      return { error: 'Cannot confirm governance for Agent Studio itself' };
+    }
+
+    const { GovernanceBootstrapService } = await import('../config/governance/governance-bootstrap.js');
+    const service = new GovernanceBootstrapService(agentStudioRoot);
+    const report = await service.bootstrap(validated, { dryRun: false });
+
+    return { ok: true, report };
+  });
+
+  // ── GET /api/governance/health — F070: All project health ──
+  app.get('/api/governance/health', async (request, reply) => {
+    const userId = resolveUserId(request);
+    if (!userId) {
+      reply.status(401);
+      return { error: 'Identity required' };
+    }
+
+    const agentStudioRoot = getProjectRoot();
+    const { GovernanceRegistry } = await import('../config/governance/governance-registry.js');
+    const registry = new GovernanceRegistry(agentStudioRoot);
+    const entries = await registry.listAll();
+
+    const healthResults = await Promise.all(entries.map((entry) => registry.checkHealth(entry.projectPath)));
+
+    return { projects: healthResults };
+  });
+
+  // ── POST /api/governance/discover — F070: Find unsynced external projects ──
+  // Frontend sends known external projectPaths (from thread data),
+  // backend cross-references with registry to find never-synced ones.
+  app.post('/api/governance/discover', async (request, reply) => {
+    const userId = resolveUserId(request);
+    if (!userId) {
+      reply.status(401);
+      return { error: 'Identity required' };
+    }
+
+    const body = request.body as { projectPaths?: string[] } | undefined;
+    if (!body?.projectPaths || !Array.isArray(body.projectPaths)) {
+      reply.status(400);
+      return { error: 'Required: projectPaths (string[])' };
+    }
+
+    const agentStudioRoot = getProjectRoot();
+    const { GovernanceRegistry } = await import('../config/governance/governance-registry.js');
+    const registry = new GovernanceRegistry(agentStudioRoot);
+
+    const unsynced: string[] = [];
+    for (const pp of body.projectPaths) {
+      if (typeof pp !== 'string' || pp === 'default' || pp === agentStudioRoot) continue;
+      const entry = await registry.get(pp);
+      if (!entry) {
+        unsynced.push(pp);
+      }
+    }
+
+    return { unsynced };
+  });
+};

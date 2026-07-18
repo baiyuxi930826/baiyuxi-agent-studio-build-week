@@ -1,0 +1,2193 @@
+/**
+ * Messages API Routes
+ * POST /api/messages - 发送消息 (JSON or multipart with images)
+ * GET /api/messages - 获取历史消息
+ *
+ * IMPORTANT: threadId 约束
+ * 生产代码应显式包含 threadId（sendMessageSchema 字段 threadId）。
+ * 兼容行为：未传 threadId 时会降级到 'default' thread（历史行为）。
+ * 跨线程鉴权、InvocationTracker、消息存储都依赖正确的 threadId。
+ * 前端应先确保 thread 存在（POST /api/threads）再发消息。
+ *
+ * ADR-008 S1: 消息写入与智能体调用执行解耦。
+ * POST 流程: 原子创建 InvocationRecord → 写入用户消息 → 回填 → reply 202 → background 执行
+ */
+
+import { randomUUID } from 'node:crypto';
+import { type AgentId, type AgentRoutingError, agentRegistry, type MessageContent } from '@agent-studio/shared';
+import type { SessionStore } from '@agent-studio/shared/utils';
+import multipart from '@fastify/multipart';
+import type { FastifyPluginAsync } from 'fastify';
+import { z } from 'zod';
+import { getDefaultAgentId } from '../config/agent-config-loader.js';
+import { resolveFrontendBaseUrl } from '../config/frontend-origin.js';
+import {
+  type CollaborationContinuityCapsuleV1,
+  extractContinuityCapsuleFromAgentMessage,
+} from '../domains/agents/services/agents/invocation/CollaborationContinuityCapsule.js';
+import {
+  ensureTerminalStatus,
+  RouteChainCompletionTracker,
+} from '../domains/agents/services/agents/invocation/ensureTerminalStatus.js';
+import { getThreadLiveInvocations } from '../domains/agents/services/agents/invocation/getThreadLiveInvocations.js';
+import type { InvocationQueue } from '../domains/agents/services/agents/invocation/InvocationQueue.js';
+import type { InvocationRegistry } from '../domains/agents/services/agents/invocation/InvocationRegistry.js';
+import type { InvocationTracker } from '../domains/agents/services/agents/invocation/InvocationTracker.js';
+import type {
+  QueueProcessor,
+  SessionContinuationCoordinatorLike,
+} from '../domains/agents/services/agents/invocation/QueueProcessor.js';
+import { reconcileZombies } from '../domains/agents/services/agents/invocation/reconcileZombies.js';
+import type { ConsumedContinuationToken } from '../domains/agents/services/agents/invocation/SessionContinuationCoordinator.js';
+import type { TaskProgressStore } from '../domains/agents/services/agents/invocation/TaskProgressStore.js';
+import { stampVisibleTurn } from '../domains/agents/services/agents/invocation/visible-turn.js';
+import type { PersistenceContext } from '../domains/agents/services/agents/routing/route-helpers.js';
+import { resetStreak } from '../domains/agents/services/agents/routing/WorklistRegistry.js';
+import {
+  accumulateTextParts,
+  flattenTextParts,
+  flattenTurnTextParts,
+} from '../domains/agents/services/agents/text-aggregation.js';
+import { createGameDriver } from '../domains/agents/services/game/createGameDriver.js';
+import type { GameDriver } from '../domains/agents/services/game/GameDriver.js';
+import { GameOrchestrator } from '../domains/agents/services/game/GameOrchestrator.js';
+import { WerewolfLobby } from '../domains/agents/services/game/werewolf/WerewolfLobby.js';
+import type { AgentRouter } from '../domains/agents/services/index.js';
+import { getPushNotificationService } from '../domains/agents/services/push/PushNotificationService.js';
+import type { DeliveryCursorStore } from '../domains/agents/services/stores/ports/DeliveryCursorStore.js';
+import type { IDraftStore } from '../domains/agents/services/stores/ports/DraftStore.js';
+import type { IGameStore } from '../domains/agents/services/stores/ports/GameStore.js';
+import type { IInvocationRecordStore } from '../domains/agents/services/stores/ports/InvocationRecordStore.js';
+import type { IMessageStore } from '../domains/agents/services/stores/ports/MessageStore.js';
+import { isDelivered } from '../domains/agents/services/stores/ports/MessageStore.js';
+import type { ISummaryStore } from '../domains/agents/services/stores/ports/SummaryStore.js';
+import type { IThreadStore } from '../domains/agents/services/stores/ports/ThreadStore.js';
+import { isInternalNonQuotableParent, isSystemUserMessage } from '../domains/agents/services/stores/visibility.js';
+import { mergeTokenUsage, type TokenUsage } from '../domains/agents/services/types.js';
+import { buildThreadDeepLink } from '../infrastructure/connectors/connector-command-helpers.js';
+import { createModuleLogger } from '../infrastructure/logger.js';
+import { buildCancelMessages, type SocketManager } from '../infrastructure/websocket/index.js';
+import { getDefaultUploadDir } from '../utils/upload-paths.js';
+
+/** F088 ISSUE-15: Minimal outbound delivery interface — avoids importing full OutboundDeliveryHook. */
+interface OutboundDeliveryHookLike {
+  deliver(
+    threadId: string,
+    content: string,
+    agentId?: string,
+    richBlocks?: unknown[],
+    threadMeta?: { threadShortId: string; threadTitle?: string; deepLinkUrl?: string },
+    origin?: string,
+    triggerMessageId?: string,
+  ): Promise<void>;
+}
+
+/** F088 ISSUE-15: Minimal streaming hook interface. */
+interface StreamingHookLike {
+  onStreamStart(
+    threadId: string,
+    agentId?: string,
+    invocationId?: string,
+    senderHint?: { id: string; name?: string },
+  ): Promise<void>;
+  onStreamChunk(threadId: string, accumulatedText: string, invocationId?: string): Promise<void>;
+  onStreamEnd(threadId: string, finalText: string, invocationId?: string): Promise<void>;
+  cleanupPlaceholders?(threadId: string, invocationId?: string): Promise<void>;
+  /** F151: Signal adapters that an invocation's delivery batch is complete. */
+  notifyDeliveryBatchDone?(threadId: string, chainDone: boolean): Promise<void>;
+}
+
+import { normalizeErrorMessage } from '../utils/normalize-error.js';
+import { emitQueueUpdated, enrichQueueEntries } from '../utils/queue-enrichment.js';
+import { resolveUserId } from '../utils/request-identity.js';
+import { buildGameSeats, parseGameCommand, sanitizeAgentIds } from './game-command-interceptor.js';
+import type { HoldBallCancelDeps } from './hold-ball-cancel.js';
+import { cancelPendingHoldsForThread } from './hold-ball-cancel.js';
+import { sendMessageSchema } from './messages.schema.js';
+import { parseMultipart } from './parse-multipart.js';
+
+const STREAM_START_TIMEOUT_MS = 5_000;
+const INVOCATION_STARTUP_WATCHDOG_MS = 180_000;
+
+/**
+ * Dependencies injected via Fastify plugin options.
+ * socketManager is injected to avoid circular import from index.ts.
+ */
+/** F194 Phase Z3 (KD-23): process-singleton in-memory map tracking routeExecution chain
+ *  completion signals for parent recordStore invocations. Producer sets pending/succeeded/failed;
+ *  background async finally reads this to terminalize records that escaped explicit terminal write. */
+const routeChainTracker = new RouteChainCompletionTracker();
+
+export interface MessagesRoutesOptions {
+  registry: InvocationRegistry;
+  messageStore: IMessageStore;
+  socketManager: SocketManager;
+  router: AgentRouter;
+  sessionStore?: SessionStore;
+  deliveryCursorStore?: DeliveryCursorStore;
+  threadStore?: IThreadStore;
+  uploadDir?: string;
+  invocationTracker?: InvocationTracker;
+  invocationRecordStore?: IInvocationRecordStore;
+  /** F194 AC-B7: when helper detects zombies, reconcileZombies clears their TaskProgress
+   *  snapshot so the frontend doesn't show phantom progress. Optional — cleanup still marks
+   *  records `failed` even without this. */
+  taskProgressStore?: TaskProgressStore;
+
+  summaryStore?: ISummaryStore;
+  /** #80: Streaming draft store for F5 recovery */
+  draftStore?: IDraftStore;
+  /** F39: Message queue for delivery-mode routing */
+  invocationQueue?: InvocationQueue;
+  /** F39: Queue processor for auto-dequeue on invocation complete */
+  queueProcessor?: QueueProcessor;
+  /** F224: Shared continuation lifecycle coordinator for direct immediate invocations. */
+  sessionContinuationCoordinator?: SessionContinuationCoordinatorLike;
+  /** Test/diagnostic override for releasing invocations that never produce a provider/session event. */
+  invocationStartupWatchdogMs?: number;
+  /** F101: Game store for /game command interception */
+  gameStore?: IGameStore;
+  /** F101: Injectable auto-player for lifecycle-safe teardown in tests/routes */
+  autoPlayer?: Pick<GameDriver, 'startLoop' | 'stopLoop' | 'stopAllLoops'>;
+  /** F088 ISSUE-15: Outbound delivery hook for connector platforms (late-bound after gateway bootstrap) */
+  outboundHook?: OutboundDeliveryHookLike;
+  /** F088 ISSUE-15: Streaming hook for connector platforms (late-bound after gateway bootstrap) */
+  streamingHook?: StreamingHookLike;
+  /** F167 Phase J: deps for auto-cancelling pending hold-ball tasks on user message */
+  holdBallCancelDeps?: HoldBallCancelDeps;
+  /** F192 Phase G AC-G12 / F227 归一: callback when magic words detected in a user
+   * message. messageId is the stored user-message id — the Event Memory teleport
+   * coordinate. */
+  onMagicWordDetected?: (
+    hits: Array<{ word: string }>,
+    threadId: string,
+    agentId: string | null,
+    messageId: string,
+    ownerUserId: string,
+    messageExcerpt?: string,
+  ) => void;
+}
+
+const log = createModuleLogger('routes/messages');
+
+async function shouldEnqueueDirectContinuation(
+  capsule: CollaborationContinuityCapsuleV1,
+  userId: string,
+  coordinator?: SessionContinuationCoordinatorLike,
+): Promise<boolean> {
+  if (!coordinator?.resolveSessionStrategy) return true;
+  try {
+    const strategy = await coordinator.resolveSessionStrategy(capsule.threadId, capsule.agentId, userId);
+    if (strategy === 'reborn') {
+      log.info(
+        { threadId: capsule.threadId, agentId: capsule.agentId },
+        '[messages] F224: reborn session — skipping continuation enqueue',
+      );
+      return false;
+    }
+    return true;
+  } catch (err) {
+    log.warn(
+      { err, threadId: capsule.threadId, agentId: capsule.agentId },
+      '[messages] F224: resolveSessionStrategy failed for continuation enqueue, defaulting to enqueue',
+    );
+    return true;
+  }
+}
+
+/**
+ * F192 Phase G AC-G12: detect magic words in user message content.
+ * Best-effort, fire-and-forget — failures are silently swallowed.
+ * Called from both queued and immediate message paths.
+ */
+async function tryDetectMagicWords(
+  content: string | null | undefined,
+  threadId: string,
+  targetAgents: string[],
+  messageId: string | null | undefined,
+  ownerUserId: string | null | undefined,
+  onMagicWordDetected?: MessagesRoutesOptions['onMagicWordDetected'],
+): Promise<void> {
+  // F227 归一: messageId is the Event Memory teleport coordinate — never guess it
+  // from thread/time. If it is unavailable, skip rather than store a
+  // coordinate-less event.
+  if (!onMagicWordDetected || !content || !messageId) return;
+  // F227 (cloud-review P1 / 砚砚): the live write must carry the authenticated owner —
+  // skip + report rather than store an unscoped event (no unknown/default fallback).
+  if (!ownerUserId) {
+    log.warn({ threadId, messageId }, 'magic-word event skipped: message has no owner userId');
+    return;
+  }
+  try {
+    const { detectMagicWords } = await import('../infrastructure/harness-eval/task-outcome/magic-word-detector.js');
+    const hits = detectMagicWords(content);
+    if (hits.length > 0) {
+      // 砚砚 (non-blocking): pass a short excerpt of the triggering message so the
+      // Event summary carries 原话 context, not just the magic word itself.
+      const excerpt = content.length > 200 ? `${content.slice(0, 200)}…` : content;
+      onMagicWordDetected(hits, threadId, targetAgents[0] ?? null, messageId, ownerUserId, excerpt);
+    }
+  } catch {
+    // Best-effort: the detection/dispatch wrapper must not fail message send. The
+    // Event-write fail-loud policy lives inside onMagicWordDetected itself (it logs
+    // + observes rather than throwing), so it is not swallowed here.
+  }
+}
+
+/**
+ * F-invocation-stale-recovery P1-2: Format routing_warnings for user-visible system_info broadcast.
+ * Mirrors the pattern in callbacks.ts buildPostMessageRoutingMessage.
+ */
+function formatRoutingWarnings(warnings: AgentRoutingError[]): string {
+  const parts: string[] = [];
+  for (const w of warnings) {
+    if (w.kind === 'agent_disabled') {
+      const alts = w.alternatives
+        .slice(0, 2)
+        .map((a) => a.mention)
+        .join('、');
+      parts.push(`@${w.agentId} 已停用，已跳过${alts ? `（可用替代：${alts}）` : ''}。`);
+    } else {
+      parts.push(`${w.mention} 不存在，已跳过。`);
+    }
+  }
+  return parts.join(' ');
+}
+
+function tryAutoCancelPendingHolds(threadId: string, deps: HoldBallCancelDeps | undefined): void {
+  if (!deps) return;
+  try {
+    const cancelled = cancelPendingHoldsForThread(threadId, deps);
+    if (cancelled.length > 0) {
+      log.info(
+        { threadId, cancelledCount: cancelled.length, taskIds: cancelled.map((t) => t.id) },
+        'F167 Phase J: auto-cancelled pending hold-ball tasks on user message',
+      );
+    }
+  } catch (err) {
+    log.warn({ threadId, err }, 'F167 Phase J: failed to auto-cancel pending holds');
+  }
+}
+
+async function persistA2ARoutingMessage(
+  messageStore: IMessageStore,
+  msg: { agentId?: string; content?: string; invocationId?: string; targetAgentId?: string; timestamp: number },
+  threadId: string,
+): Promise<string | undefined> {
+  if (!msg.content) return undefined;
+  try {
+    const stored = await messageStore.append({
+      userId: 'system',
+      agentId: null,
+      content: msg.content,
+      mentions: [],
+      timestamp: msg.timestamp,
+      threadId,
+      extra: {
+        systemKind: 'a2a_routing',
+        a2aRouting: {
+          fromAgentId: msg.agentId,
+          targetAgentId: msg.targetAgentId,
+          invocationId: msg.invocationId,
+        },
+      },
+    });
+    return stored.id;
+  } catch (err) {
+    log.warn({ err, threadId }, 'Failed to persist a2a_handoff');
+    return undefined;
+  }
+}
+
+const getMessagesSchema = z.object({
+  limit: z.coerce.number().int().min(1).max(10000).default(50),
+  /** Cursor: "timestamp:id" or legacy plain timestamp */
+  before: z.string().optional(),
+  threadId: z.string().min(1).max(100).optional(),
+});
+
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+const MAX_FILES = 5;
+
+const DECISION_NOTIFICATION_RE = /\b(review|lgtm|merge|pr)\b/i;
+
+export function shouldMarkDecisionNotification(content: string): boolean {
+  const lower = content.toLowerCase();
+  return (
+    DECISION_NOTIFICATION_RE.test(content) ||
+    content.includes('合入') ||
+    content.includes('审批') ||
+    content.includes('批准') ||
+    content.includes('决策') ||
+    content.includes('请确认') ||
+    content.includes('是否允许') ||
+    lower.includes('can merge')
+  );
+}
+
+export const messagesRoutes: FastifyPluginAsync<MessagesRoutesOptions> = async (app, opts) => {
+  const uploadDir = getDefaultUploadDir(opts.uploadDir ?? process.env.UPLOAD_DIR);
+
+  // Register multipart parser for image uploads
+  await app.register(multipart, {
+    limits: { fileSize: MAX_FILE_SIZE, files: MAX_FILES },
+  });
+
+  // Shared AgentRouter injected via opts (created in index.ts)
+  const router = opts.router;
+  const gameOrchestrator = opts.gameStore
+    ? new GameOrchestrator({
+        gameStore: opts.gameStore,
+        socketManager: opts.socketManager,
+        messageStore: opts.messageStore,
+      })
+    : null;
+  const gameAutoPlayer = gameOrchestrator
+    ? (opts.autoPlayer ??
+      createGameDriver({
+        gameNarratorEnabled: false,
+        legacyDeps: {
+          gameStore: opts.gameStore!,
+          orchestrator: gameOrchestrator,
+          messageStore: opts.messageStore,
+        },
+      }))
+    : null;
+
+  if (gameAutoPlayer) {
+    app.addHook('onClose', async () => {
+      gameAutoPlayer.stopAllLoops();
+    });
+  }
+
+  // POST /api/messages - 发送消息（WebSocket 广播）
+  app.post('/api/messages', async (request, reply) => {
+    let content: string;
+    let legacyUserId: string | undefined;
+    let threadId: string | undefined;
+    let contentBlocks: MessageContent[] | undefined;
+    let idempotencyKey: string | undefined;
+    // F35: Whisper fields
+    let whisperVisibility: 'whisper' | undefined;
+    let whisperRecipients: readonly AgentId[] | undefined;
+
+    // F39: Delivery mode
+    let deliveryMode: 'immediate' | 'queue' | 'force' | undefined;
+
+    // #699: Reply-to (quote) reference
+    let replyTo: string | undefined;
+
+    if (request.isMultipart()) {
+      // Parse multipart: text fields + image files
+      const parsed = await parseMultipart(request, uploadDir);
+      if ('error' in parsed) {
+        reply.status(400);
+        return { error: parsed.error };
+      }
+      ({ content, userId: legacyUserId, threadId, contentBlocks } = parsed);
+      if ('idempotencyKey' in parsed && parsed.idempotencyKey) {
+        idempotencyKey = parsed.idempotencyKey;
+      }
+      // F35: Extract whisper fields from multipart
+      if (parsed.visibility === 'whisper' && parsed.whisperTo) {
+        whisperVisibility = 'whisper';
+        whisperRecipients = parsed.whisperTo as AgentId[];
+      }
+      // F39: Extract deliveryMode from multipart
+      if (parsed.deliveryMode) {
+        deliveryMode = parsed.deliveryMode;
+      }
+      // #699: Extract replyTo from multipart
+      if (parsed.replyTo) {
+        replyTo = parsed.replyTo;
+      }
+    } else {
+      // JSON mode (backwards compatible)
+      const parseResult = sendMessageSchema.safeParse(request.body);
+      if (!parseResult.success) {
+        reply.status(400);
+        return { error: 'Invalid request body', details: parseResult.error.issues };
+      }
+      ({ content, userId: legacyUserId, threadId, idempotencyKey } = parseResult.data);
+      deliveryMode = parseResult.data.deliveryMode;
+      // F35: Extract whisper fields from parsed body
+      if (parseResult.data.visibility === 'whisper') {
+        whisperVisibility = 'whisper';
+        whisperRecipients = parseResult.data.whisperTo as AgentId[] | undefined;
+      }
+      // #699: Extract replyTo from JSON body
+      replyTo = parseResult.data.replyTo;
+    }
+
+    const userId = resolveUserId(request, {
+      fallbackUserId: legacyUserId,
+      defaultUserId: 'default-user',
+    });
+    if (!userId) {
+      reply.status(401);
+      return { error: 'Identity required (session cookie or X-Agent-Studio-User header)' };
+    }
+
+    // Default to 'default' thread for lobby (prevents global broadcast)
+    const resolvedThreadId = threadId ?? 'default';
+
+    // F167 L1 AC-A3: user message is a fresh turn — clear any in-flight ping-pong
+    // streak on this thread's active worklist (no-op if none).
+    resetStreak(resolvedThreadId);
+
+    // Ensure thread exists and auto-title on first message
+    if (resolvedThreadId !== 'default' && opts.threadStore) {
+      const thread = await opts.threadStore.get(resolvedThreadId);
+
+      if (!thread || thread.deletedAt) {
+        // Thread doesn't exist or soft-deleted — reject to prevent orphaned messages (#21 + Phase D)
+        reply.status(400);
+        return {
+          error: '对话不存在',
+          detail: '请先创建对话后再发送消息。如果对话已被删除，请新建一个。',
+          code: 'THREAD_NOT_FOUND',
+        };
+      } else if (thread.title === null) {
+        // Auto-title existing untitled thread
+        const autoTitle = content.length > 30 ? `${content.slice(0, 30)}...` : content;
+        await opts.threadStore.updateTitle(resolvedThreadId, autoTitle);
+        opts.socketManager.broadcastToRoom(`thread:${resolvedThreadId}`, 'thread_updated', {
+          threadId: resolvedThreadId,
+          title: autoTitle,
+        });
+      }
+    }
+
+    // Delete guard check (read-only, no side effects — safe before idempotency check)
+    if (opts.invocationTracker?.isDeleting(resolvedThreadId)) {
+      reply.status(409);
+      return {
+        error: '对话正在删除中',
+        detail: '请稍后重试，或新建一个对话继续',
+        code: 'THREAD_DELETING',
+      };
+    }
+
+    // #699 P1-2: Validate replyTo — must exist in same thread, not deleted, and delivered
+    if (replyTo) {
+      const replyTarget = await opts.messageStore.getById(replyTo);
+      if (
+        !replyTarget ||
+        replyTarget.deletedAt ||
+        replyTarget.threadId !== resolvedThreadId ||
+        !isDelivered(replyTarget) ||
+        // #699 P1 (gpt52 intake review): align user-direct path with isEligibleReplyParent —
+        // system/briefing are internal, non-routable, must not be quotable (else hydrateReplyPreview leaks raw content)
+        isInternalNonQuotableParent(replyTarget)
+      ) {
+        replyTo = undefined;
+      } else if (replyTarget.visibility === 'whisper') {
+        // #699: Prevent public replies from quoting hidden whispers.
+        // hydrateReplyPreview fetches raw content without visibility checks,
+        // so a public reply's preview would leak whisper content to non-recipients.
+        if (whisperVisibility !== 'whisper') {
+          // Public message replying to a whisper → drop replyTo
+          replyTo = undefined;
+        } else {
+          // Whisper replying to a whisper → ensure all new recipients can see the parent
+          const parentRecipients = new Set(replyTarget.whisperTo ?? []);
+          const newRecipients = whisperRecipients ?? [];
+          if (newRecipients.some((agentId) => !parentRecipients.has(agentId))) {
+            replyTo = undefined;
+          }
+        }
+      }
+    }
+
+    // F101: /game command interception — start game directly, skip AI routing
+    const parsedGame = parseGameCommand(content);
+    if (parsedGame && opts.gameStore && opts.threadStore) {
+      if (!gameOrchestrator || !gameAutoPlayer) {
+        throw new Error('game auto-player is unavailable');
+      }
+
+      const DEFAULT_PLAYER_COUNT = 7;
+      const allAgentIds = agentRegistry.getAllIds();
+      const sanitized = parsedGame.agentIds ? sanitizeAgentIds(parsedGame.agentIds, allAgentIds) : [];
+      // Fallback to all agents if sanitize filtered everything out (or no agentIds provided)
+      const agentIds = sanitized.length > 0 ? sanitized : [...allAgentIds];
+      if (agentIds.length === 0) {
+        reply.status(400);
+        return { error: '没有可用的 Agent 成员，请先在设置中添加一个 Agent', code: 'NO_TARGETS' };
+      }
+      const playerCount = parsedGame.playerCount ?? DEFAULT_PLAYER_COUNT;
+      const seats = buildGameSeats({
+        humanRole: parsedGame.humanRole,
+        userId,
+        agentIds,
+        playerCount,
+      });
+
+      // Phase D: Create independent game thread with project categorization
+      const ts = new Date()
+        .toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' })
+        .replace(' ', '-')
+        .replaceAll(':', '');
+      const gameTitle = `狼人杀 — ${playerCount}人局 (${ts})`;
+      const gameThread = await opts.threadStore.create(userId, gameTitle, `games/${parsedGame.gameType}`);
+      const gameThreadId = gameThread.id;
+      await opts.threadStore.updatePin(gameThreadId, true);
+
+      // Notify source thread about the new game thread (include initiator for frontend guard)
+      opts.socketManager.broadcastToRoom(`thread:${resolvedThreadId}`, 'game:thread_created', {
+        gameThreadId,
+        gameTitle,
+        initiatorUserId: userId,
+        timestamp: Date.now(),
+      });
+
+      // Store user message in the game thread
+      const userMessage = await opts.messageStore.append({
+        userId,
+        agentId: null,
+        content,
+        mentions: [],
+        timestamp: Date.now(),
+        threadId: gameThreadId,
+      });
+
+      // Use WerewolfLobby for role assignment, then orchestrator for persistence + broadcast
+      const lobby = new WerewolfLobby();
+      const lobbyRuntime = lobby.createLobby({
+        threadId: gameThreadId,
+        playerCount,
+        players: seats.map((s) => ({ actorType: s.actorType, actorId: s.actorId })),
+      });
+      lobby.startGame(lobbyRuntime);
+
+      let gameRuntime;
+      try {
+        gameRuntime = await gameOrchestrator.startGame({
+          threadId: gameThreadId,
+          definition: lobbyRuntime.definition,
+          seats: lobbyRuntime.seats,
+          config: {
+            timeoutMs: 30000,
+            voiceMode: parsedGame.voiceMode,
+            humanRole: parsedGame.humanRole,
+            ...(parsedGame.humanRole === 'player' ? { humanSeat: 'P1' } : {}),
+            observerUserId: userId, // H2 fix: messageStore dual-write needs userId for thread visibility
+          },
+        });
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (message.includes('already has an active game')) {
+          reply.status(409);
+          return { error: message };
+        }
+        throw err;
+      }
+
+      // Broadcast scoped views so frontend receives game:state_update
+      await gameOrchestrator.broadcastGameState(gameRuntime.gameId);
+
+      // AC-C3: Start AI auto-play loop — agents submit actions asynchronously
+      gameAutoPlayer.startLoop(gameRuntime.gameId);
+
+      return {
+        status: 'game_started',
+        gameId: gameRuntime.gameId,
+        gameThreadId,
+        userMessageId: userMessage.id,
+      };
+    }
+
+    // ADR-008 S1: Pre-resolve targets + intent, persisting @mentions as participants
+    log.debug({ threadId: resolvedThreadId, contentLen: content.length }, 'Resolving targets and intent');
+    const {
+      targetAgents: resolvedTargetAgents,
+      intent,
+      hasMentions,
+      routing_warnings,
+    } = await router.resolveTargetsAndIntent(content, resolvedThreadId, {
+      persist: true,
+    });
+    // F35: When sending a whisper, override routing targets to only whisperTo recipients.
+    // This prevents non-recipient agents from being invoked and seeing whisper content.
+    const targetAgents =
+      whisperVisibility === 'whisper' && whisperRecipients?.length
+        ? [...new Set(whisperRecipients)]
+        : [...resolvedTargetAgents];
+    if (targetAgents.length === 0) {
+      reply.status(400);
+      return { error: '没有可用的 Agent 成员，请先在设置中添加一个 Agent', code: 'NO_TARGETS' };
+    }
+    const primaryAgent = targetAgents[0] ?? 'unknown';
+
+    // F-invocation-stale-recovery P1-2: Surface routing_warnings when user's explicit @mention
+    // silently fell back (e.g., @kimi → agent_not_found → default agent, user sees no feedback).
+    // Non-whisper only (whisper targets are overridden above; warning is not meaningful there).
+    if (routing_warnings && routing_warnings.length > 0 && whisperVisibility !== 'whisper') {
+      const warningMsg = formatRoutingWarnings(routing_warnings);
+      opts.socketManager.broadcastAgentMessage(
+        {
+          type: 'system_info',
+          agentId: primaryAgent,
+          // Use 'warning' type — recognized by system-info-visible.ts (reads parsed.message)
+          content: JSON.stringify({
+            type: 'warning',
+            message: warningMsg,
+          }),
+          timestamp: Date.now(),
+        },
+        resolvedThreadId,
+      );
+    }
+
+    // Server-generated idempotency key if client didn't provide one
+    const resolvedIdempotencyKey = idempotencyKey ?? randomUUID();
+
+    // F39+F108B: Slot-aware delivery mode routing
+    // Whisper → check target agent's slot (side-dispatch to idle agent)
+    // Broadcast with explicit @mention → any target busy = queue (P1 review fix)
+    // Broadcast without @mention → thread-level check (any active → queue)
+    // #555: Cover the gap between one invocation ending (tracker cleared) and the
+    // next starting from queue (tracker not yet registered).
+    // Whisper / @mention use agent-specific isAgentBusy; broadcast uses active execution,
+    // not queued leftovers, to avoid enqueue-only dead ends.
+    const hasActive = (() => {
+      if (!opts.invocationTracker) {
+        return opts.queueProcessor?.hasActiveExecution?.(resolvedThreadId) ?? false;
+      }
+      if (whisperVisibility === 'whisper' && primaryAgent !== 'unknown') {
+        return (
+          opts.invocationTracker.has(resolvedThreadId, primaryAgent) ||
+          (opts.queueProcessor?.isAgentBusy?.(resolvedThreadId, primaryAgent) ?? false)
+        );
+      }
+      if (hasMentions) {
+        return targetAgents.some(
+          (agent) =>
+            agent !== 'unknown' &&
+            (opts.invocationTracker!.has(resolvedThreadId, agent) ||
+              (opts.queueProcessor?.isAgentBusy?.(resolvedThreadId, agent) ?? false)),
+        );
+      }
+      return (
+        opts.invocationTracker.has(resolvedThreadId) ||
+        (opts.queueProcessor?.hasActiveExecution?.(resolvedThreadId) ?? false)
+      );
+    })();
+    const mode = deliveryMode ?? (hasActive ? 'queue' : 'immediate');
+    log.debug(
+      { threadId: resolvedThreadId, targetAgents, intent: intent.intent, mode, hasActive },
+      'Dispatch decision',
+    );
+
+    if (mode === 'queue' && hasActive && opts.invocationQueue) {
+      // ① Enqueue first (sync, capacity gatekeeper) — messageId is null at this point
+      const enqueueResult = opts.invocationQueue.enqueue({
+        threadId: resolvedThreadId,
+        userId,
+        idempotencyKey: resolvedIdempotencyKey,
+        content,
+        source: 'user',
+        targetAgents,
+        intent: intent.intent,
+      });
+
+      // Queue full → 429, no message written (no ghost message)
+      if (enqueueResult.outcome === 'full') {
+        const fullQueue = await enrichQueueEntries(
+          opts.invocationQueue.list(resolvedThreadId, userId),
+          opts.messageStore,
+        );
+        opts.socketManager.emitToUser(userId, 'queue_full_warning', {
+          threadId: resolvedThreadId,
+          source: 'user',
+          queueSize: opts.invocationQueue.size(resolvedThreadId, userId),
+          queue: fullQueue,
+        });
+        reply.status(429);
+        return {
+          error: '消息队列已满',
+          code: 'QUEUE_FULL',
+          queueSize: opts.invocationQueue.size(resolvedThreadId, userId),
+        };
+      }
+
+      let storedUserMessageId: string | null = enqueueResult.entry?.messageId ?? null;
+
+      // ② Write user message (F117: mark as queued — invisible until dequeue)
+      // If enqueue returned a deduped active entry, reuse existing messageId and skip append.
+      if (!enqueueResult.deduped) {
+        try {
+          const userMessage = await opts.messageStore.append({
+            userId,
+            agentId: null,
+            content,
+            mentions: targetAgents,
+            timestamp: Date.now(),
+            threadId: resolvedThreadId,
+            idempotencyKey: resolvedIdempotencyKey,
+            deliveryStatus: 'queued', // F117: not visible in history/context/mentions until delivered
+            ...(contentBlocks ? { contentBlocks } : {}),
+            ...(whisperVisibility && whisperRecipients
+              ? { visibility: whisperVisibility, whisperTo: whisperRecipients }
+              : {}),
+            ...(replyTo ? { replyTo } : {}),
+          });
+          storedUserMessageId = userMessage.id;
+
+          // F192 Phase G AC-G12 / F227: detect magic words → Event Memory (queued path)
+          void tryDetectMagicWords(
+            content,
+            resolvedThreadId,
+            targetAgents,
+            storedUserMessageId,
+            userId,
+            opts.onMagicWordDetected,
+          );
+
+          const queueEntryId = enqueueResult.entry?.id;
+          if (queueEntryId) {
+            opts.invocationQueue.backfillMessageId(resolvedThreadId, userId, queueEntryId, userMessage.id);
+          }
+        } catch (err) {
+          const queueEntryId = enqueueResult.entry?.id;
+          if (queueEntryId) {
+            opts.invocationQueue.rollbackEnqueue(resolvedThreadId, userId, queueEntryId);
+          }
+          throw err;
+        }
+      }
+
+      // Emit queue update to this user only (privacy: scopeKey isolation)
+      await emitQueueUpdated(
+        opts.socketManager,
+        userId,
+        resolvedThreadId,
+        opts.invocationQueue.list(resolvedThreadId, userId),
+        opts.messageStore,
+        enqueueResult.outcome,
+      );
+
+      tryAutoCancelPendingHolds(resolvedThreadId, opts.holdBallCancelDeps);
+
+      reply.status(202);
+      return {
+        status: 'queued',
+        queuePosition: enqueueResult.queuePosition,
+        entryId: enqueueResult.entry?.id,
+        merged: false,
+        ...(storedUserMessageId ? { userMessageId: storedUserMessageId } : {}),
+      };
+    }
+
+    if (mode === 'force' && hasActive) {
+      // F-parallel-cancel (cloud #6): force = preempt the TARGET invocation, NOT the whole thread.
+      // After the batchController split, cancel(primaryAgent) no longer stops the whole old invocation
+      // (the old behaviour relied on primary == shared execution gate), and the new dispatch's
+      // startAll only preempts targetAgents — multi-agent siblings of the OLD invocation would keep
+      // running. cancelInvocation aborts exactly the targetAgents' invocation (their batch gate + every
+      // slot under it) while leaving an UNRELATED side-dispatch (e.g. an idle-agent whisper for a
+      // different agent in the same thread) untouched. cancelAll() stays the whole-thread reset.
+      // 'preempted' reason → plain canceled (force immediately starts a new invocation below, so no
+      // suppress-auto-resume).
+      const cancelledAgentIds =
+        opts.invocationTracker?.cancelInvocation?.(resolvedThreadId, targetAgents, userId, 'preempted') ?? [];
+      const clearedAgents = cancelledAgentIds.length > 0 ? cancelledAgentIds : [primaryAgent];
+      if (cancelledAgentIds.length > 0) {
+        for (const m of buildCancelMessages({ cancelled: true, agentIds: cancelledAgentIds })) {
+          opts.socketManager.broadcastAgentMessage(m, resolvedThreadId);
+        }
+      }
+      // F39 bugfix: Prevent QueueProcessor state poisoning — the old invocation's
+      // async cleanup will call onInvocationComplete('failed'/'canceled') which pauses
+      // the thread. Clear that preemptively since we're about to start a new invocation.
+      for (const c of clearedAgents) opts.queueProcessor?.clearPause(resolvedThreadId, c);
+
+      // F39 bugfix: Notify frontend that force-cancel happened (clear stale queue UI)
+      if (opts.invocationQueue) {
+        await emitQueueUpdated(
+          opts.socketManager,
+          userId,
+          resolvedThreadId,
+          opts.invocationQueue.list(resolvedThreadId, userId),
+          opts.messageStore,
+          'force_cleared',
+        );
+      }
+      // Fall through to immediate execution below
+    }
+
+    // ① F122 A.1: Occupy tracker slot BEFORE creating InvocationRecord to close TOCTOU window.
+    // Non-force paths use tryStartThread (non-preemptive); force uses start() (preemptive, already cancelled above).
+    if (opts.invocationRecordStore) {
+      let controller: AbortController | undefined;
+
+      if (mode !== 'force' && opts.invocationTracker) {
+        // F122 AC-A8: Atomic thread-level busy gate + slot registration.
+        // If thread became busy since initial has() check at line 306, degrade to queue.
+        const tryResult = opts.invocationTracker.tryStartThreadAll(resolvedThreadId, targetAgents, userId);
+        if (tryResult === null) {
+          // TOCTOU: thread became busy between has() and here — degrade to queue
+          if (opts.invocationQueue) {
+            const enqueueResult = opts.invocationQueue.enqueue({
+              threadId: resolvedThreadId,
+              userId,
+              idempotencyKey: resolvedIdempotencyKey,
+              content,
+              source: 'user',
+              targetAgents,
+              intent: intent.intent,
+            });
+            if (enqueueResult.outcome === 'full') {
+              const toctouFullQueue = await enrichQueueEntries(
+                opts.invocationQueue.list(resolvedThreadId, userId),
+                opts.messageStore,
+              );
+              opts.socketManager.emitToUser(userId, 'queue_full_warning', {
+                threadId: resolvedThreadId,
+                source: 'user',
+                queueSize: opts.invocationQueue.size(resolvedThreadId, userId),
+                queue: toctouFullQueue,
+              });
+              reply.status(429);
+              return { error: '消息队列已满', code: 'QUEUE_FULL' };
+            }
+            // F122 R1-gpt52 P1-1: Wrap append+backfill in try/catch with rollback,
+            // matching original queue path (lines 340-374) to prevent ghost queue entries.
+            let toctouUserMessageId: string | null = enqueueResult.entry?.messageId ?? null;
+            if (!enqueueResult.deduped) {
+              try {
+                const toctouUserMessage = await opts.messageStore.append({
+                  userId,
+                  agentId: null,
+                  content,
+                  mentions: targetAgents,
+                  timestamp: Date.now(),
+                  threadId: resolvedThreadId,
+                  idempotencyKey: resolvedIdempotencyKey,
+                  deliveryStatus: 'queued',
+                  ...(contentBlocks ? { contentBlocks } : {}),
+                  ...(whisperVisibility && whisperRecipients
+                    ? { visibility: whisperVisibility, whisperTo: whisperRecipients }
+                    : {}),
+                  ...(replyTo ? { replyTo } : {}),
+                });
+                toctouUserMessageId = toctouUserMessage.id;
+                const queueEntryId = enqueueResult.entry?.id;
+                if (queueEntryId) {
+                  opts.invocationQueue.backfillMessageId(resolvedThreadId, userId, queueEntryId, toctouUserMessage.id);
+                }
+              } catch (err) {
+                const queueEntryId = enqueueResult.entry?.id;
+                if (queueEntryId) {
+                  opts.invocationQueue.rollbackEnqueue(resolvedThreadId, userId, queueEntryId);
+                }
+                throw err;
+              }
+            }
+            await emitQueueUpdated(
+              opts.socketManager,
+              userId,
+              resolvedThreadId,
+              opts.invocationQueue.list(resolvedThreadId, userId),
+              opts.messageStore,
+              enqueueResult.outcome,
+            );
+            tryAutoCancelPendingHolds(resolvedThreadId, opts.holdBallCancelDeps);
+            reply.status(202);
+            return {
+              status: 'queued',
+              queuePosition: enqueueResult.queuePosition,
+              entryId: enqueueResult.entry?.id,
+              merged: false,
+              ...(toctouUserMessageId ? { userMessageId: toctouUserMessageId } : {}),
+            };
+          }
+          // No queue available — thread is busy but we can't queue. Reject.
+          reply.status(409);
+          return { error: 'Agent 正在忙', code: 'THREAD_BUSY' };
+        }
+        controller = tryResult;
+      }
+
+      // F122 R1 P1: Wrap create/update/append in try/catch to release slot on error.
+      // The background coroutine has its own finally for normal completion, but if we
+      // throw before entering it, the slot would leak (thread stuck as "busy").
+      let createResult: { outcome: string; invocationId: string };
+      try {
+        createResult = await opts.invocationRecordStore.create({
+          threadId: resolvedThreadId,
+          userId,
+          targetAgents,
+          intent: intent.intent,
+          idempotencyKey: resolvedIdempotencyKey,
+        });
+      } catch (createErr) {
+        // Release slots occupied by tryStartThreadAll — prevent "假忙" leak
+        if (controller) {
+          opts.invocationTracker?.completeAll(resolvedThreadId, targetAgents, controller);
+        }
+        throw createErr;
+      }
+
+      if (createResult.outcome === 'duplicate') {
+        // AC-A11: tryStartThreadAll succeeded but create returned duplicate — release slots
+        if (controller) {
+          opts.invocationTracker?.completeAll(resolvedThreadId, targetAgents, controller);
+        }
+        reply.status(200);
+        return { status: 'duplicate', invocationId: createResult.invocationId };
+      }
+
+      // Force path: still uses startAll() (preemptive — cancel already happened above)
+      if (!controller) {
+        controller = opts.invocationTracker?.startAll(resolvedThreadId, targetAgents, userId);
+      }
+
+      // Race: thread entered deleting between isDeleting() and start()
+      if (controller?.signal.aborted) {
+        await opts.invocationRecordStore.update(createResult.invocationId, {
+          status: 'canceled',
+        });
+        reply.status(409);
+        return {
+          error: '对话正在删除中',
+          detail: '请稍后重试，或新建一个对话继续',
+          code: 'THREAD_DELETING',
+        };
+      }
+
+      // F122 R1 P1 cont: wrap message write + update before background coroutine.
+      // If any of these throw, release the slot to prevent "假忙" leak.
+      let storedUserMessage: { id: string };
+      try {
+        // ② Write user message (decoupled from agent execution)
+        storedUserMessage = await opts.messageStore.append({
+          userId,
+          agentId: null,
+          content,
+          mentions: targetAgents,
+          timestamp: Date.now(),
+          threadId: resolvedThreadId,
+          ...(contentBlocks ? { contentBlocks } : {}),
+          ...(whisperVisibility && whisperRecipients
+            ? { visibility: whisperVisibility, whisperTo: whisperRecipients }
+            : {}),
+          ...(replyTo ? { replyTo } : {}),
+        });
+
+        // ③ Backfill InvocationRecord.userMessageId
+        await opts.invocationRecordStore.update(createResult.invocationId, {
+          userMessageId: storedUserMessage.id,
+        });
+
+        // F192 Phase G AC-G12 / F227: detect magic words → Event Memory (immediate path)
+        void tryDetectMagicWords(
+          content,
+          resolvedThreadId,
+          targetAgents,
+          storedUserMessage.id,
+          userId,
+          opts.onMagicWordDetected,
+        );
+      } catch (preExecErr) {
+        // Release slots — we haven't entered background coroutine yet
+        opts.invocationTracker?.completeAll(resolvedThreadId, targetAgents, controller);
+        // Mark record as failed if it was created
+        try {
+          await opts.invocationRecordStore?.update(createResult.invocationId, { status: 'failed' });
+        } catch {
+          /* best-effort cleanup */
+        }
+        throw preExecErr;
+      }
+
+      // ④ Reply with invocationId
+      reply.send({
+        status: 'processing',
+        invocationId: createResult.invocationId,
+        userMessageId: storedUserMessage.id,
+        timestamp: Date.now(),
+      });
+
+      tryAutoCancelPendingHolds(resolvedThreadId, opts.holdBallCancelDeps);
+
+      // ⑤ Background: execute agent invocation via routeExecution
+      void (async () => {
+        const HEARTBEAT_INTERVAL_MS = 30_000;
+        const heartbeatInterval = setInterval(() => {
+          opts.socketManager.broadcastToRoom(`thread:${resolvedThreadId}`, 'heartbeat', {
+            threadId: resolvedThreadId,
+            timestamp: Date.now(),
+          });
+        }, HEARTBEAT_INTERVAL_MS);
+
+        // F39: Track final status for queue auto-dequeue
+        let finalStatus: 'succeeded' | 'failed' | 'canceled' | 'canceled_by_user' = 'failed';
+
+        // F088 ISSUE-15: Hoisted so catch/abort branches can clean up streaming sessions
+        let streamStartPromise: Promise<void> | undefined;
+        let firstRouteEventSeen = false;
+        let startupWatchdogFired = false;
+        let startupTimeoutFailureRecorded = false;
+        let queueCompletionNotified = false;
+
+        const notifyQueueCompletion = (status: 'succeeded' | 'failed' | 'canceled' | 'canceled_by_user') => {
+          if (queueCompletionNotified) return;
+          queueCompletionNotified = true;
+          opts.queueProcessor?.onInvocationComplete(resolvedThreadId, primaryAgent, status).catch((err) => {
+            log.error(
+              { err, threadId: resolvedThreadId, agentId: primaryAgent, finalStatus: status },
+              '[messages] onInvocationComplete failed — queued messages may be stuck (#595)',
+            );
+          });
+        };
+
+        // F148 fix: Hoisted so abort/catch branches can ack completed agents' cursors
+        const cursorBoundaries = new Map<string, string>();
+        const continuationCapsules = new Map<string, CollaborationContinuityCapsuleV1>();
+        let consumedContinuation: ConsumedContinuationToken | undefined;
+
+        // F194 Phase Z3 (AC-Z3): mark chain start for finally fallback. routeExecution may
+        // hang / silently exit / swallow exceptions and never reach explicit terminal write
+        // (root cause of bubble-still-split symptom). Without this signal, finally would
+        // fallback failed even on success. start→succeeded/failed → finally CAS terminal.
+        routeChainTracker.start(createResult.invocationId);
+
+        const markStartupTimeoutFailed = async () => {
+          if (startupTimeoutFailureRecorded) return;
+          startupTimeoutFailureRecorded = true;
+          finalStatus = 'failed';
+          routeChainTracker.fail(createResult.invocationId);
+          await opts.invocationRecordStore?.update(createResult.invocationId, {
+            status: 'failed',
+            error: 'Invocation startup timed out before provider/session initialized',
+          });
+          opts.socketManager.broadcastAgentMessage(
+            {
+              type: 'system_info',
+              agentId: targetAgents[0] ?? getDefaultAgentId(),
+              content: JSON.stringify({
+                type: 'invocation_startup_timeout',
+                message: 'Agent 启动超时，已释放卡住的调用。',
+                invocationId: createResult.invocationId,
+              }),
+              timestamp: Date.now(),
+            },
+            resolvedThreadId,
+          );
+          await cleanupStreamingOnFailure(resolvedThreadId, createResult.invocationId, streamStartPromise, opts, log);
+        };
+
+        const startupWatchdogMs = opts.invocationStartupWatchdogMs ?? INVOCATION_STARTUP_WATCHDOG_MS;
+        const startupWatchdog: ReturnType<typeof setTimeout> | undefined =
+          startupWatchdogMs > 0
+            ? setTimeout(() => {
+                if (firstRouteEventSeen || controller?.signal.aborted) return;
+                startupWatchdogFired = true;
+                controller?.abort('startup_timeout');
+                opts.invocationTracker?.completeAll(resolvedThreadId, targetAgents, controller);
+                notifyQueueCompletion('failed');
+                void markStartupTimeoutFailed().catch((err) => {
+                  log.warn(
+                    { err, invocationId: createResult.invocationId },
+                    '[messages] startup watchdog failed to mark invocation failed',
+                  );
+                });
+              }, startupWatchdogMs)
+            : undefined;
+
+        const clearStartupWatchdog = () => {
+          if (startupWatchdog) clearTimeout(startupWatchdog);
+        };
+
+        try {
+          await opts.invocationRecordStore?.update(createResult.invocationId, {
+            status: 'running',
+          });
+
+          // #768: intent_mode deferred to first CLI event (avoid "replying" when CLI never starts)
+          let intentModeBroadcast = false;
+          // P1-2: track persistence failures across generator boundary
+          const persistenceContext: PersistenceContext = { failed: false, errors: [] };
+          // F8: collect per-agent token usage from done events
+          const collectedUsage = new Map<string, TokenUsage>();
+          // F070: track governance block errorCode for recoverable failure marking
+          let governanceErrorCode: string | undefined;
+
+          // F088 ISSUE-15: Collect per-turn content for outbound delivery to connector platforms
+          const outboundTurns: Array<{
+            agentId: string;
+            textParts: string[];
+            richBlocks?: unknown[];
+          }> = [];
+          let currentTurnAgentId: string | undefined;
+          const collectedTextParts: string[] = [];
+
+          // F088 ISSUE-15: Start streaming placeholder on external platforms
+          if (opts.streamingHook) {
+            streamStartPromise = opts.streamingHook
+              .onStreamStart(resolvedThreadId, primaryAgent, createResult.invocationId)
+              .catch((err) => {
+                log.warn({ err, threadId: resolvedThreadId }, '[messages] StreamingHook.onStreamStart failed');
+              });
+          }
+
+          // User stop can win the race before CLI produces the first event.
+          // Do not re-arm frontend state with spawn_started/intent_mode after abort.
+          if (controller?.signal.aborted) {
+            finalStatus =
+              controller.signal.reason === 'user_cancel' || controller.signal.reason === 'cancel_all'
+                ? 'canceled_by_user'
+                : 'canceled';
+            await opts.invocationRecordStore?.update(createResult.invocationId, {
+              status: 'canceled',
+            });
+            await cleanupStreamingOnFailure(resolvedThreadId, createResult.invocationId, streamStartPromise, opts, log);
+            return;
+          }
+
+          // F224: direct immediate invocations must consume the same pending continuation
+          // as QueueProcessor. Only single-agent content is safe to rewrite with a agent-specific prompt.
+          if (opts.sessionContinuationCoordinator && targetAgents.length === 1) {
+            const singleAgentId = targetAgents[0]!;
+            try {
+              const prepared = await opts.sessionContinuationCoordinator.prepareInvocationContext({
+                threadId: resolvedThreadId,
+                agentId: singleAgentId,
+                userId,
+                content,
+              });
+              content = prepared.content;
+              consumedContinuation = prepared.consumedContinuation;
+              if (prepared.sessionPolicy === 'reborn') {
+                log.info(
+                  { threadId: resolvedThreadId, agentId: singleAgentId },
+                  '[messages] F224: reborn session — coordinator skipped continuation consume',
+                );
+              } else if (prepared.consumedContinuation) {
+                log.info(
+                  { threadId: resolvedThreadId, agentId: singleAgentId },
+                  '[messages] F224: consumed pending continuation for direct invocation',
+                );
+              }
+            } catch (err) {
+              log.warn(
+                { err, threadId: resolvedThreadId, agentId: singleAgentId },
+                '[messages] F224: prepareInvocationContext failed, proceeding without continuation context',
+              );
+            }
+          }
+
+          // F118 D2: Broadcast spawn_started immediately — fills the intent_mode blind spot.
+          // intent_mode only fires after the first CLI NDJSON event (0–2 min delay).
+          // spawn_started fires here, before routeExecution, so the UI can show
+          // per-agent "spawning" indicators without waiting for CLI to come alive.
+          opts.socketManager.broadcastToRoom(`thread:${resolvedThreadId}`, 'spawn_started', {
+            threadId: resolvedThreadId,
+            targetAgents,
+            invocationId: createResult.invocationId,
+          });
+
+          for await (const msg of router.routeExecution(
+            userId,
+            content,
+            resolvedThreadId,
+            storedUserMessage.id,
+            targetAgents,
+            intent,
+            {
+              ...(contentBlocks ? { contentBlocks } : {}),
+              uploadDir,
+              ...(controller?.signal ? { signal: controller.signal } : {}),
+              // F-parallel-cancel: per-agent signal so a single-agent cancel on this direct execution
+              // path aborts only that agent — not the shared batch gate. Without this, route layer
+              // falls back to the batch controller and single-agent cancel never reaches the agent.
+              signalForAgent: (agentId: string) =>
+                opts.invocationTracker?.getController?.(resolvedThreadId, agentId)?.signal,
+              ...(opts.invocationQueue
+                ? {
+                    queueHasQueuedMessages: (tid: string) =>
+                      opts.invocationQueue?.hasQueuedNonAgentForThread(tid) ?? false,
+                    deferA2AEnqueue: (e) => opts.invocationQueue?.enqueue(e as any),
+                    hasQueuedOrActiveAgentForAgent: (tid: string, agentId: string) =>
+                      opts.invocationQueue?.hasActiveOrQueuedAgentForAgent(tid, agentId) ?? false,
+                  }
+                : {}),
+              ...(controller ? { invocationController: controller } : {}),
+              trackA2ASlot: (tid: string, agentId: string, uid: string, ctrl: AbortController) => {
+                opts.invocationTracker?.trackExternalSlot(tid, agentId, ctrl, uid, [agentId]);
+              },
+              completeA2ASlots: (tid: string, agentIds: readonly string[], ctrl: AbortController) => {
+                for (const agentId of agentIds) opts.invocationTracker?.completeSlot?.(tid, agentId, ctrl);
+              },
+              cursorBoundaries,
+              persistenceContext,
+              parentInvocationId: createResult.invocationId,
+              // F222 P1: user direct entry → eligible for frustration auto-issue
+              frustrationAutoIssueEligible: true,
+            },
+          )) {
+            if (!firstRouteEventSeen) {
+              firstRouteEventSeen = true;
+              clearStartupWatchdog();
+            }
+            if (controller?.signal.aborted) {
+              break;
+            }
+            // #768: Broadcast intent_mode on first CLI event — proves CLI is alive.
+            if (!intentModeBroadcast) {
+              opts.socketManager.broadcastToRoom(`thread:${resolvedThreadId}`, 'intent_mode', {
+                threadId: resolvedThreadId,
+                mode: intent.intent,
+                targetAgents,
+                invocationId: createResult.invocationId,
+              });
+              intentModeBroadcast = true;
+              // Push participants to sidebar. resolveTargets only calls addParticipants
+              // for @mention flows; non-mention routing (preferredAgents/default) skips it.
+              // Merge stored participants with targetAgents so sidebar always gets the
+              // responding agents, regardless of how they were resolved.
+              const existingParticipants = (await opts.threadStore?.get(resolvedThreadId))?.participants ?? [];
+              const mergedParticipants = [...new Set([...existingParticipants, ...targetAgents])];
+              opts.socketManager.broadcastToRoom(`thread:${resolvedThreadId}`, 'thread_updated', {
+                threadId: resolvedThreadId,
+                participants: mergedParticipants,
+              });
+            }
+            // F39 bugfix: stop broadcasting after cancel (drain pipe buffer silently)
+            if (controller?.signal.aborted) break;
+            const continuationCapsule = extractContinuityCapsuleFromAgentMessage(msg);
+            if (continuationCapsule) {
+              continuationCapsules.set(continuationCapsule.agentId, continuationCapsule);
+            }
+            if (msg.type === 'done' && msg.agentId && msg.metadata?.usage) {
+              collectedUsage.set(msg.agentId, mergeTokenUsage(collectedUsage.get(msg.agentId), msg.metadata.usage));
+            }
+            if (msg.type === 'done' && msg.errorCode) {
+              governanceErrorCode = msg.errorCode;
+            }
+            if ((msg.type === 'done' || msg.type === 'error') && msg.agentId) {
+              opts.invocationTracker?.completeSlot?.(resolvedThreadId, msg.agentId, controller);
+            }
+
+            // F088 ISSUE-15: Collect outbound turns (same pattern as QueueProcessor)
+            if (msg.type === 'done' && msg.agentId) {
+              if (persistenceContext.richBlocks) {
+                const turn = outboundTurns[outboundTurns.length - 1];
+                if (turn && turn.agentId === msg.agentId && currentTurnAgentId === msg.agentId) {
+                  turn.richBlocks = [...persistenceContext.richBlocks];
+                } else {
+                  outboundTurns.push({
+                    agentId: msg.agentId,
+                    textParts: [],
+                    richBlocks: [...persistenceContext.richBlocks],
+                  });
+                }
+                persistenceContext.richBlocks = undefined;
+              }
+              currentTurnAgentId = undefined;
+            }
+            if (msg.type === 'text' && typeof (msg as unknown as Record<string, unknown>).content === 'string') {
+              const textContent = (msg as unknown as Record<string, unknown>).content as string;
+              const textMode = (msg as { textMode?: 'append' | 'replace' }).textMode;
+              accumulateTextParts(collectedTextParts, textContent, textMode);
+              if (msg.agentId) {
+                if (msg.agentId !== currentTurnAgentId) {
+                  outboundTurns.push({ agentId: msg.agentId, textParts: [] });
+                  currentTurnAgentId = msg.agentId;
+                }
+                const turn = outboundTurns[outboundTurns.length - 1];
+                accumulateTextParts(turn.textParts, textContent, textMode);
+              }
+              // F088 ISSUE-15: Forward streaming chunks to external platforms
+              if (opts.streamingHook) {
+                const accumulated =
+                  outboundTurns.length > 0 ? flattenTurnTextParts(outboundTurns) : flattenTextParts(collectedTextParts);
+                opts.streamingHook
+                  .onStreamChunk(resolvedThreadId, accumulated, createResult.invocationId)
+                  .catch((streamErr) => {
+                    log.warn(
+                      { err: streamErr, threadId: resolvedThreadId },
+                      '[messages] StreamingHook.onStreamChunk failed',
+                    );
+                  });
+              }
+            }
+
+            // F194 Phase Z9 (砚砚 R1 P1-2): unified visible turn stamp via helper.
+            // Route layer (R1 P1-1 fix) now stamps msg.invocationId = ownInvocationId
+            // for assistant yielded events, so helper receives a defined turn id
+            // (no parent fallback firing in practice).
+            const broadcastPayload = {
+              ...msg,
+              ...stampVisibleTurn(createResult.invocationId, msg.invocationId),
+            };
+
+            if (msg.type === 'a2a_handoff') {
+              const storedId = await persistA2ARoutingMessage(opts.messageStore, broadcastPayload, resolvedThreadId);
+              if (storedId) broadcastPayload.messageId = storedId;
+            }
+
+            opts.socketManager.broadcastAgentMessage(broadcastPayload, resolvedThreadId);
+          }
+
+          // F39 P1 fix (砚砚 R1): abort guard after loop — when signal is aborted
+          // and the generator ends normally (no throw), the break exits the loop but
+          // post-loop code would still run ack+succeeded. Guard explicitly.
+          // F-parallel-cancel: use AGGREGATE finalStatus — batch gate abort (whole invocation) OR
+          // every target agent singly cancelled → canceled. A single-agent cancel no longer aborts the
+          // batch gate, so raw controller.signal.aborted only covers the whole-invocation case.
+          // (completeAll runs in finally, AFTER this, so cancel tombstones are still visible here.)
+          const aggFinalStatus = startupWatchdogFired
+            ? 'failed'
+            : opts.invocationTracker?.resolveFinalStatus
+              ? opts.invocationTracker.resolveFinalStatus(resolvedThreadId, targetAgents, {
+                  aborted: controller?.signal.aborted ?? false,
+                  reason: controller?.signal.reason as string | undefined,
+                })
+              : controller?.signal.aborted
+                ? // Fallback (tracker without resolveFinalStatus): whole-invocation abort → reason
+                  // decides canceled_by_user vs canceled (matches resolveFinalStatus semantics).
+                  controller.signal.reason === 'user_cancel' || controller.signal.reason === 'cancel_all'
+                  ? 'canceled_by_user'
+                  : 'canceled'
+                : 'succeeded';
+          if (aggFinalStatus === 'failed') {
+            await markStartupTimeoutFailed();
+          } else if (aggFinalStatus !== 'succeeded') {
+            finalStatus = aggFinalStatus;
+            await opts.invocationRecordStore?.update(createResult.invocationId, {
+              status: 'canceled',
+            });
+            // Bugfix: silent-exit P2 — only broadcast diagnostic when preempted by
+            // a newer invocation (reason='preempted'). User-initiated cancel already
+            // broadcasts its own messages via buildCancelMessages; adding another here
+            // would cause a duplicate with misleading text.
+            if (controller?.signal.reason === 'preempted') {
+              opts.socketManager.broadcastAgentMessage(
+                {
+                  type: 'system_info',
+                  agentId: targetAgents[0] ?? getDefaultAgentId(),
+                  content: JSON.stringify({
+                    type: 'invocation_preempted',
+                    detail: 'This response was superseded by a newer request.',
+                    invocationId: createResult.invocationId,
+                  }),
+                  timestamp: Date.now(),
+                },
+                resolvedThreadId,
+              );
+            }
+            // F148 fix: ack cursors for agents that completed before abort (monotonic CAS, safe to call)
+            if (cursorBoundaries.size > 0) {
+              await router.ackCollectedCursors(userId, resolvedThreadId, cursorBoundaries);
+            }
+            // P1 fix: finalize streaming session on abort so external placeholders are cleaned up
+            await cleanupStreamingOnFailure(resolvedThreadId, createResult.invocationId, streamStartPromise, opts, log);
+          } else if (persistenceContext.failed) {
+            const errorDetail = persistenceContext.errors.map((e) => `${e.agentId}: ${e.error}`).join('; ');
+            await opts.invocationRecordStore?.update(createResult.invocationId, {
+              status: 'failed',
+              error: `Message delivered but persistence failed: ${errorDetail}`,
+            });
+            opts.socketManager.broadcastAgentMessage(
+              {
+                type: 'error',
+                agentId: getDefaultAgentId(),
+                error: '消息已发送但未能保存，刷新后可能丢失。可点击重试。',
+                timestamp: Date.now(),
+              },
+              resolvedThreadId,
+            );
+
+            const pushSvcErr = getPushNotificationService();
+            if (pushSvcErr) {
+              pushSvcErr
+                .notifyUser(userId, {
+                  title: 'Agent 消息保存失败',
+                  body: '消息已发送但未能保存，请检查',
+                  tag: `agent-error-${resolvedThreadId}`,
+                  data: { threadId: resolvedThreadId, url: `/?thread=${resolvedThreadId}` },
+                })
+                .catch(() => {});
+            }
+            await cleanupStreamingOnFailure(resolvedThreadId, createResult.invocationId, streamStartPromise, opts, log);
+          } else if (governanceErrorCode) {
+            // F070: Governance gate blocked — mark as failed with errorCode for retry
+            await opts.invocationRecordStore?.update(createResult.invocationId, {
+              status: 'failed',
+              error: governanceErrorCode,
+            });
+            await cleanupStreamingOnFailure(resolvedThreadId, createResult.invocationId, streamStartPromise, opts, log);
+          } else {
+            // ADR-008 S3: ack cursors before marking succeeded so that if ack
+            // throws, the catch block sees running→failed (valid transition).
+            await router.ackCollectedCursors(userId, resolvedThreadId, cursorBoundaries);
+
+            await opts.invocationRecordStore?.update(createResult.invocationId, {
+              status: 'succeeded',
+              ...(collectedUsage.size > 0
+                ? {
+                    usageByAgent: Object.fromEntries(collectedUsage),
+                  }
+                : {}),
+            });
+            finalStatus = 'succeeded';
+            // F194 Phase Z3: chain succeeded — signal for finally fallback
+            routeChainTracker.succeed(createResult.invocationId);
+
+            for (const continuationCapsule of continuationCapsules.values()) {
+              if (
+                !(await shouldEnqueueDirectContinuation(
+                  continuationCapsule,
+                  userId,
+                  opts.sessionContinuationCoordinator,
+                ))
+              ) {
+                continue;
+              }
+              await opts.queueProcessor
+                ?.enqueueContinuation({
+                  threadId: resolvedThreadId,
+                  userId,
+                  agentId: continuationCapsule.agentId,
+                  capsule: continuationCapsule,
+                })
+                .catch((err) => {
+                  log.warn({ err, threadId: resolvedThreadId }, 'enqueueContinuation failed (best-effort)');
+                  return undefined;
+                });
+            }
+
+            // Push notification: agent(s) finished responding
+            const pushSvc = getPushNotificationService();
+            if (pushSvc) {
+              const agentNames = targetAgents.join(', ');
+              const assistantText = (
+                outboundTurns.length > 0 ? flattenTurnTextParts(outboundTurns) : flattenTextParts(collectedTextParts)
+              ).trim();
+              const needsDecision = assistantText.length > 0 ? shouldMarkDecisionNotification(assistantText) : false;
+              const pushBodySource = assistantText || 'Agent 已处理，请打开会话查看详情';
+              pushSvc
+                .notifyUser(userId, {
+                  title: needsDecision ? `${agentNames} 需要你决策` : `${agentNames} 回复了`,
+                  body: pushBodySource.slice(0, 80),
+                  icon: targetAgents.length === 1 ? `/avatars/default.svg` : '/icons/studio-mark.svg',
+                  tag: `${needsDecision ? 'agent-decision' : 'agent-reply'}-${resolvedThreadId}`,
+                  data: {
+                    threadId: resolvedThreadId,
+                    url: `/?thread=${resolvedThreadId}`,
+                    ...(needsDecision ? { requiresDecision: true } : {}),
+                  },
+                })
+                .catch(() => {
+                  /* best-effort */
+                });
+            }
+
+            // F088 ISSUE-15: Outbound delivery to connector platforms (Feishu/Telegram)
+            // P2 fix: fire-and-forget so delivery latency doesn't block invocationTracker.complete()
+            deliverOutboundFromWeb(
+              resolvedThreadId,
+              primaryAgent,
+              createResult.invocationId,
+              collectedTextParts,
+              outboundTurns,
+              persistenceContext,
+              streamStartPromise,
+              opts,
+              log,
+            ).catch((deliverErr) => {
+              log.error({ err: deliverErr, threadId: resolvedThreadId }, '[messages] deliverOutboundFromWeb failed');
+            });
+          }
+        } catch (err) {
+          // F39 bugfix: detect abort (cancel/force) vs real failure
+          if (startupWatchdogFired) {
+            await markStartupTimeoutFailed();
+          } else if (controller?.signal.aborted) {
+            finalStatus =
+              controller.signal.reason === 'user_cancel' || controller.signal.reason === 'cancel_all'
+                ? 'canceled_by_user'
+                : 'canceled';
+            await opts.invocationRecordStore?.update(createResult.invocationId, {
+              status: 'canceled',
+            });
+            // F148 fix: ack cursors for agents that completed before the exception
+            if (cursorBoundaries.size > 0) {
+              try {
+                await router.ackCollectedCursors(userId, resolvedThreadId, cursorBoundaries);
+              } catch {
+                /* best-effort — don't mask the original error */
+              }
+            }
+            // Don't broadcast error for intentional cancel
+            // P1-A fix: clean up streaming placeholder even on abort/cancel
+            await cleanupStreamingOnFailure(resolvedThreadId, createResult.invocationId, streamStartPromise, opts, log);
+          } else {
+            // F148 fix: ack cursors for agents that completed before the exception
+            if (cursorBoundaries.size > 0) {
+              try {
+                await router.ackCollectedCursors(userId, resolvedThreadId, cursorBoundaries);
+              } catch {
+                /* best-effort — don't mask the original error */
+              }
+            }
+            log.error({ err, invocationId: createResult.invocationId }, 'Background processing error');
+            const errorMsg = normalizeErrorMessage(err);
+            await opts.invocationRecordStore?.update(createResult.invocationId, {
+              status: 'failed',
+              error: errorMsg,
+            });
+            // F194 Phase Z3: chain failed — diagnostic signal for finally fallback
+            routeChainTracker.fail(createResult.invocationId);
+            opts.socketManager.broadcastAgentMessage(
+              {
+                type: 'error',
+                agentId: getDefaultAgentId(),
+                error: errorMsg,
+                isFinal: true,
+                timestamp: Date.now(),
+              },
+              resolvedThreadId,
+            );
+
+            const pushSvcCatch = getPushNotificationService();
+            if (pushSvcCatch) {
+              pushSvcCatch
+                .notifyUser(userId, {
+                  title: 'Agent 出错了',
+                  body: errorMsg.slice(0, 100),
+                  tag: `agent-error-${resolvedThreadId}`,
+                  data: { threadId: resolvedThreadId, url: `/?thread=${resolvedThreadId}` },
+                })
+                .catch(() => {});
+            }
+            await cleanupStreamingOnFailure(resolvedThreadId, createResult.invocationId, streamStartPromise, opts, log);
+          } // end else (non-abort error)
+        } finally {
+          clearStartupWatchdog();
+          clearInterval(heartbeatInterval);
+          opts.invocationTracker?.completeAll(resolvedThreadId, targetAgents, controller);
+          // F194 Phase Z3 (AC-Z3): defensive terminal write. If routeExecution silently exited
+          // without writing terminal (the runtime split symptom root cause), CAS expectedStatus=
+          // running guarded write based on chainCompletion signal. Skips if status already terminal.
+          // Reads chainTracker → succeeded/failed/missing → CAS update or fallback. (砚砚 R1 P1-3)
+          if (opts.invocationRecordStore) {
+            try {
+              await ensureTerminalStatus(
+                createResult.invocationId,
+                {
+                  invocationRecordStore: opts.invocationRecordStore,
+                  chainCompletion: routeChainTracker,
+                  log,
+                },
+                { reqId: request.id },
+              );
+            } catch (err) {
+              log.warn(
+                { err, invocationId: createResult.invocationId, feature: 'F194' },
+                'F194 Z3 ensureTerminalStatus failed (background)',
+              );
+            }
+          }
+          routeChainTracker.release(createResult.invocationId);
+          if (opts.sessionContinuationCoordinator) {
+            try {
+              await opts.sessionContinuationCoordinator.commitInvocationOutcome({
+                finalStatus,
+                threadId: resolvedThreadId,
+                agentId: primaryAgent,
+                userId,
+                consumedContinuation,
+                producedCapsules: [...continuationCapsules.values()],
+              });
+            } catch (err) {
+              log.warn(
+                { err, threadId: resolvedThreadId, targetAgents },
+                '[messages] F224: commitInvocationOutcome failed',
+              );
+            }
+          }
+          // F39: Notify queue processor for auto-dequeue chain
+          notifyQueueCompletion(finalStatus);
+        }
+      })();
+    } else {
+      // Fallback: no invocationRecordStore (legacy path, uses route())
+      // F122 A.1: Try non-preemptive first. Legacy path has no InvocationQueue so it
+      // cannot degrade to queue — fall back to preemptive startAll() as temporary compat.
+      // TODO(F122 Phase B): Legacy path should be removed or given queue support.
+      let controller: AbortController | undefined;
+      if (mode !== 'force' && opts.invocationTracker) {
+        controller =
+          opts.invocationTracker.tryStartThreadAll(resolvedThreadId, targetAgents, userId) ??
+          opts.invocationTracker.startAll(resolvedThreadId, targetAgents, userId);
+      } else {
+        controller = opts.invocationTracker?.startAll(resolvedThreadId, targetAgents, userId);
+      }
+      if (controller?.signal.aborted) {
+        reply.status(409);
+        return {
+          error: '对话正在删除中',
+          detail: '请稍后重试，或新建一个对话继续',
+          code: 'THREAD_DELETING',
+        };
+      }
+
+      reply.send({ status: 'processing', timestamp: Date.now() });
+
+      void (async () => {
+        const HEARTBEAT_INTERVAL_MS = 30_000;
+        const heartbeatInterval = setInterval(() => {
+          opts.socketManager.broadcastToRoom(`thread:${resolvedThreadId}`, 'heartbeat', {
+            threadId: resolvedThreadId,
+            timestamp: Date.now(),
+          });
+        }, HEARTBEAT_INTERVAL_MS);
+
+        try {
+          // #768: intent_mode deferred to first CLI event (legacy path)
+          let intentModeBroadcast = false;
+
+          for await (const msg of router.route(
+            userId,
+            content,
+            resolvedThreadId,
+            contentBlocks,
+            uploadDir,
+            controller?.signal,
+          )) {
+            // #768: Broadcast intent_mode on first CLI event (legacy path)
+            if (!intentModeBroadcast) {
+              opts.socketManager.broadcastToRoom(`thread:${resolvedThreadId}`, 'intent_mode', {
+                threadId: resolvedThreadId,
+                mode: intent.intent,
+                targetAgents,
+                // Legacy path: no invocationId (no InvocationRecord). Frontend falls back gracefully.
+              });
+              intentModeBroadcast = true;
+            }
+            const legacyPayload = { ...msg };
+            if (msg.type === 'a2a_handoff') {
+              const storedId = await persistA2ARoutingMessage(opts.messageStore, msg, resolvedThreadId);
+              if (storedId) legacyPayload.messageId = storedId;
+            }
+            opts.socketManager.broadcastAgentMessage(legacyPayload, resolvedThreadId);
+          }
+        } catch (err) {
+          log.error({ err }, 'Background processing error');
+          opts.socketManager.broadcastAgentMessage(
+            {
+              type: 'error',
+              agentId: getDefaultAgentId(),
+              error: normalizeErrorMessage(err),
+              isFinal: true,
+              timestamp: Date.now(),
+            },
+            resolvedThreadId,
+          );
+        } finally {
+          clearInterval(heartbeatInterval);
+          opts.invocationTracker?.completeAll(resolvedThreadId, targetAgents, controller);
+        }
+      })();
+    }
+  });
+
+  // GET /api/messages - 获取历史消息
+  app.get('/api/messages', async (request) => {
+    const parseResult = getMessagesSchema.safeParse(request.query);
+    if (!parseResult.success) {
+      return { messages: [], hasMore: false };
+    }
+    const { limit, before, threadId } = parseResult.data;
+    const userId = resolveUserId(request, { defaultUserId: 'default-user' });
+    if (!userId) {
+      return { messages: [], hasMore: false };
+    }
+
+    // Parse composite cursor "timestamp:id" or legacy plain timestamp
+    let beforeTs: number | undefined;
+    let beforeId: string | undefined;
+    if (before) {
+      const colonIdx = before.indexOf(':');
+      if (colonIdx > 0) {
+        beforeTs = parseInt(before.slice(0, colonIdx), 10);
+        beforeId = before.slice(colonIdx + 1);
+      } else {
+        beforeTs = parseInt(before, 10);
+      }
+      if (!Number.isFinite(beforeTs!)) {
+        return { messages: [], hasMore: false };
+      }
+    }
+
+    // Always thread-scoped — default to 'default' thread for lobby
+    const resolvedThreadId = threadId ?? 'default';
+
+    // Loop-scan: iteratively fetch batches from the store, filtering out
+    // internal system messages, until we have `limit + 1` visible items
+    // (the +1 probes hasMore) or the store is exhausted. This guarantees
+    // reachability regardless of how many consecutive internal messages
+    // cluster together — the old fixed-overscan approach would return
+    // {messages:[], hasMore:true} when internal clusters exceeded the cap.
+    //
+    // Termination guarantee: both in-memory and Redis store implementations
+    // use strict cursor advancement (exclusive `< cursor`), so each batch
+    // is strictly older than the previous. The store has finite data, so
+    // storeExhausted (rawBatch.length < BATCH_SIZE) is guaranteed to fire.
+    // The prevCursorId check is a defensive backstop against store bugs
+    // where the cursor fails to advance — it breaks the loop rather than
+    // spinning forever, and does NOT impose any functional scan limit.
+    const BATCH_SIZE = limit + 1 + 20; // generous first batch for common case
+    const needed = limit + 1;
+
+    type StoredMsg = Awaited<ReturnType<typeof opts.messageStore.getByThread>>[number];
+    const allVisible: StoredMsg[] = [];
+    let cursorTs = beforeTs;
+    let cursorId = beforeId;
+    let storeExhausted = false;
+
+    while (allVisible.length < needed && !storeExhausted) {
+      const rawBatch =
+        cursorTs != null
+          ? await opts.messageStore.getByThreadBefore(resolvedThreadId, cursorTs, BATCH_SIZE, cursorId, userId)
+          : await opts.messageStore.getByThread(resolvedThreadId, BATCH_SIZE, userId);
+
+      if (rawBatch.length < BATCH_SIZE) {
+        storeExhausted = true;
+      }
+
+      // Filter internal messages:
+      // - systemKind='context_briefing': F148 routing context for agents
+      //   (NOT F233 duty briefing, which also uses origin='briefing' but lacks this marker)
+      // - routing-guard-failure: internal route guard diagnostic
+      const batchVisible = rawBatch.filter(
+        (m) => m.extra?.systemKind !== 'context_briefing' && m.source?.connector !== 'routing-guard-failure',
+      );
+
+      // Prepend: each subsequent batch is chronologically older
+      allVisible.unshift(...batchVisible);
+
+      // Advance cursor to the oldest message in this batch for next iteration.
+      // Store returns oldest-first (after internal .reverse()), so [0] is oldest.
+      // Defensive: if cursor didn't advance, break to prevent infinite loop.
+      if (rawBatch.length > 0) {
+        const oldest = rawBatch[0]!;
+        const nextTs = oldest.deliveredAt ?? oldest.timestamp;
+        const nextId = oldest.id;
+        if (nextTs === cursorTs && nextId === cursorId) break; // cursor stuck — store bug
+        cursorTs = nextTs;
+        cursorId = nextId;
+      }
+    }
+
+    // hasMore: true if we collected more visible items than the page size,
+    // or if we haven't exhausted the store (more may exist deeper).
+    const hasMore = allVisible.length > limit || !storeExhausted;
+    const page = allVisible.length > limit ? allVisible.slice(allVisible.length - limit) : allVisible;
+
+    // Map chat messages (union type allows summary items to be pushed later)
+    type TimelineItem = {
+      id: string;
+      type: 'user' | 'assistant' | 'connector' | 'summary' | 'system';
+      agentId: string | null;
+      content: string;
+      timestamp: number;
+      summary?: { id: string; topic: string; conclusions: string[]; openQuestions: string[]; createdBy: string };
+      [key: string]: unknown;
+    };
+    const chatItems: TimelineItem[] = page.map((m) => ({
+      id: m.id,
+      type: (m.agentId
+        ? isSystemUserMessage(m)
+          ? 'system'
+          : 'assistant'
+        : m.source
+          ? 'connector'
+          : isSystemUserMessage(m)
+            ? 'system'
+            : 'user') as TimelineItem['type'],
+      agentId: m.agentId,
+      content: m.content,
+      ...(m.contentBlocks ? { contentBlocks: m.contentBlocks } : {}),
+      ...(m.toolEvents ? { toolEvents: m.toolEvents } : {}),
+      ...(m.metadata ? { metadata: m.metadata } : {}),
+      ...(m.origin ? { origin: m.origin } : {}),
+      ...(m.thinking ? { thinking: m.thinking } : {}),
+      ...(m.extra?.rich ||
+      m.extra?.crossPost ||
+      m.extra?.isExplicitPost ||
+      m.extra?.stream ||
+      m.extra?.targetAgents ||
+      m.extra?.scheduler ||
+      m.extra?.systemKind ||
+      m.extra?.a2aRouting
+        ? {
+            extra: {
+              ...(m.extra.rich ? { rich: m.extra.rich } : {}),
+              ...(m.extra.crossPost ? { crossPost: m.extra.crossPost } : {}),
+              ...(m.extra.isExplicitPost ? { isExplicitPost: true } : {}),
+              ...(m.extra.stream ? { stream: m.extra.stream } : {}),
+              ...(m.extra.targetAgents ? { targetAgents: m.extra.targetAgents } : {}),
+              ...(m.extra.scheduler ? { scheduler: m.extra.scheduler } : {}),
+              ...(m.extra.systemKind ? { systemKind: m.extra.systemKind } : {}),
+              ...(m.extra.a2aRouting ? { a2aRouting: m.extra.a2aRouting } : {}),
+            },
+          }
+        : {}),
+      ...(m.visibility ? { visibility: m.visibility } : {}),
+      ...(m.whisperTo ? { whisperTo: m.whisperTo } : {}),
+      ...(m.revealedAt ? { revealedAt: m.revealedAt } : {}),
+      ...(m.deliveredAt ? { deliveredAt: m.deliveredAt } : {}),
+      ...(m.source
+        ? {
+            source: {
+              connector: m.source.connector,
+              label: m.source.label,
+              icon: m.source.icon,
+              ...(m.source.url ? { url: m.source.url } : {}),
+              ...(m.source.meta ? { meta: m.source.meta } : {}),
+            },
+          }
+        : {}),
+      ...(m.replyTo ? { replyTo: m.replyTo } : {}),
+      timestamp: m.timestamp,
+    }));
+
+    // F121: Hydrate reply previews for messages with replyTo
+    const replyItems = chatItems.filter((item) => item.replyTo);
+    if (replyItems.length > 0) {
+      const { hydrateReplyPreview } = await import('../domains/agents/services/stores/ports/MessageStore.js');
+      await Promise.all(
+        replyItems.map(async (item) => {
+          const preview = await hydrateReplyPreview(opts.messageStore, item.replyTo as string);
+          if (preview) {
+            item.replyPreview = preview;
+          }
+        }),
+      );
+    }
+
+    // #80: Merge active streaming drafts (first page only — no before cursor)
+    if (!before && opts.draftStore) {
+      const draftStore = opts.draftStore;
+      const drafts = await draftStore.getByThread(userId, resolvedThreadId);
+      let activeDrafts = drafts;
+      // #80 fix-B diagnostic: trace draft merge for F5 recovery verification
+      if (drafts.length > 0) {
+        request.log.info(
+          { threadId: resolvedThreadId, draftCount: drafts.length, draftIds: drafts.map((d) => d.invocationId) },
+          '#80 draft merge: found active drafts',
+        );
+        // P1-2 dedup: filter out drafts whose invocationId matches a formal message.
+        // F194 Phase Z3 P1-3 (砚砚 R): formal set MUST collect both `invocationId` (parent SoT) and
+        // `turnInvocationId` (Z3 dual id, where draft.invocationId === turnInvocationId for new
+        // formal messages). Without this, append-success-but-draft-not-yet-deleted window double-shows
+        // formal + draft for the same turn.
+        const formalInvocationIds = new Set<string>();
+        for (const m of page) {
+          const parentInv = m.extra?.stream?.invocationId;
+          const turnInv = m.extra?.stream?.turnInvocationId;
+          if (parentInv) formalInvocationIds.add(parentInv);
+          if (turnInv) formalInvocationIds.add(turnInv);
+        }
+        activeDrafts = drafts.filter((d) => !formalInvocationIds.has(d.invocationId));
+        // Cloud R4 P2: if drafts survive page-level dedup, widen the check to cover
+        // formal messages pushed off the first page (race window: TTL > page depth).
+        // Cloud R5 P2: wider window must always exceed page limit (limit max=200 → worst case 800).
+        if (activeDrafts.length > 0 && page.length >= limit) {
+          const widerLimit = Math.max(200, limit * 4);
+          const wider = await opts.messageStore.getByThread(resolvedThreadId, widerLimit, userId);
+          for (const m of wider) {
+            const parentInv = m.extra?.stream?.invocationId;
+            const turnInv = m.extra?.stream?.turnInvocationId;
+            if (parentInv) formalInvocationIds.add(parentInv);
+            if (turnInv) formalInvocationIds.add(turnInv);
+          }
+          activeDrafts = activeDrafts.filter((d) => !formalInvocationIds.has(d.invocationId));
+        }
+      }
+
+      // F194 Phase B step 2b: canonical getThreadLiveInvocations helper.
+      // Cloud R17 P1: helper MUST run even when activeDrafts is empty — zombies
+      // (record running + no fresh draft + age past grace) are exactly the empty-drafts
+      // case. Skipping the helper here means /messages never reconciles them; only /queue
+      // would, and a thread that's read but not queue-checked stays phantom forever.
+      //
+      // AC-B5 preservation (砚砚 R6 P1 fix): gate only requires `invocationRecordStore` —
+      // tracker is OPTIONAL. Embedded modes / legacy tests that wire recordStore but not
+      // tracker still get zombie detection + orphan filtering.
+      if (opts.invocationRecordStore) {
+        const recordStore = opts.invocationRecordStore;
+        const tracker = opts.invocationTracker;
+        const draftsForHelper = activeDrafts; // already deduped against formal messages (or empty)
+        try {
+          const liveness = await getThreadLiveInvocations(resolvedThreadId, userId, {
+            listRunningRecords: (tid, uid) => recordStore.listRunningByThread(tid, uid),
+            getActiveSlots: (tid) => tracker?.getActiveSlots(tid) ?? [],
+            getTrackerUserId: (tid, cid) => tracker?.getUserId(tid, cid) ?? null,
+            getDrafts: () => draftsForHelper,
+            // F194 Phase Z (KD-22): namespace bridge — child registry id → parent recordStore id.
+            // Wraps existing InvocationRegistry.getRecord (parentInvocationId field) + getLatestId.
+            // Helper uses these to detect parent+child execution chain liveness and agent-slot reuse
+            // zombies (砚砚 R1 P1-1: 结构化 dep, not boolean black-box).
+            getTurnInvocation: async (id) => {
+              const rec = await opts.registry.getRecord(id);
+              if (!rec) return null;
+              return {
+                parentInvocationId: rec.parentInvocationId,
+                threadId: rec.threadId,
+                userId: rec.userId,
+                agentId: rec.agentId,
+                createdAt: rec.createdAt,
+              };
+            },
+            getLatestTurnInvocationId: (tid, agent) => opts.registry.getLatestId(tid, agent),
+            // F194 AC-B12: route diagnostic events into request log. NB: do NOT spread
+            // `source: 'F194'` — that would clobber LivenessEvent.source (record+draft /
+            // record-only / tracker+draft / null), losing the diagnostic. Use `feature`.
+            onLog: (event) => request.log.info({ ...event, feature: 'F194' }, 'F194 liveness event'),
+          });
+          const liveInvocationIds = new Set(liveness.active.map((s) => s.invocationId));
+          const orphanDrafts = activeDrafts.filter((d) => !liveInvocationIds.has(d.invocationId));
+          activeDrafts = activeDrafts.filter((d) => liveInvocationIds.has(d.invocationId));
+          // F194 AC-B7~B10: fire-and-forget zombie cleanup so /messages read isn't blocked.
+          // Lifecycle converges to failed + TaskProgress cleared. Idempotent (state machine
+          // guard rejects double-write). reconcileZombies failure logs warn — never throws.
+          if (liveness.zombies.length > 0) {
+            void reconcileZombies(liveness.zombies, {
+              invocationRecordStore: recordStore,
+              taskProgressStore: opts.taskProgressStore,
+              log: request.log,
+            }).catch((err) => request.log.warn({ err, feature: 'F194' }, 'reconcileZombies failed'));
+          }
+          if (orphanDrafts.length > 0) {
+            request.log.info(
+              {
+                threadId: resolvedThreadId,
+                orphanCount: orphanDrafts.length,
+                draftIds: orphanDrafts.map((d) => d.invocationId),
+                cleanup: 'helper-canonical',
+              },
+              '#80 draft merge: filtered orphan drafts (F194 helper-canonical)',
+            );
+          }
+        } catch (err) {
+          // F194 AC-B13: fail-open + fallback metric — record/tracker error must not 500
+          // the read endpoint, but split-brain protection is bypassed during fallback.
+          request.log.warn(
+            {
+              err,
+              kind: 'liveness_fallback',
+              threadId: resolvedThreadId,
+              userId,
+              feature: 'F194',
+              endpoint: '/messages',
+              draftCount: activeDrafts.length,
+            },
+            '#80 draft merge: F194 helper threw, fall-open keep all drafts',
+          );
+        }
+      }
+
+      // P2: stable sort by updatedAt for parallel multi-agent drafts
+      activeDrafts.sort((a, b) => a.updatedAt - b.updatedAt);
+      if (activeDrafts.length > 0) {
+        request.log.info(
+          { threadId: resolvedThreadId, mergedCount: activeDrafts.length, agents: activeDrafts.map((d) => d.agentId) },
+          '#80 draft merge: merging drafts into response',
+        );
+      }
+      for (const d of activeDrafts) {
+        chatItems.push({
+          id: `draft-${d.invocationId}`,
+          type: 'assistant',
+          agentId: d.agentId as string | null,
+          content: d.content,
+          timestamp: d.updatedAt,
+          isDraft: true,
+          origin: 'stream',
+          // F194 Phase Z9 AC-Z25 (KD-28): always stamp turnInvocationId; draft has only
+          // one identity so both fields point to draft invocationId.
+          extra: { stream: { invocationId: d.invocationId, turnInvocationId: d.invocationId } },
+          ...(d.toolEvents ? { toolEvents: d.toolEvents } : {}),
+          ...(d.thinking ? { thinking: d.thinking } : {}),
+        });
+      }
+    }
+
+    // Auto-summary disabled (baiyuxi-agent-studio#343): regex-based summaries removed from chat flow.
+    // Scheduled compaction (SummaryCompactionTask) continues for memory infrastructure.
+
+    return {
+      messages: chatItems,
+      hasMore,
+    };
+  });
+};
+
+/** @internal exported for testing — do not use outside of test. */
+export async function cleanupStreamingOnFailure(
+  threadId: string,
+  invocationId: string,
+  streamStartPromise: Promise<void> | undefined,
+  opts: MessagesRoutesOptions,
+  logger: typeof log,
+): Promise<void> {
+  if (!opts.streamingHook) return;
+  try {
+    if (streamStartPromise) {
+      await Promise.race([streamStartPromise, new Promise<void>((r) => setTimeout(r, STREAM_START_TIMEOUT_MS))]);
+    }
+    await opts.streamingHook.onStreamEnd(threadId, '', invocationId);
+    await opts.streamingHook.cleanupPlaceholders?.(threadId, invocationId);
+  } catch (err) {
+    logger.warn({ err, threadId }, '[messages] cleanupStreamingOnFailure failed');
+  }
+}
+
+/** @internal exported for testing — do not use outside of test. */
+export async function deliverOutboundFromWeb(
+  threadId: string,
+  primaryAgent: string,
+  invocationId: string,
+  collectedTextParts: string[],
+  outboundTurns: Array<{ agentId: string; textParts: string[]; richBlocks?: unknown[] }>,
+  persistenceContext: PersistenceContext,
+  streamStartPromise: Promise<void> | undefined,
+  opts: MessagesRoutesOptions,
+  logger: typeof log,
+): Promise<void> {
+  const finalContent =
+    outboundTurns.length > 0 ? flattenTurnTextParts(outboundTurns) : flattenTextParts(collectedTextParts);
+
+  if (opts.streamingHook) {
+    if (streamStartPromise) {
+      await Promise.race([
+        streamStartPromise,
+        new Promise<void>((resolve) => setTimeout(resolve, STREAM_START_TIMEOUT_MS)),
+      ]);
+    }
+    await opts.streamingHook.onStreamEnd(threadId, finalContent, invocationId).catch((err) => {
+      logger.warn({ err, threadId }, '[messages] StreamingHook.onStreamEnd failed');
+    });
+  }
+
+  const hasContent = collectedTextParts.length > 0 || outboundTurns.length > 0;
+  if (!opts.outboundHook || !hasContent) {
+    if (opts.streamingHook?.cleanupPlaceholders) {
+      await opts.streamingHook.cleanupPlaceholders(threadId, invocationId).catch((err) => {
+        logger.warn({ err, threadId }, '[messages] StreamingHook.cleanupPlaceholders failed (silent)');
+      });
+    }
+    return;
+  }
+
+  let threadMeta: { threadShortId: string; threadTitle?: string; deepLinkUrl?: string } | undefined;
+  try {
+    const LOOKUP_TIMEOUT_MS = 2000;
+    const thread = opts.threadStore?.get(threadId);
+    if (thread) {
+      const lookupPromise = Promise.resolve(thread).catch(() => undefined);
+      const timeout = new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), LOOKUP_TIMEOUT_MS));
+      const resolved = await Promise.race([lookupPromise, timeout]);
+      if (resolved) {
+        const frontendBase = resolveFrontendBaseUrl(process.env);
+        threadMeta = {
+          threadShortId: threadId.slice(0, 15),
+          threadTitle: resolved.title ?? undefined,
+          deepLinkUrl: buildThreadDeepLink(frontendBase, threadId),
+        };
+      }
+    }
+  } catch {
+    logger.warn({ threadId }, '[messages] threadMeta lookup failed');
+  }
+
+  const DELIVER_TIMEOUT_MS = 10_000;
+  const nonEmptyTurns = outboundTurns.filter(
+    (t) => t.textParts.length > 0 || (t.richBlocks && t.richBlocks.length > 0),
+  );
+
+  let deliveryFailed = false;
+  const inflightDeliverPromises: Promise<void>[] = [];
+
+  if (nonEmptyTurns.length > 1) {
+    for (const turn of nonEmptyTurns) {
+      const turnContent = turn.textParts.join('');
+      const deliverPromise = opts.outboundHook.deliver(
+        threadId,
+        turnContent,
+        turn.agentId,
+        turn.richBlocks,
+        threadMeta,
+      );
+      inflightDeliverPromises.push(deliverPromise);
+      try {
+        await Promise.race([
+          deliverPromise,
+          new Promise<void>((_, reject) => setTimeout(() => reject(new Error('deliver timeout')), DELIVER_TIMEOUT_MS)),
+        ]);
+      } catch (err) {
+        deliveryFailed = true;
+        logger.error({ err, threadId, agentId: turn.agentId }, '[messages] Outbound delivery error');
+      }
+    }
+  } else if (nonEmptyTurns.length === 1) {
+    const turn = nonEmptyTurns[0];
+    const richBlocks = persistenceContext.richBlocks ?? turn.richBlocks;
+    const deliverPromise = opts.outboundHook.deliver(threadId, finalContent, turn.agentId, richBlocks, threadMeta);
+    inflightDeliverPromises.push(deliverPromise);
+    try {
+      await Promise.race([
+        deliverPromise,
+        new Promise<void>((_, reject) => setTimeout(() => reject(new Error('deliver timeout')), DELIVER_TIMEOUT_MS)),
+      ]);
+    } catch (err) {
+      deliveryFailed = true;
+      logger.error({ err, threadId }, '[messages] Outbound delivery error');
+    }
+  } else {
+    const richBlocks = persistenceContext.richBlocks;
+    if (richBlocks) {
+      const deliverPromise = opts.outboundHook.deliver(threadId, finalContent, primaryAgent, richBlocks, threadMeta);
+      inflightDeliverPromises.push(deliverPromise);
+      try {
+        await Promise.race([
+          deliverPromise,
+          new Promise<void>((_, reject) => setTimeout(() => reject(new Error('deliver timeout')), DELIVER_TIMEOUT_MS)),
+        ]);
+      } catch (err) {
+        deliveryFailed = true;
+        logger.error({ err, threadId }, '[messages] Outbound delivery error');
+      }
+    }
+  }
+
+  if (!deliveryFailed && opts.streamingHook?.cleanupPlaceholders) {
+    await opts.streamingHook.cleanupPlaceholders(threadId, invocationId).catch((err) => {
+      logger.warn({ err, threadId }, '[messages] StreamingHook.cleanupPlaceholders failed');
+    });
+  } else if (deliveryFailed && opts.streamingHook?.cleanupPlaceholders) {
+    const cleanupFn = opts.streamingHook.cleanupPlaceholders.bind(opts.streamingHook);
+    Promise.allSettled(inflightDeliverPromises).then((results) => {
+      if (results.every((r) => r.status === 'fulfilled')) {
+        cleanupFn(threadId, invocationId).catch((err) => {
+          logger.warn({ err, threadId }, '[messages] Late-success placeholder cleanup failed');
+        });
+      }
+    });
+  }
+
+  // F151: Signal adapters that this invocation's delivery batch is complete.
+  // chainDone = no more active or queued invocations for this thread.
+  if (opts.streamingHook?.notifyDeliveryBatchDone) {
+    const threadStillBusy =
+      (opts.invocationTracker?.has(threadId) ?? false) || (opts.queueProcessor?.isThreadBusy(threadId) ?? false);
+    await opts.streamingHook.notifyDeliveryBatchDone(threadId, !threadStillBusy).catch((err) => {
+      logger.warn({ err, threadId }, '[messages] notifyDeliveryBatchDone failed');
+    });
+  }
+}

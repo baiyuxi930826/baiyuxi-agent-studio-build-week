@@ -1,0 +1,1147 @@
+// F102: IIndexBuilder — scan docs, parse frontmatter, build/rebuild evidence index
+// F152 Phase A: refactored to use RepoScanner strategy (KD-5)
+
+import { createHash } from 'node:crypto';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve } from 'node:path';
+import { AgentStudioScanner, extractAnchor, extractFrontmatter } from './AgentStudioScanner.js';
+import { GenericRepoScanner } from './GenericRepoScanner.js';
+import type {
+  ConsistencyReport,
+  EvidenceItem,
+  EvidenceKind,
+  IEmbeddingService,
+  IIndexBuilder,
+  RebuildResult,
+  RepoScanner,
+} from './interfaces.js';
+
+// Re-export for backward compatibility — external code imports KIND_DIRS from IndexBuilder
+export { KIND_DIRS } from './AgentStudioScanner.js';
+
+import { decodeTranscriptPathSegment } from '../agents/services/session/transcript-paths.js';
+import { extractDocLinkEdges, extractFeatureRefEdges, extractWikiLinkEdges } from './edge-extractors.js';
+import { embedIndexedItems, embedPassages, type PassageEmbeddingRow } from './embed-utils.js';
+import { type PassageVectorStore, passageVectorKey } from './PassageVectorStore.js';
+import type { SqliteEvidenceStore } from './SqliteEvidenceStore.js';
+import { SIGNAL_FLAGS } from './summary-config.js';
+import type { VectorStore } from './VectorStore.js';
+
+/**
+ * Bump when scanner extraction logic changes (e.g., new fields derived from
+ * the same source files). A version mismatch triggers an automatic full
+ * re-index on the next rebuild(), so users only need to restart the API.
+ *
+ * History:
+ *   1 — initial (implicit, pre-versioning)
+ *   2 — AgentStudioScanner: section headings → keywords (PR #1179)
+ *   3 — Phase D: pathToAuthority backfill (authority derived from path)
+ *   4 — F209 Phase B: entity mention extraction from docs/passages
+ *   5 — visual artifact text indexing (SVG text + message block alt/caption)
+ */
+export const INDEXING_VERSION = 5;
+
+/** Higher number = higher priority for anchor ownership */
+const KIND_PRIORITY: Record<EvidenceKind, number> = {
+  feature: 4,
+  decision: 3,
+  plan: 2,
+  discussion: 2,
+  research: 2,
+  session: 1,
+  lesson: 1,
+  thread: 1,
+  'pack-knowledge': 0, // F129: pack knowledge — lowest priority, never overwrites global docs
+};
+
+const PASSAGE_EMBED_SCAN_BATCH_SIZE = 256;
+
+/**
+ * Minimal thread snapshot for indexing — avoids coupling to full IThreadStore interface.
+ * The caller (factory/index.ts) provides a callback that returns these.
+ */
+export interface ThreadSnapshot {
+  id: string;
+  title: string | null;
+  participants: string[];
+  threadMemory?: { summary: string } | null;
+  lastActiveAt: number;
+  /** Feature IDs associated with this thread (from phase, backlogItemId, etc.) */
+  featureIds?: string[];
+}
+
+function computeThreadSourceHash(title: string, summary: string, keywords: string[]): string {
+  return createHash('sha256').update(JSON.stringify({ title, summary, keywords })).digest('hex').slice(0, 16);
+}
+
+const SEARCHABLE_BLOCK_TEXT_FIELDS = [
+  'text',
+  'alt',
+  'caption',
+  'title',
+  'subtitle',
+  'label',
+  'description',
+  'body',
+  'bodyMarkdown',
+  'markdown',
+  'summary',
+];
+
+function buildSearchableMessageContent(message: StoredMessageSnapshot): string {
+  const parts: string[] = [];
+  const seen = new Set<string>();
+  const push = (value: unknown): void => {
+    if (typeof value !== 'string') return;
+    const text = value.replace(/\s+/g, ' ').trim();
+    if (!text) return;
+    const key = text.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    parts.push(text);
+  };
+
+  push(message.content);
+  for (const block of message.contentBlocks ?? []) collectBlockText(block, push);
+  for (const block of message.richBlocks ?? []) collectBlockText(block, push);
+
+  return parts.join('\n');
+}
+
+function collectBlockText(block: unknown, push: (value: unknown) => void): void {
+  if (!block || typeof block !== 'object') return;
+  const obj = block as Record<string, unknown>;
+
+  for (const field of SEARCHABLE_BLOCK_TEXT_FIELDS) {
+    push(obj[field]);
+  }
+
+  const items = obj.items;
+  if (Array.isArray(items)) {
+    for (const item of items) collectBlockText(item, push);
+  }
+
+  const sections = obj.sections;
+  if (Array.isArray(sections)) {
+    for (const section of sections) collectBlockText(section, push);
+  }
+}
+
+/** Callback that returns all threads for indexing. */
+export type ThreadListFn = () => ThreadSnapshot[] | Promise<ThreadSnapshot[]>;
+
+/** Callback that returns thread IDs to exclude from session digest indexing. */
+export type ExcludeThreadIdsFn = () => Set<string> | Promise<Set<string>>;
+
+/** Snapshot of a single message for passage indexing. */
+export interface StoredMessageSnapshot {
+  id: string;
+  content: string;
+  agentId?: string;
+  threadId: string;
+  timestamp: number;
+  contentBlocks?: readonly unknown[];
+  richBlocks?: readonly unknown[];
+}
+
+/** Callback that returns messages for a given thread. */
+export type MessageListFn = (
+  threadId: string,
+  limit?: number,
+) => StoredMessageSnapshot[] | Promise<StoredMessageSnapshot[]>;
+
+const PROJECT_MANIFESTS = [
+  'package.json',
+  'Cargo.toml',
+  'go.mod',
+  'pyproject.toml',
+  'pom.xml',
+  'build.gradle',
+  'Gemfile',
+  'composer.json',
+  'pubspec.yaml',
+];
+
+function hasProjectManifest(dir: string): boolean {
+  return PROJECT_MANIFESTS.some((f) => existsSync(join(dir, f)));
+}
+
+/** AC-A3: auto-select scanner + resolve the correct scan root (P1-1 fix) */
+function detectScanner(docsRoot: string, exclude?: string[]): { scanner: RepoScanner; scanRoot: string } {
+  // Agent Studio repos have features/ or decisions/ inside docsRoot
+  if (existsSync(join(docsRoot, 'features')) || existsSync(join(docsRoot, 'decisions'))) {
+    return { scanner: new AgentStudioScanner(exclude), scanRoot: docsRoot };
+  }
+  // docsRoot itself might be a project root (has manifests directly)
+  if (hasProjectManifest(docsRoot)) {
+    return { scanner: new GenericRepoScanner(), scanRoot: docsRoot };
+  }
+  // Production path: docsRoot is a docs/ subdirectory — check parent for manifests
+  const parentDir = resolve(docsRoot, '..');
+  if (parentDir !== resolve(docsRoot) && hasProjectManifest(parentDir)) {
+    return { scanner: new GenericRepoScanner(), scanRoot: parentDir };
+  }
+  // Default: AgentStudioScanner (backward compatible)
+  return { scanner: new AgentStudioScanner(exclude), scanRoot: docsRoot };
+}
+
+export class IndexBuilder implements IIndexBuilder {
+  /** E-2: Set of threadIds that have been modified since last flush */
+  private dirtyThreads = new Set<string>();
+
+  private passageEmbeddingWarmupInFlight: Promise<void> | null = null;
+
+  /** F152 Phase A: pluggable scanner — defaults to AgentStudioScanner */
+  private readonly scanner: RepoScanner & {
+    parseSingle?(f: string, r: string): import('./interfaces.js').ScannedEvidence | null;
+  };
+
+  /** F152 P1-1 fix: the root directory the scanner should scan (may differ from docsRoot) */
+  private readonly scanRoot: string;
+
+  constructor(
+    private readonly store: SqliteEvidenceStore,
+    private readonly docsRoot: string,
+    private embedDeps?: {
+      embedding: IEmbeddingService;
+      vectorStore: VectorStore;
+      passageVectorStore?: PassageVectorStore;
+    },
+    private readonly transcriptDataDir?: string,
+    private readonly threadListFn?: ThreadListFn,
+    private readonly messageListFn?: MessageListFn,
+    private readonly excludeThreadIdsFn?: ExcludeThreadIdsFn,
+    scanner?: RepoScanner,
+    exclude?: string[],
+  ) {
+    if (scanner) {
+      this.scanner = scanner;
+      this.scanRoot = docsRoot;
+    } else {
+      const detected = detectScanner(docsRoot, exclude);
+      this.scanner = detected.scanner;
+      this.scanRoot = detected.scanRoot;
+    }
+    this.store.setSourceRoot(this.scanRoot);
+  }
+
+  setEmbedDeps(deps: {
+    embedding: IEmbeddingService;
+    vectorStore: VectorStore;
+    passageVectorStore?: PassageVectorStore;
+  }): void {
+    this.embedDeps = deps;
+  }
+
+  addExcludePatterns(patterns: string[]): void {
+    if (this.scanner instanceof AgentStudioScanner) {
+      this.scanner.addExcludePatterns(patterns);
+    }
+  }
+
+  /** P2-4 fix: auto-skip soft clues for large repos (AC-A5 performance guard) */
+  private buildScanOptions(): Record<string, unknown> {
+    if (!(this.scanner instanceof GenericRepoScanner)) return {};
+    try {
+      const entryCount = readdirSync(this.scanRoot).length;
+      return entryCount > 200 ? { skipSoftClues: true } : {};
+    } catch {
+      return {};
+    }
+  }
+
+  /** Returns true when scanner logic has changed since last index build. */
+  private hasIndexingVersionChanged(): boolean {
+    try {
+      const db = this.store.getDb();
+      const row = db.prepare("SELECT value FROM embedding_meta WHERE key = 'indexing_version'").get() as
+        | { value: string }
+        | undefined;
+      return row?.value !== String(INDEXING_VERSION);
+    } catch {
+      return true; // table missing or error → treat as version mismatch
+    }
+  }
+
+  private async storeIndexingVersion(): Promise<void> {
+    try {
+      await this.store.runExclusive(() => {
+        const db = this.store.getDb();
+        db.prepare("INSERT OR REPLACE INTO embedding_meta (key, value) VALUES ('indexing_version', ?)").run(
+          String(INDEXING_VERSION),
+        );
+      });
+    } catch {
+      // fail-open: version not persisted → next restart will re-index (safe)
+    }
+  }
+
+  async rebuild(options?: {
+    force?: boolean;
+    onProgress?: (phase: string, percent: number) => void;
+  }): Promise<RebuildResult> {
+    const report = options?.onProgress ?? (() => {});
+    const start = Date.now();
+    let indexed = 0;
+    let skipped = 0;
+
+    // Auto-force when scanner logic has changed since last rebuild
+    const versionChanged = this.hasIndexingVersionChanged();
+    const effectiveForce = options?.force || versionChanged;
+
+    report('scanning', 0);
+    // F152 Phase A: delegate to pluggable scanner (KD-5)
+    const scannedItems = this.scanner.discover(this.scanRoot, this.buildScanOptions());
+    report('scanning', 15);
+    const currentAnchors = new Set<string>();
+    const indexedItems: EvidenceItem[] = [];
+
+    for (const scanned of scannedItems) {
+      const sourceHash = scanned.rawContent
+        ? createHash('sha256').update(scanned.rawContent).digest('hex').slice(0, 16)
+        : ((scanned.item as EvidenceItem).sourceHash ??
+          createHash('sha256').update(scanned.item.title).digest('hex').slice(0, 16));
+
+      const item: EvidenceItem = {
+        ...scanned.item,
+        sourceHash,
+        provenance: scanned.provenance,
+      };
+
+      currentAnchors.add(item.anchor);
+
+      // Skip if hash unchanged AND provenance already populated (unless force/version bump)
+      // P1-2 fix: don't skip when existing doc lacks provenance but new scan provides it
+      if (!effectiveForce) {
+        const existing = await this.store.getByAnchor(item.anchor);
+        if (existing?.sourceHash === item.sourceHash) {
+          const needsProvenanceBackfill = !existing?.provenance?.tier && item.provenance?.tier;
+          if (!needsProvenanceBackfill) {
+            skipped++;
+            continue;
+          }
+        }
+      }
+
+      // Kind-priority guard: don't let lower-priority docs overwrite higher-priority ones
+      const existing = await this.store.getByAnchor(item.anchor);
+      if (existing) {
+        const existingPriority = KIND_PRIORITY[existing.kind] ?? 0;
+        const newPriority = KIND_PRIORITY[item.kind] ?? 0;
+        const existingFileExists = existing.sourcePath ? existsSync(join(this.docsRoot, existing.sourcePath)) : false;
+        if (newPriority < existingPriority && existingFileExists) {
+          skipped++;
+          continue;
+        }
+      }
+
+      await this.store.upsert([item]);
+      indexedItems.push(item);
+      indexed++;
+    }
+
+    report('indexing', 30);
+
+    // Phase D: auto-extract edges from frontmatter cross-references (AC-D18, KD-29)
+    // Phase F: clear both legacy 'related' and normalized 'related_to'; write 'related_to' with provenance
+    await this.store.runExclusive(() => {
+      this.store
+        .getDb()
+        .prepare("DELETE FROM edges WHERE relation IN ('related', 'related_to') AND provenance = 'frontmatter'")
+        .run();
+    });
+
+    for (const scanned of scannedItems) {
+      if (!scanned.rawContent) continue;
+      const fm = extractFrontmatter(scanned.rawContent);
+      if (!fm) continue;
+      const anchor = extractAnchor(fm);
+      if (!anchor) continue;
+
+      const relatedFeatures = fm.related_features;
+      if (Array.isArray(relatedFeatures)) {
+        for (const ref of relatedFeatures) {
+          if (typeof ref === 'string' && ref !== anchor) {
+            await this.store.addEdge({
+              fromAnchor: anchor,
+              toAnchor: ref,
+              relation: 'related_to',
+              provenance: 'frontmatter',
+            });
+          }
+        }
+      }
+    }
+
+    // Phase C (F188): extract wikilink / doc_link / feature_ref edges from content
+    await this.store.runExclusive(() => {
+      this.store.getDb().prepare("DELETE FROM edges WHERE provenance = 'content'").run();
+    });
+
+    const toPosix = (p: string): string => p.replace(/\\/g, '/');
+    const sourcePathKey = (sourcePath: string): string =>
+      toPosix(isAbsolute(sourcePath) ? relative(this.scanRoot, sourcePath) : sourcePath);
+    const pathToAnchor = new Map<string, string>();
+    const setAlias = (key: string, anchor: string): void => {
+      if (!pathToAnchor.has(key)) pathToAnchor.set(key, anchor);
+    };
+    for (const scanned of scannedItems) {
+      const sp = scanned.item.sourcePath;
+      if (sp) {
+        const key = sourcePathKey(sp);
+        pathToAnchor.set(key, scanned.item.anchor);
+        if (key.startsWith('docs/')) {
+          setAlias(key.slice('docs/'.length), scanned.item.anchor);
+        } else {
+          setAlias(`docs/${key}`, scanned.item.anchor);
+        }
+      }
+    }
+
+    for (const scanned of scannedItems) {
+      if (!scanned.rawContent) continue;
+      const anchor = scanned.item.anchor;
+      if (!anchor) continue;
+
+      const body = scanned.rawContent.replace(/^---\n[\s\S]*?\n---\n?/, '');
+      const relSourcePath = scanned.item.sourcePath ? sourcePathKey(scanned.item.sourcePath) : undefined;
+      const allEdges = [
+        ...extractWikiLinkEdges(body, anchor),
+        ...extractFeatureRefEdges(body, anchor),
+        ...extractDocLinkEdges(body, anchor, pathToAnchor, relSourcePath),
+      ];
+      for (const edge of allEdges) {
+        await this.store.addEdge(edge);
+      }
+    }
+
+    report('indexing', 40);
+    // Phase D-6: Index session digests (kind=session)
+    if (this.transcriptDataDir) {
+      const excludedThreadIds = this.excludeThreadIdsFn ? await this.excludeThreadIdsFn() : undefined;
+      const sessionItems = this.discoverSessionDigests(excludedThreadIds);
+      for (const item of sessionItems) {
+        currentAnchors.add(item.anchor);
+        if (!options?.force) {
+          const existing = await this.store.getByAnchor(item.anchor);
+          if (existing?.sourceHash === item.sourceHash) {
+            skipped++;
+            continue;
+          }
+        }
+        await this.store.upsert([item]);
+        indexedItems.push(item);
+        indexed++;
+      }
+    }
+
+    // Phase E-1: Index thread summaries
+    let threadListFailed = false;
+    if (this.threadListFn) {
+      let threads: ThreadSnapshot[];
+      try {
+        threads = await this.threadListFn();
+      } catch {
+        threads = [];
+        threadListFailed = true;
+      }
+
+      for (const thread of threads) {
+        const anchor = `thread-${thread.id}`;
+        const title = thread.title ?? `Thread ${thread.id.slice(0, 12)}`;
+        const keywords = [...thread.participants, ...(thread.featureIds ?? [])];
+
+        // KD-32/33: Build summary from message content, not threadMemory.summary
+        // threadMemory.summary is empty for 96% of threads — useless as data source
+        let summary = '';
+        if (this.messageListFn) {
+          try {
+            const messages = await this.messageListFn(thread.id, 100);
+            if (messages.length > 0) {
+              const turns = messages
+                .map((m) => {
+                  const content = buildSearchableMessageContent(m);
+                  return content ? `[${m.agentId ?? 'user'}] ${content}` : '';
+                })
+                .filter(Boolean);
+              // Truncate to ~3000 chars for FTS5 summary field
+              const joined = turns.join('\n');
+              summary = joined.length > 3000 ? `${joined.slice(0, 2997)}...` : joined;
+            }
+          } catch {
+            // fail-open: skip this thread's messages
+          }
+        }
+        // Fallback: use threadMemory.summary if messages unavailable
+        if (!summary) {
+          summary = thread.threadMemory?.summary ?? '';
+        }
+        // Still nothing? Use title as minimal searchable content
+        if (!summary) {
+          summary = title;
+        }
+
+        const sourceHash = computeThreadSourceHash(title, summary, keywords);
+
+        currentAnchors.add(anchor);
+        if (!options?.force) {
+          const existing = await this.store.getByAnchor(anchor);
+          if (existing?.sourceHash === sourceHash) {
+            skipped++;
+            continue;
+          }
+        }
+        const item: EvidenceItem = {
+          anchor,
+          kind: 'thread',
+          status: 'active',
+          title,
+          summary,
+          keywords: keywords.length > 0 ? keywords : undefined,
+          sourcePath: `threads/${thread.id}`,
+          sourceHash,
+          updatedAt: new Date(thread.lastActiveAt).toISOString(),
+        };
+        await this.store.upsert([item]);
+        indexedItems.push(item);
+        indexed++;
+      }
+    }
+
+    report('indexing', 55);
+    // Phase E-3: Index thread message passages
+    let threads: ThreadSnapshot[] = [];
+    if (this.messageListFn && this.threadListFn && !threadListFailed) {
+      try {
+        threads = await this.threadListFn();
+      } catch {
+        threads = [];
+      }
+      await this.indexPassages(threads);
+    }
+
+    // Phase I (AC-I1/I3): Backfill from JSONL transcripts for threads with expired Redis messages
+    if (this.transcriptDataDir && threads.length > 0) {
+      for (const thread of threads) {
+        await this.backfillPassagesFromTranscript(thread.id);
+      }
+    }
+
+    report('cleanup', 70);
+    // Remove stale anchors that no longer exist on disk
+    // P1 fix: if threadListFn failed, preserve existing thread-* anchors (don't delete on transient error)
+    const db = this.store.getDb();
+    const allAnchors = db.prepare('SELECT anchor FROM evidence_docs').all() as Array<{ anchor: string }>;
+    const removedAnchors: string[] = [];
+    for (const row of allAnchors) {
+      if (!currentAnchors.has(row.anchor)) {
+        if (threadListFailed && row.anchor.startsWith('thread-')) continue;
+        await this.store.deleteByAnchor(row.anchor);
+        this.embedDeps?.vectorStore.delete(row.anchor);
+        removedAnchors.push(row.anchor);
+      }
+    }
+
+    report('embedding', 80);
+    // Phase C: generate embeddings for indexed items (shared utility with batch splitting)
+    if (this.embedDeps) {
+      const { embedding, vectorStore } = this.embedDeps;
+      const store = this.store;
+      try {
+        await embedIndexedItems({
+          items: indexedItems,
+          embedding,
+          vectorStore,
+          onVectorReset: () => this.embedDeps?.passageVectorStore?.clearAll(),
+          allDocsProvider: () => {
+            const db = store.getDb();
+            const allDocs = db.prepare('SELECT anchor, title, summary FROM evidence_docs').all() as Array<{
+              anchor: string;
+              title: string;
+              summary: string | null;
+            }>;
+            return allDocs.map(
+              (d) => ({ anchor: d.anchor, title: d.title, summary: d.summary ?? undefined }) as EvidenceItem,
+            );
+          },
+        });
+      } catch {
+        // fail-open: embedding errors don't block indexing
+      }
+    }
+    // Persist current indexing version so next startup can detect changes
+    await this.storeIndexingVersion();
+    report('done', 100);
+
+    return { docsIndexed: indexed, docsSkipped: skipped, durationMs: Date.now() - start };
+  }
+
+  startPassageEmbeddingWarmup(): void {
+    // F209 fix: passage embedding is a recall accelerator (passage_fts stays canonical),
+    // so it MUST NOT block rebuild()/listen(). Call this only after the API is listening.
+    setImmediate(() => {
+      void this.runPassageEmbeddingWarmup();
+    });
+  }
+
+  private runPassageEmbeddingWarmup(): Promise<void> {
+    if (this.passageEmbeddingWarmupInFlight) return this.passageEmbeddingWarmupInFlight;
+
+    const warmup = this.embedMissingPassages()
+      .catch(() => {
+        /* fail-open: passage vectors are an accelerator; passage_fts remains canonical */
+      })
+      .finally(() => {
+        if (this.passageEmbeddingWarmupInFlight === warmup) {
+          this.passageEmbeddingWarmupInFlight = null;
+        }
+      });
+    this.passageEmbeddingWarmupInFlight = warmup;
+    return warmup;
+  }
+
+  async incrementalUpdate(changedPaths: string[]): Promise<void> {
+    // Two-pass: deletions first, then upserts.
+    // This ensures that when a higher-priority owner is deleted and a lower-priority
+    // doc is updated in the same batch, the deletion clears the way for the upsert.
+    const toUpsert: Array<{ filePath: string; parsed: EvidenceItem }> = [];
+    const toDelete: string[] = [];
+
+    for (const filePath of changedPaths) {
+      const parsed = this.parseSingleFile(filePath);
+      if (parsed) {
+        toUpsert.push({ filePath, parsed });
+      } else {
+        toDelete.push(filePath);
+      }
+    }
+
+    // Pass 1: deletions (P1: sync vector deletion) + backfill from candidate docs
+    const deletedAnchors: string[] = [];
+    for (const filePath of toDelete) {
+      // P1-5 fix: use scanRoot (not docsRoot) — source_path stored relative to scanRoot
+      const relPath = relative(this.scanRoot, filePath);
+      const db = this.store.getDb();
+      const row = db.prepare('SELECT anchor FROM evidence_docs WHERE source_path = ?').get(relPath) as
+        | { anchor: string }
+        | undefined;
+      if (row) {
+        await this.store.deleteByAnchor(row.anchor);
+        this.embedDeps?.vectorStore.delete(row.anchor);
+        deletedAnchors.push(row.anchor);
+      }
+    }
+
+    // Backfill: for each deleted anchor, scan for remaining docs that claim it
+    if (deletedAnchors.length > 0) {
+      const allScanned = this.scanner.discover(this.scanRoot, this.buildScanOptions());
+      for (const anchor of deletedAnchors) {
+        const candidates = allScanned
+          .filter((s) => s.item.anchor === anchor)
+          .map(
+            (s) =>
+              ({
+                ...s.item,
+                sourceHash: s.rawContent
+                  ? createHash('sha256').update(s.rawContent).digest('hex').slice(0, 16)
+                  : undefined,
+                provenance: s.provenance,
+              }) as EvidenceItem,
+          );
+        if (candidates.length > 0) {
+          candidates.sort((a, b) => (KIND_PRIORITY[b.kind] ?? 0) - (KIND_PRIORITY[a.kind] ?? 0));
+          const best = candidates[0]!;
+          if (!toUpsert.some((u) => u.parsed.anchor === anchor)) {
+            toUpsert.push({ filePath: join(this.docsRoot, best.sourcePath!), parsed: best });
+          }
+        }
+      }
+    }
+
+    // Pass 2: upserts (with kind-priority guard) + embed new/changed docs
+    for (const { parsed } of toUpsert) {
+      const existing = await this.store.getByAnchor(parsed.anchor);
+      if (existing) {
+        const existingPriority = KIND_PRIORITY[existing.kind] ?? 0;
+        const newPriority = KIND_PRIORITY[parsed.kind] ?? 0;
+        if (newPriority < existingPriority) {
+          continue;
+        }
+      }
+      await this.store.upsert([parsed]);
+      // Embed the new/changed doc
+      if (this.embedDeps?.embedding.isReady()) {
+        try {
+          const [vec] = await this.embedDeps.embedding.embed([`${parsed.title} ${parsed.summary ?? ''}`]);
+          this.embedDeps.vectorStore.upsert(parsed.anchor, vec);
+        } catch {
+          // fail-open: skip embedding on error
+        }
+      }
+    }
+  }
+
+  async checkConsistency(): Promise<ConsistencyReport> {
+    const db = this.store.getDb();
+    const docCount = (db.prepare('SELECT count(*) AS c FROM evidence_docs').get() as { c: number }).c;
+    const ftsCount = (db.prepare('SELECT count(*) AS c FROM evidence_fts').get() as { c: number }).c;
+
+    return {
+      ok: docCount === ftsCount,
+      docCount,
+      ftsCount,
+      mismatches: docCount !== ftsCount ? [`doc=${docCount} fts=${ftsCount}`] : [],
+    };
+  }
+
+  // ── Private ──────────────────────────────────────────────────────
+
+  /** F152: Bridge — delegate single-file parsing to scanner (for incrementalUpdate) */
+  private parseSingleFile(filePath: string): EvidenceItem | null {
+    if ('parseSingle' in this.scanner && typeof this.scanner.parseSingle === 'function') {
+      const scanned = this.scanner.parseSingle(filePath, this.scanRoot);
+      if (!scanned) return null;
+      const sourceHash = scanned.rawContent
+        ? createHash('sha256').update(scanned.rawContent).digest('hex').slice(0, 16)
+        : undefined;
+      return { ...scanned.item, sourceHash, provenance: scanned.provenance };
+    }
+    return null;
+  }
+
+  /**
+   * D6: Discover sealed session digests from transcript data directory.
+   * Scans dataDir/threads/{threadId}/{agentId}/sessions/{sessionId}/digest.extractive.json
+   */
+  private discoverSessionDigests(excludedThreadIds?: Set<string>): EvidenceItem[] {
+    if (!this.transcriptDataDir) return [];
+    const results: EvidenceItem[] = [];
+    const threadsDir = join(this.transcriptDataDir, 'threads');
+
+    let threadIds: string[];
+    try {
+      threadIds = readdirSync(threadsDir).filter((e) => {
+        try {
+          return statSync(join(threadsDir, e)).isDirectory();
+        } catch {
+          return false;
+        }
+      });
+    } catch {
+      return results;
+    }
+
+    for (const threadDirName of threadIds) {
+      const threadId = decodeTranscriptPathSegment(threadDirName);
+      if (excludedThreadIds?.has(threadId)) continue;
+      const threadPath = join(threadsDir, threadDirName);
+      let agentIds: string[];
+      try {
+        agentIds = readdirSync(threadPath).filter((e) => {
+          try {
+            return statSync(join(threadPath, e)).isDirectory();
+          } catch {
+            return false;
+          }
+        });
+      } catch {
+        continue;
+      }
+
+      for (const agentDirName of agentIds) {
+        const agentId = decodeTranscriptPathSegment(agentDirName);
+        const sessionsPath = join(threadPath, agentDirName, 'sessions');
+        let sessionIds: string[];
+        try {
+          sessionIds = readdirSync(sessionsPath).filter((e) => {
+            try {
+              return statSync(join(sessionsPath, e)).isDirectory();
+            } catch {
+              return false;
+            }
+          });
+        } catch {
+          continue;
+        }
+
+        for (const sessionDirName of sessionIds) {
+          const sessionId = decodeTranscriptPathSegment(sessionDirName);
+          const digestPath = join(sessionsPath, sessionDirName, 'digest.extractive.json');
+          try {
+            const raw = readFileSync(digestPath, 'utf-8');
+            const digest = JSON.parse(raw) as {
+              sessionId: string;
+              threadId: string;
+              agentId: string;
+              seq: number;
+              time: { createdAt: number; sealedAt: number };
+              invocations?: Array<{ toolNames?: string[] }>;
+              filesTouched?: Array<{ path: string }>;
+            };
+
+            const toolNames = (digest.invocations ?? [])
+              .flatMap((inv) => inv.toolNames ?? [])
+              .filter((v, i, a) => a.indexOf(v) === i);
+            const files = (digest.filesTouched ?? []).map((f) => f.path);
+            const summary = [
+              `Session ${digest.seq} by ${digest.agentId}`,
+              toolNames.length > 0 ? `Tools: ${toolNames.join(', ')}` : '',
+              files.length > 0
+                ? `Files: ${files.slice(0, 5).join(', ')}${files.length > 5 ? ` (+${files.length - 5})` : ''}`
+                : '',
+            ]
+              .filter(Boolean)
+              .join('. ');
+
+            const sourceHash = createHash('sha256').update(raw).digest('hex').slice(0, 16);
+            const anchor = `session-${sessionId}`;
+
+            results.push({
+              anchor,
+              kind: 'session',
+              status: 'active',
+              title: `Session ${digest.seq} — ${digest.agentId} @ ${threadId.slice(0, 12)}`,
+              summary,
+              keywords: toolNames,
+              sourcePath: `transcripts/threads/${threadId}/${agentId}/sessions/${sessionId}`,
+              sourceHash,
+              updatedAt: new Date(digest.time.sealedAt).toISOString(),
+            });
+          } catch {
+            // digest doesn't exist or parse error — skip
+          }
+        }
+      }
+    }
+
+    return results;
+  }
+
+  // ── E-2: Dirty-thread debounce infrastructure ──────────────────────
+
+  /** Mark a thread as dirty (its summary has changed). Called externally after messageStore.append. */
+  markThreadDirty(threadId: string): void {
+    this.dirtyThreads.add(threadId);
+  }
+
+  /**
+   * G-3c: Accumulate pending delta into summary_state.
+   * Called at append time with actual new message content (not rebuilt summary).
+   * P1 fix (砚砚 review): accumulate from delta, not from flushed summary snapshot.
+   */
+  accumulateSummaryDelta(threadId: string, messageContent: string): void {
+    const tokenEstimate = Math.ceil(messageContent.length / 4);
+
+    let signalFlags = 0;
+    const lower = messageContent.toLowerCase();
+    if (/(?:决定|agreed|kd-|decided|confirmed)/i.test(lower)) signalFlags |= SIGNAL_FLAGS.DECISION;
+    if (/(?:\.ts|\.js|\.tsx|pr\s*#|commit|merge|diff)/i.test(lower)) signalFlags |= SIGNAL_FLAGS.CODE;
+    if (/(?:fix|bug|error|修复|报错)/i.test(lower)) signalFlags |= SIGNAL_FLAGS.ERROR_FIX;
+
+    // Fire-and-forget through write queue (F163 AC-A5 single-writer contract)
+    void this.store
+      .runExclusive(() => {
+        const db = this.store.getDb();
+        db.prepare(`
+        INSERT INTO summary_state (thread_id, pending_message_count, pending_token_count, pending_signal_flags, summary_type)
+        VALUES (?, 1, ?, ?, 'concat')
+        ON CONFLICT(thread_id) DO UPDATE SET
+          pending_message_count = pending_message_count + 1,
+          pending_token_count = pending_token_count + ?,
+          pending_signal_flags = pending_signal_flags | ?
+      `).run(threadId, tokenEstimate, signalFlags, tokenEstimate, signalFlags);
+      })
+      .catch(() => {
+        /* fail-open */
+      });
+  }
+
+  /** Flush dirty threads: re-index only the threads that have been marked dirty. */
+  async flushDirtyThreads(): Promise<number> {
+    if (this.dirtyThreads.size === 0 || !this.threadListFn) return 0;
+
+    const dirtyIds = [...this.dirtyThreads];
+    this.dirtyThreads.clear();
+
+    let flushed = 0;
+    let threads: ThreadSnapshot[];
+    try {
+      threads = await this.threadListFn();
+    } catch {
+      return 0;
+    }
+
+    const threadMap = new Map(threads.map((t) => [t.id, t]));
+
+    for (const threadId of dirtyIds) {
+      const thread = threadMap.get(threadId);
+      if (!thread) continue;
+
+      const anchor = `thread-${threadId}`;
+      const title = thread.title ?? `Thread ${threadId.slice(0, 12)}`;
+      const keywords = [...thread.participants, ...(thread.featureIds ?? [])];
+
+      // KD-32/33: Build summary from message content, same logic as rebuild()
+      let summary = '';
+      if (this.messageListFn) {
+        try {
+          const messages = await this.messageListFn(threadId, 100);
+          if (messages.length > 0) {
+            const turns = messages
+              .map((m) => {
+                const content = buildSearchableMessageContent(m);
+                return content ? `[${m.agentId ?? 'user'}] ${content}` : '';
+              })
+              .filter(Boolean);
+            const joined = turns.join('\n');
+            summary = joined.length > 3000 ? `${joined.slice(0, 2997)}...` : joined;
+          }
+        } catch {
+          // fail-open
+        }
+      }
+      if (!summary) {
+        summary = thread.threadMemory?.summary ?? '';
+      }
+      if (!summary) {
+        summary = title;
+      }
+
+      const sourceHash = computeThreadSourceHash(title, summary, keywords);
+
+      const existing = await this.store.getByAnchor(anchor);
+      if (existing?.sourceHash === sourceHash) continue; // unchanged
+
+      const item: EvidenceItem = {
+        anchor,
+        kind: 'thread',
+        status: 'active',
+        title,
+        summary,
+        keywords: keywords.length > 0 ? keywords : undefined,
+        sourcePath: `threads/${threadId}`,
+        sourceHash,
+        updatedAt: new Date(thread.lastActiveAt).toISOString(),
+      };
+
+      await this.store.upsert([item]);
+
+      // Embed if available
+      if (this.embedDeps?.embedding.isReady()) {
+        try {
+          const [vec] = await this.embedDeps.embedding.embed([`${title} ${summary}`]);
+          this.embedDeps.vectorStore.upsert(anchor, vec);
+        } catch {
+          // fail-open
+        }
+      }
+
+      flushed++;
+    }
+
+    // #652: Also index passages for dirty threads so new messages are immediately searchable
+    const dirtySnapshots = dirtyIds.map((id) => threadMap.get(id)).filter(Boolean) as ThreadSnapshot[];
+    if (dirtySnapshots.length > 0) {
+      await this.indexPassages(dirtySnapshots);
+      await this.embedMissingPassages(dirtySnapshots.map((t) => `thread-${t.id}`));
+    }
+
+    return flushed;
+  }
+
+  /** F209 Phase A: embed newly indexed raw passages without blocking lexical recall. */
+  private async embedMissingPassages(docAnchors?: string[]): Promise<void> {
+    const deps = this.embedDeps;
+    if (!deps?.passageVectorStore) return;
+
+    try {
+      const db = this.store.getDb();
+      const existingStmt = db.prepare('SELECT 1 AS present FROM passage_vectors WHERE passage_key = ? LIMIT 1');
+      let lastId = 0;
+
+      for (;;) {
+        const whereClauses = ['id > ?'];
+        const params: unknown[] = [lastId];
+        if (docAnchors?.length) {
+          whereClauses.push(`doc_anchor IN (${docAnchors.map(() => '?').join(',')})`);
+          params.push(...docAnchors);
+        }
+        const rows = db
+          .prepare(
+            `SELECT id, doc_anchor AS docAnchor, passage_id AS passageId, content
+             FROM evidence_passages
+             WHERE ${whereClauses.join(' AND ')}
+             ORDER BY id
+             LIMIT ?`,
+          )
+          .all(...params, PASSAGE_EMBED_SCAN_BATCH_SIZE) as Array<PassageEmbeddingRow & { id: number }>;
+        if (rows.length === 0) return;
+
+        lastId = rows[rows.length - 1]!.id;
+        const missing = rows.filter((r) => !existingStmt.get(passageVectorKey(r.docAnchor, r.passageId)));
+        await embedPassages({
+          passages: missing,
+          embedding: deps.embedding,
+          passageVectorStore: deps.passageVectorStore,
+        });
+      }
+    } catch {
+      // fail-open: passage vectors are an accelerator; passage_fts remains canonical.
+    }
+  }
+
+  /**
+   * E-3: Index thread messages as passages in evidence_passages table.
+   * For each thread, fetches messages via messageListFn and upserts into evidence_passages.
+   */
+  private async indexPassages(threads: ThreadSnapshot[]): Promise<void> {
+    if (!this.messageListFn) return;
+    const db = this.store.getDb();
+
+    // Phase I (AC-I2): never delete missing passages on rebuild.
+    // Existing returned messages still need to refresh so new block metadata can backfill.
+    const upsertStmt = db.prepare(`
+      INSERT INTO evidence_passages
+      (doc_anchor, passage_id, content, speaker, position, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(doc_anchor, passage_id) DO UPDATE SET
+        content = excluded.content,
+        speaker = excluded.speaker,
+        position = excluded.position,
+        created_at = excluded.created_at
+      WHERE evidence_passages.content IS NOT excluded.content
+        OR evidence_passages.speaker IS NOT excluded.speaker
+        OR evidence_passages.position IS NOT excluded.position
+        OR evidence_passages.created_at IS NOT excluded.created_at
+    `);
+
+    for (const thread of threads) {
+      let messages: StoredMessageSnapshot[];
+      try {
+        messages = await this.messageListFn(thread.id, 2000);
+      } catch {
+        continue;
+      }
+
+      const tx = db.transaction((msgs: StoredMessageSnapshot[]) => {
+        for (let i = 0; i < msgs.length; i++) {
+          const msg = msgs[i];
+          const content = buildSearchableMessageContent(msg);
+          if (!content) continue;
+          const docAnchor = `thread-${thread.id}`;
+          const passageId = `msg-${msg.id}`;
+          const result = upsertStmt.run(
+            docAnchor,
+            passageId,
+            content,
+            msg.agentId ?? 'user',
+            i,
+            new Date(msg.timestamp).toISOString(),
+          );
+          if (result.changes > 0) this.embedDeps?.passageVectorStore?.delete(passageVectorKey(docAnchor, passageId));
+        }
+      });
+
+      // Route batch insert through single-writer queue (F163 AC-A5)
+      await this.store.runExclusive(() => tx(messages));
+      await this.store.refreshEntityMentions([`thread-${thread.id}`]);
+    }
+  }
+
+  /**
+   * Phase I (AC-I1): Backfill passages from JSONL transcript events.
+   * Reads events.jsonl files, aggregates text chunks per invocationId,
+   * and inserts as passages with INSERT OR IGNORE (idempotent).
+   * Returns count of newly added passages.
+   */
+  async backfillPassagesFromTranscript(threadId: string): Promise<number> {
+    if (!this.transcriptDataDir) return 0;
+    const db = this.store.getDb();
+    const threadDir = join(this.transcriptDataDir, 'threads', threadId);
+
+    let agentDirs: string[];
+    try {
+      agentDirs = readdirSync(threadDir).filter((e) => !e.startsWith('.'));
+    } catch {
+      return 0;
+    }
+
+    const insertStmt = db.prepare(`
+      INSERT OR IGNORE INTO evidence_passages
+      (doc_anchor, passage_id, content, speaker, position, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+
+    let added = 0;
+    let position = 10000; // offset to avoid collision with Redis-sourced positions (0-based)
+
+    for (const agentId of agentDirs) {
+      const sessionsDir = join(threadDir, agentId, 'sessions');
+      let sessionDirs: string[];
+      try {
+        sessionDirs = readdirSync(sessionsDir).filter((e) => !e.startsWith('.'));
+      } catch {
+        continue;
+      }
+
+      for (const sessionId of sessionDirs) {
+        const eventsPath = join(sessionsDir, sessionId, 'events.jsonl');
+        let content: string;
+        try {
+          content = readFileSync(eventsPath, 'utf-8');
+        } catch {
+          continue;
+        }
+
+        // Accumulate text chunks by invocationId
+        const invocationTexts = new Map<string, { text: string; t: number; agentId: string }>();
+
+        for (const line of content.split('\n')) {
+          if (!line.trim()) continue;
+          try {
+            const evt = JSON.parse(line);
+            if (evt.event?.type === 'text' && typeof evt.event?.content === 'string') {
+              const invId = evt.invocationId ?? `${sessionId}-noninv`;
+              const existing = invocationTexts.get(invId);
+              if (existing) {
+                existing.text += evt.event.content;
+              } else {
+                invocationTexts.set(invId, {
+                  text: evt.event.content,
+                  agentId: evt.agentId ?? agentId,
+                  t: evt.t,
+                });
+              }
+            }
+          } catch {
+            /* skip malformed lines */
+          }
+        }
+
+        // Insert accumulated text per invocation — routed through single-writer queue (F163 AC-A5)
+        const tx = db.transaction(() => {
+          for (const [invId, data] of invocationTexts) {
+            if (!data.text.trim()) continue;
+            // Guard: skip entries with missing/invalid timestamp (P1 fix)
+            const ts = new Date(data.t);
+            if (Number.isNaN(ts.getTime())) continue;
+            const result = insertStmt.run(
+              `thread-${threadId}`,
+              `transcript-${invId}`,
+              data.text,
+              data.agentId,
+              position++,
+              ts.toISOString(),
+            );
+            if (result.changes > 0) added++;
+          }
+        });
+        await this.store.runExclusive(() => tx());
+      }
+    }
+    if (added > 0) await this.store.refreshEntityMentions([`thread-${threadId}`]);
+    return added;
+  }
+}
+
+// Helper functions moved to AgentStudioScanner.ts (F152 Phase A, KD-5)

@@ -1,0 +1,111 @@
+'use client';
+
+import Link from 'next/link';
+import { useState } from 'react';
+import { anchorToHref, type RecallEvent, useRecallEvents } from '@/hooks/useRecallEvents';
+import { ExpandableText } from '../ExpandableText';
+
+function RecallCard({ event }: { event: RecallEvent }) {
+  const [expanded, setExpanded] = useState(false);
+
+  return (
+    <div className="rounded-lg bg-[var(--console-card-bg)] p-2.5">
+      <button type="button" onClick={() => setExpanded(!expanded)} className="flex w-full items-center gap-2 text-left">
+        <span className="text-xs text-studio-secondary">{expanded ? '\u25BE' : '\u25B8'}</span>
+        <span className="flex-1 text-sm font-medium text-studio-black truncate" title={event.query}>
+          {event.query}
+        </span>
+        {event.resultCount != null && (
+          <span className="rounded bg-[var(--console-panel-bg)] px-1.5 py-0.5 text-micro font-semibold text-studio-interactive">
+            {event.resultCount} 条命中
+          </span>
+        )}
+      </button>
+      {expanded && (
+        <div className="mt-2 space-y-1 console-divider-t pt-2 text-xs text-studio-secondary">
+          {event.mode && <div>模式: {event.mode}</div>}
+          {event.scope && <div>范围: {event.scope}</div>}
+          <div>时间: {new Date(event.timestamp).toLocaleTimeString()}</div>
+          {event.results && event.results.length > 0 && (
+            <div className="mt-1.5 space-y-1.5">
+              {event.results.map((r, i) => {
+                const href = anchorToHref(r.anchor);
+                return (
+                  <div
+                    key={`${event.id}-r${i}`}
+                    className="rounded border border-[var(--console-border-soft)]/40 bg-[var(--console-card-bg)] p-1.5"
+                  >
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      {r.sourceType && (
+                        <span className="rounded bg-[var(--console-panel-bg)]/60 px-1 py-0.5 text-micro font-semibold text-studio-interactive">
+                          {r.sourceType}
+                        </span>
+                      )}
+                      <ExpandableText text={r.title} clampClass="truncate" className="font-medium text-studio-black" />
+                      {r.confidence && (
+                        <span className="ml-auto text-micro text-studio-secondary/70">[{r.confidence}]</span>
+                      )}
+                    </div>
+                    {r.snippet && (
+                      <ExpandableText
+                        text={r.snippet}
+                        as="p"
+                        clampClass="line-clamp-2"
+                        className="mt-0.5 text-micro text-studio-secondary/80"
+                      />
+                    )}
+                    {href && (
+                      <Link
+                        href={href}
+                        className="mt-0.5 flex items-center gap-1 text-xs font-mono text-studio-interactive/70 hover:text-studio-interactive hover:underline"
+                        title={`追溯源头: ${r.anchor}`}
+                      >
+                        <span aria-hidden>&#x2197;</span>
+                        <span className="truncate">{r.anchor}</span>
+                      </Link>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {event.results &&
+            event.results.length > 0 &&
+            event.resultCount != null &&
+            event.resultCount > event.results.length && (
+              <div className="mt-1 text-micro text-studio-secondary/60">
+                还有 {event.resultCount - event.results.length} 条结果未显示
+              </div>
+            )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function RecallFeed() {
+  const events = useRecallEvents();
+
+  if (events.length === 0) {
+    return (
+      <div data-testid="recall-feed" className="p-3">
+        <p className="text-xs text-studio-secondary">
+          Agent 还没有使用记忆搜索。当Agent 调用 search_evidence 时，这里会实时显示。
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div data-testid="recall-feed" className="space-y-2 p-3">
+      <div className="flex items-center gap-2">
+        <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-conn-green-text" />
+        <span className="text-xs font-semibold text-studio-black">实时</span>
+        <span className="text-xs text-studio-secondary">{events.length} 次召回</span>
+      </div>
+      {events.map((evt) => (
+        <RecallCard key={evt.id} event={evt} />
+      ))}
+    </div>
+  );
+}

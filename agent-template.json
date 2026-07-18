@@ -1,0 +1,432 @@
+{
+    "version":  2,
+    "roleTemplates":  [
+                          {
+                              "id":  "architecture-development",
+                              "name":  "Ethan（任务主控与实现）",
+                              "nickname":  "Ethan",
+                              "avatar":  "/avatars/default.svg",
+                              "color":  {
+                                            "primary":  "#2563EB",
+                                            "secondary":  "#DBEAFE"
+                                        },
+                              "roleDescription":  "任务主控与实现能力通道，负责拆解目标、选择工作流、组织上下文与工具调用、完成主要实现和集成验证。",
+                              "personality":  "冷静、务实、有主见，先拆清任务边界，再给出可验证的执行路径。",
+                              "teamStrengths":  "任务拆解、工作流编排、核心实现、工具调用、集成验证"
+                          },
+                          {
+                              "id":  "code-review",
+                              "name":  "Owen（验证与审查）",
+                              "nickname":  "Owen",
+                              "avatar":  "/avatars/default.svg",
+                              "color":  {
+                                            "primary":  "#0F766E",
+                                            "secondary":  "#D9F4EF"
+                                        },
+                              "roleDescription":  "验证与审查能力通道，负责评估输出质量、代码风险、安全边界、测试缺口、回归风险和发布前检查。",
+                              "personality":  "严谨直接，重视证据、边界条件、可复现验证和交付门禁。",
+                              "teamStrengths":  "输出评估、代码审查、安全分析、测试策略、回归风险定位、发布前检查"
+                          },
+                          {
+                              "id":  "frontend-visual",
+                              "name":  "Andy（界面与视觉）",
+                              "nickname":  "Andy",
+                              "avatar":  "/avatars/default.svg",
+                              "color":  {
+                                            "primary":  "#0EA5A8",
+                                            "secondary":  "#DDF7FA"
+                                        },
+                              "roleDescription":  "界面与视觉能力通道，负责 UI/UX、交互状态、视觉层级、截图证据、移动端适配和浏览器验证。",
+                              "personality":  "表达清晰、审美敏锐，能把抽象需求落成可用界面和可验证视觉结果。",
+                              "teamStrengths":  "界面设计、视觉风格、交互体验、可用性、截图与浏览器验证"
+                          },
+                          {
+                              "id":  "research-docs",
+                              "name":  "Nora（研究与上下文）",
+                              "nickname":  "Nora",
+                              "avatar":  "/avatars/default.svg",
+                              "color":  {
+                                            "primary":  "#7C3AED",
+                                            "secondary":  "#EDE9FE"
+                                        },
+                              "roleDescription":  "研究与上下文能力通道，负责资料检索、事实核验、长上下文总结、竞品观察、方案素材和结构化输入。",
+                              "personality":  "耐心、系统化，适合把零散资料整理成可执行判断和上下文包。",
+                              "teamStrengths":  "资料检索、事实核验、长文总结、趋势分析、方案素材、上下文整理"
+                          }
+                      ],
+    "clientDefaults":  {
+                           "claude":  {
+                                          "defaultModel":  "gpt-5.4",
+                                          "models":  [
+                                                         "gpt-5.4",
+                                                         "claude-sonnet-4-6",
+                                                         "claude-opus-4-6",
+                                                         "claude-opus-4-6[1m]",
+                                                         "claude-sonnet-4-5-20250929",
+                                                         "claude-opus-4-5-20251101",
+                                                         "claude-fable-5"
+                                                     ]
+                                      },
+                           "codex":  {
+                                         "defaultModel":  "gpt-5.4",
+                                         "models":  [
+                                                        "gpt-5.3-codex",
+                                                        "gpt-5.3-codex-spark",
+                                                        "gpt-5.4"
+                                                    ]
+                                     },
+                           "gemini":  {
+                                          "defaultModel":  "gpt-5.4",
+                                          "models":  [
+                                                         "gpt-5.4",
+                                                         "gemini-2.5-pro",
+                                                         "gemini-3-flash-preview",
+                                                         "gemini-3.1-pro-preview"
+                                                     ]
+                                      }
+                       },
+    "coCreator":  {
+                      "name":  "Project Owner",
+                      "nickname":  "Owner",
+                      "avatar":  "/avatars/default.svg",
+                      "timeZone":  "UTC",
+                      "aliases":  [
+                                      "You",
+                                      "Owner"
+                                  ],
+                      "mentionPatterns":  [
+                                              "@owner"
+                                          ]
+                  },
+    "roster":  {
+                   "opus":  {
+                                "family":  "architecture-development",
+                                "roles":  [
+                                              "orchestrator",
+                                              "builder",
+                                              "peer-reviewer"
+                                          ],
+                                "lead":  true,
+                                "available":  true,
+                                "evaluation":  "Ethan（任务主控与实现） 任务主控与实现 agent"
+                            },
+                   "codex":  {
+                                 "family":  "code-review",
+                                 "roles":  [
+                                               "evaluator",
+                                               "peer-reviewer",
+                                               "security"
+                                           ],
+                                 "lead":  true,
+                                 "available":  true,
+                                 "evaluation":  "Owen（验证与审查） 验证与审查 agent"
+                             },
+                   "gemini":  {
+                                  "family":  "frontend-visual",
+                                  "roles":  [
+                                                "interface",
+                                                "visual",
+                                                "browser-qa"
+                                            ],
+                                  "lead":  true,
+                                  "available":  true,
+                                  "evaluation":  "Andy（界面与视觉） 界面与视觉 agent"
+                              },
+                   "kimi":  {
+                                "family":  "research-docs",
+                                "roles":  [
+                                              "research",
+                                              "context"
+                                          ],
+                                "lead":  true,
+                                "available":  true,
+                                "evaluation":  "Nora（研究与上下文） 研究与上下文 agent"
+                            }
+               },
+    "reviewPolicy":  {
+                         "requireDifferentFamily":  true,
+                         "preferActiveInThread":  true,
+                         "preferLead":  true,
+                         "excludeUnavailable":  true
+                     },
+    "roles":  [
+                  {
+                      "id":  "architecture-development",
+                      "agentId":  "opus",
+                      "name":  "Ethan（任务主控与实现）",
+                      "displayName":  "Ethan（任务主控与实现）",
+                      "nickname":  "Ethan",
+                      "avatar":  "/avatars/default.svg",
+                      "color":  {
+                                    "primary":  "#2563EB",
+                                    "secondary":  "#DBEAFE"
+                                },
+                      "mentionPatterns":  [
+                                              "@ethan",
+                                              "@opus",
+                                              "@architect",
+                                              "@lead-architect",
+                                              "@dev",
+                                              "@architecture-development",
+                                              "@架构",
+                                              "@开发",
+                                              "@orchestrator",
+                                              "@builder",
+                                              "@task-lead",
+                                              "@任务主控",
+                                              "@实现",
+                                              "@任务主控与实现"
+                                          ],
+                      "roleDescription":  "任务主控与实现能力通道，负责拆解目标、选择工作流、组织上下文与工具调用、完成主要实现和集成验证。",
+                      "teamStrengths":  "任务拆解、工作流编排、核心实现、工具调用、集成验证",
+                      "caution":  null,
+                      "defaultVariantId":  "opus-default",
+                      "variants":  [
+                                       {
+                                           "id":  "opus-default",
+                                           "clientId":  "anthropic",
+                                           "defaultModel":  "gpt-5.4",
+                                           "mcpSupport":  true,
+                                           "cli":  {
+                                                       "command":  "claude",
+                                                       "outputFormat":  "stream-json",
+                                                       "defaultArgs":  [
+                                                                           "--output-format",
+                                                                           "stream-json"
+                                                                       ],
+                                                       "effort":  "max"
+                                                   },
+                                           "personality":  "冷静、有主见，先拆任务边界，再给可验证的执行方案。",
+                                           "strengths":  [
+                                                             "orchestration",
+                                                             "implementation",
+                                                             "mcp"
+                                                         ],
+                                           "contextBudget":  {
+                                                                 "maxPromptTokens":  180000,
+                                                                 "maxContextTokens":  160000,
+                                                                 "maxMessages":  200,
+                                                                 "maxContentLengthPerMsg":  100000
+                                                             },
+                                           "displayName":  "Ethan（任务主控与实现）",
+                                           "caution":  null
+                                       }
+                                   ]
+                  },
+                  {
+                      "id":  "code-review",
+                      "agentId":  "codex",
+                      "name":  "Owen（验证与审查）",
+                      "displayName":  "Owen（验证与审查）",
+                      "nickname":  "Owen",
+                      "avatar":  "/avatars/default.svg",
+                      "color":  {
+                                    "primary":  "#0F766E",
+                                    "secondary":  "#D9F4EF"
+                                },
+                      "mentionPatterns":  [
+                                              "@owen",
+                                              "@codex",
+                                              "@reviewer",
+                                              "@code-reviewer",
+                                              "@code-review",
+                                              "@审查",
+                                              "@evaluator",
+                                              "@gatekeeper",
+                                              "@validation",
+                                              "@验证",
+                                              "@验证与审查"
+                                          ],
+                      "roleDescription":  "验证与审查能力通道，负责评估输出质量、代码风险、安全边界、测试缺口、回归风险和发布前检查。",
+                      "teamStrengths":  "输出评估、代码审查、安全分析、测试策略、回归风险定位、发布前检查",
+                      "caution":  null,
+                      "defaultVariantId":  "codex-default",
+                      "features":  {
+                                       "missionHub":  {
+                                                          "selfClaimScope":  "disabled"
+                                                      }
+                                   },
+                      "variants":  [
+                                       {
+                                           "id":  "codex-default",
+                                           "clientId":  "openai",
+                                           "defaultModel":  "gpt-5.4",
+                                           "mcpSupport":  true,
+                                           "cli":  {
+                                                       "command":  "codex",
+                                                       "outputFormat":  "json",
+                                                       "defaultArgs":  [
+                                                                           "exec",
+                                                                           "--json"
+                                                                       ],
+                                                       "effort":  "xhigh"
+                                                   },
+                                           "personality":  "严谨直接，关注证据、边界条件、可复现验证和交付门禁。",
+                                           "strengths":  [
+                                                             "evaluation",
+                                                             "code-review",
+                                                             "security",
+                                                             "testing"
+                                                         ],
+                                           "contextBudget":  {
+                                                                 "maxPromptTokens":  240000,
+                                                                 "maxContextTokens":  216000,
+                                                                 "maxMessages":  200,
+                                                                 "maxContentLengthPerMsg":  100000
+                                                             },
+                                           "displayName":  "Owen（验证与审查）",
+                                           "caution":  null
+                                       }
+                                   ]
+                  },
+                  {
+                      "id":  "frontend-visual",
+                      "agentId":  "gemini",
+                      "name":  "Andy（界面与视觉）",
+                      "displayName":  "Andy（界面与视觉）",
+                      "nickname":  "Andy",
+                      "avatar":  "/avatars/default.svg",
+                      "color":  {
+                                    "primary":  "#0EA5A8",
+                                    "secondary":  "#DDF7FA"
+                                },
+                      "mentionPatterns":  [
+                                              "@andy",
+                                              "@gemini",
+                                              "@frontend",
+                                              "@frontend-designer",
+                                              "@designer",
+                                              "@ui",
+                                              "@visual",
+                                              "@frontend-visual",
+                                              "@前端",
+                                              "@视觉",
+                                              "@interface",
+                                              "@surface",
+                                              "@browser-qa",
+                                              "@界面",
+                                              "@界面与视觉"
+                                          ],
+                      "roleDescription":  "界面与视觉能力通道，负责 UI/UX、交互状态、视觉层级、截图证据、移动端适配和浏览器验证。",
+                      "teamStrengths":  "界面设计、视觉风格、交互体验、可用性、截图与浏览器验证",
+                      "caution":  null,
+                      "defaultVariantId":  "gemini-default",
+                      "features":  {
+                                       "sessionChain":  true
+                                   },
+                      "variants":  [
+                                       {
+                                           "id":  "gemini-default",
+                                           "clientId":  "google",
+                                           "defaultModel":  "gpt-5.4",
+                                           "mcpSupport":  true,
+                                           "cli":  {
+                                                       "command":  "gemini",
+                                                       "outputFormat":  "stream-json",
+                                                       "defaultArgs":  [
+
+                                                                       ]
+                                                   },
+                                           "acp":  {
+                                                       "command":  "gemini",
+                                                       "startupArgs":  [
+                                                                           "--acp",
+                                                                           "--approval-mode",
+                                                                           "yolo"
+                                                                       ],
+                                                       "mcpWhitelist":  [
+                                                                            "agent-studio",
+                                                                            "agent-studio-memory",
+                                                                            "agent-studio-collab",
+                                                                            "agent-studio-signals",
+                                                                            "pencil"
+                                                                        ],
+                                                       "supportsMultiplexing":  true
+                                                   },
+                                           "personality":  "表达清晰、审美敏锐，能把抽象需求落成可用界面。",
+                                           "strengths":  [
+                                                             "interface-design",
+                                                             "visual-design",
+                                                             "ui-ux",
+                                                             "browser-qa"
+                                                         ],
+                                           "contextBudget":  {
+                                                                 "maxPromptTokens":  350000,
+                                                                 "maxContextTokens":  300000,
+                                                                 "maxMessages":  300,
+                                                                 "maxContentLengthPerMsg":  100000
+                                                             },
+                                           "displayName":  "Andy（界面与视觉）",
+                                           "caution":  "禁止写代码！幻觉多，不遵守 SOP",
+                                           "restrictions":  [
+                                                                "禁止写代码"
+                                                            ],
+                                           "sessionChain":  true
+                                       }
+                                   ]
+                  },
+                  {
+                      "id":  "research-docs",
+                      "agentId":  "kimi",
+                      "name":  "Nora（研究与上下文）",
+                      "displayName":  "Nora（研究与上下文）",
+                      "nickname":  "Nora",
+                      "avatar":  "/avatars/default.svg",
+                      "color":  {
+                                    "primary":  "#7C3AED",
+                                    "secondary":  "#EDE9FE"
+                                },
+                      "mentionPatterns":  [
+                                              "@nora",
+                                              "@kimi",
+                                              "@moonshot",
+                                              "@research",
+                                              "@analyst",
+                                              "@docs",
+                                              "@research-docs",
+                                              "@研究",
+                                              "@文档",
+                                              "@context",
+                                              "@research-context",
+                                              "@上下文",
+                                              "@研究与上下文"
+                                          ],
+                      "roleDescription":  "研究与上下文能力通道，负责资料检索、事实核验、长上下文总结、竞品观察、方案素材和结构化输入。",
+                      "teamStrengths":  "资料检索、事实核验、长文总结、趋势分析、方案素材、上下文整理",
+                      "caution":  null,
+                      "defaultVariantId":  "kimi-default",
+                      "variants":  [
+                                       {
+                                           "id":  "kimi-default",
+                                           "clientId":  "kimi",
+                                           "defaultModel":  "gpt-5.4",
+                                           "mcpSupport":  true,
+                                           "cli":  {
+                                                       "command":  "kimi",
+                                                       "outputFormat":  "stream-json",
+                                                       "defaultArgs":  [
+                                                                           "--print",
+                                                                           "--output-format",
+                                                                           "stream-json"
+                                                                       ]
+                                                   },
+                                           "personality":  "耐心、系统化，适合把零散资料整理成可执行判断和上下文包。",
+                                           "strengths":  [
+                                                             "long-context",
+                                                             "research",
+                                                             "fact-checking",
+                                                             "summarization"
+                                                         ],
+                                           "contextBudget":  {
+                                                                 "maxPromptTokens":  240000,
+                                                                 "maxContextTokens":  216000,
+                                                                 "maxMessages":  200,
+                                                                 "maxContentLengthPerMsg":  100000
+                                                             },
+                                           "displayName":  "Nora（研究与上下文）",
+                                           "caution":  null
+                                       }
+                                   ]
+                  }
+              ]
+}

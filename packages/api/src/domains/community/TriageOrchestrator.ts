@@ -1,0 +1,110 @@
+import type { ConsensusResult, DirectionCardPayload, IssueState, TriageEntry } from '@agent-studio/shared';
+import type { ICommunityIssueStore } from '../agents/services/stores/ports/CommunityIssueStore.js';
+import type { IThreadStore } from '../agents/services/stores/ports/ThreadStore.js';
+import { resolveConsensus } from './resolveConsensus.js';
+
+interface TriageOrchestratorDeps {
+  communityIssueStore: Pick<ICommunityIssueStore, 'get' | 'update'>;
+  threadStore?: Pick<IThreadStore, 'create'>;
+}
+
+type TriageAction =
+  | { action: 'await-second-agent'; issueId: string }
+  | { action: 'resolved'; issueId: string; consensus: ConsensusResult }
+  | { action: 'error'; reason: string };
+
+export class TriageOrchestrator {
+  constructor(private readonly deps: TriageOrchestratorDeps) {}
+
+  async recordTriageEntry(issueId: string, entry: TriageEntry): Promise<TriageAction> {
+    const issue = await this.deps.communityIssueStore.get(issueId);
+    if (!issue) return { action: 'error', reason: 'Issue not found' };
+
+    const existing: DirectionCardPayload = (issue.directionCard as unknown as DirectionCardPayload) ?? {
+      entries: [],
+    };
+    if (existing.entries.some((e) => e.agentId === entry.agentId)) {
+      return { action: 'error', reason: 'duplicate agentId — same agent cannot triage twice' };
+    }
+    const entries = [...existing.entries, entry];
+    const isBugfix = issue.issueType === 'bug';
+    const isSecondEntry = existing.entries.length >= 1;
+
+    if (!isSecondEntry && !isBugfix) {
+      await this.deps.communityIssueStore.update(issueId, {
+        directionCard: { entries } as unknown as Record<string, unknown>,
+        lastActivity: { at: Date.now(), event: `triage-by-${entry.agentId}` },
+      });
+      return { action: 'await-second-agent', issueId };
+    }
+
+    const consensus = resolveConsensus(entries);
+
+    let state: IssueState | undefined;
+    if (consensus.needsOwner) state = 'pending-decision';
+    else if (consensus.verdict === 'WELCOME') state = 'accepted';
+    else if (consensus.verdict === 'POLITELY-DECLINE') state = 'declined';
+
+    await this.deps.communityIssueStore.update(issueId, {
+      directionCard: { entries, consensus } as unknown as Record<string, unknown>,
+      ...(state && { state }),
+      consensusState: consensus.needsOwner ? 'discussing' : 'consensus-reached',
+      relatedFeature: entry.relatedFeature ?? issue.relatedFeature,
+      lastActivity: { at: Date.now(), event: 'consensus-resolved' },
+    });
+
+    return { action: 'resolved', issueId, consensus };
+  }
+
+  async routeAccepted(
+    issueId: string,
+    relatedFeature: string | null,
+    userId: string,
+    threadId?: string,
+  ): Promise<void> {
+    const issue = await this.deps.communityIssueStore.get(issueId);
+    if (!issue) return;
+
+    if (relatedFeature) {
+      await this.deps.communityIssueStore.update(issueId, {
+        state: 'accepted',
+        relatedFeature,
+        ...(threadId && { assignedThreadId: threadId }),
+        lastActivity: { at: Date.now(), event: `routed-to-${relatedFeature}` },
+      });
+      return;
+    }
+
+    // C3.1: if threadId is explicitly provided (e.g. from routeRecommendation
+    // existing-thread), route to that thread without auto-creating a new one.
+    if (threadId) {
+      await this.deps.communityIssueStore.update(issueId, {
+        state: 'accepted',
+        assignedThreadId: threadId,
+        lastActivity: { at: Date.now(), event: `routed-to-thread-${threadId}` },
+      });
+      return;
+    }
+
+    if (!this.deps.threadStore) {
+      // F168 Phase C C0.1 (INV-7): fail-loud — 静默 return 会让无 relatedFeature 的
+      // accepted issue 永远不被路由（thread 没建、assignedThreadId 为空、case.routed 不发）。
+      throw new Error(
+        `[TriageOrchestrator] routeAccepted: threadStore not wired — cannot create thread for issue ${issueId} (no relatedFeature). Check communityIssueRoutes registration in index.ts.`,
+      );
+    }
+    const thread = await this.deps.threadStore.create(userId, `Community: ${issue.title}`);
+    await this.deps.communityIssueStore.update(issueId, {
+      state: 'accepted',
+      assignedThreadId: thread.id,
+      lastActivity: { at: Date.now(), event: `thread-created-${thread.id}` },
+    });
+  }
+
+  async routeDeclined(issueId: string): Promise<void> {
+    await this.deps.communityIssueStore.update(issueId, {
+      state: 'declined',
+      lastActivity: { at: Date.now(), event: 'declined' },
+    });
+  }
+}

@@ -1,0 +1,455 @@
+/** Kimi Agent Service — kimi-cli subprocess via print mode + stream-json. */
+
+import { rmSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { type AgentId, createAgentId } from '@agent-studio/shared';
+import { getAgentModel } from '../../../../../config/agent-models.js';
+import { createModuleLogger } from '../../../../../infrastructure/logger.js';
+import { formatCliExitError } from '../../../../../utils/cli-format.js';
+import { formatCliNotFoundError, resolveCliCommand } from '../../../../../utils/cli-resolve.js';
+import { isCliError, isCliTimeout, isLivenessWarning, spawnCli } from '../../../../../utils/cli-spawn.js';
+import type { SpawnFn } from '../../../../../utils/cli-types.js';
+import { CliRawArchive } from '../../session/CliRawArchive.js';
+import type { AgentMessage, AgentService, AgentServiceOptions, MessageMetadata } from '../../types.js';
+import type { RawArchiveSink } from '../providers/codex-audit-hooks.js';
+import { sanitizeRawEvent } from '../providers/codex-audit-hooks.js';
+import { resolveDefaultClaudeMcpServerPath } from './ClaudeAgentService.js';
+import { collectImageAccessDirectories } from './image-cli-bridge.js';
+import { extractImagePaths } from './image-paths.js';
+import {
+  buildApiKeyEnv,
+  buildProjectMcpArgs,
+  readKimiContextUsedTokens,
+  readKimiModelConfigInfo,
+  readKimiSessionId,
+  resolveKimiModelAlias,
+  writeMcpConfigFile,
+} from './kimi-config.js';
+import {
+  buildKimiPrompt,
+  extractTextContent,
+  extractThinkingContent,
+  type KimiPrintMessage,
+  parseToolArguments,
+  parseUsage,
+  readSessionIdFromMessage,
+} from './kimi-event-parser.js';
+
+const log = createModuleLogger('kimi-agent');
+
+interface KimiAgentServiceOptions {
+  agentId?: AgentId;
+  spawnFn?: SpawnFn;
+  model?: string;
+  mcpServerPath?: string;
+  /** #780: Raw NDJSON archive sink (default: CliRawArchive to disk) */
+  rawArchive?: RawArchiveSink;
+}
+
+export class KimiAgentService implements AgentService {
+  readonly agentId: AgentId;
+  private readonly spawnFn: SpawnFn | undefined;
+  private readonly model: string;
+  private readonly mcpServerPath: string | undefined;
+  /** #780: Raw NDJSON archive for post-mortem diagnostics */
+  private readonly rawArchive: RawArchiveSink;
+
+  constructor(options?: KimiAgentServiceOptions) {
+    this.agentId = options?.agentId ?? createAgentId('kimi');
+    this.spawnFn = options?.spawnFn;
+    this.model = options?.model ?? getAgentModel(this.agentId as string);
+    this.mcpServerPath =
+      options?.mcpServerPath ?? process.env.AGENT_STUDIO_MCP_SERVER_PATH ?? resolveDefaultClaudeMcpServerPath();
+    this.rawArchive = options?.rawArchive ?? new CliRawArchive();
+  }
+
+  async *invoke(prompt: string, options?: AgentServiceOptions): AsyncIterable<AgentMessage> {
+    const requestedModel = options?.callbackEnv?.AGENT_STUDIO_KIMI_MODEL_OVERRIDE ?? this.model;
+    const effectiveModel = resolveKimiModelAlias(requestedModel, options?.callbackEnv);
+    const metadata: MessageMetadata = { provider: 'kimi', model: effectiveModel };
+    const imagePaths = extractImagePaths(options?.contentBlocks, options?.uploadDir);
+    const imageAccessDirs = collectImageAccessDirectories(imagePaths);
+    const effectivePrompt = buildKimiPrompt(prompt, options?.systemPrompt, imagePaths);
+    const workingDirectory = options?.workingDirectory ?? process.cwd();
+    const apiKeyEnv = buildApiKeyEnv(effectiveModel, options?.callbackEnv);
+    const tempMcpConfig = this.mcpServerPath
+      ? writeMcpConfigFile(workingDirectory, this.mcpServerPath, options?.callbackEnv)
+      : null;
+    const modelConfig = readKimiModelConfigInfo(effectiveModel, options?.callbackEnv);
+    const supportsThinking =
+      modelConfig.capabilities.includes('thinking') ||
+      apiKeyEnv?.KIMI_MODEL_CAPABILITIES?.includes('thinking') === true;
+    const supportsImageInput =
+      modelConfig.capabilities.includes('image_in') ||
+      apiKeyEnv?.KIMI_MODEL_CAPABILITIES?.includes('image_in') === true;
+
+    const kimiCommand = resolveCliCommand('kimi-cli') ?? resolveCliCommand('kimi');
+    if (!kimiCommand) {
+      yield {
+        type: 'error' as const,
+        agentId: this.agentId,
+        error: formatCliNotFoundError('kimi'),
+        metadata,
+        timestamp: Date.now(),
+      };
+      yield { type: 'done' as const, agentId: this.agentId, metadata, timestamp: Date.now() };
+      return;
+    }
+
+    const isLegacy = resolveCliCommand('kimi-cli') !== null;
+    const cliSupportsThinking = isLegacy && (supportsThinking || modelConfig.defaultThinking);
+
+    const args: string[] = isLegacy
+      ? ['--print', '--output-format', 'stream-json']
+      : ['--output-format', 'stream-json'];
+    if (options?.sessionId) {
+      args.push('--session', options.sessionId);
+      metadata.sessionId = options.sessionId;
+      yield {
+        type: 'session_init',
+        agentId: this.agentId,
+        sessionId: options.sessionId,
+        metadata,
+        timestamp: Date.now(),
+      };
+    }
+    if (isLegacy) {
+      args.push('--work-dir', workingDirectory);
+      if (cliSupportsThinking) {
+        args.push('--thinking');
+      }
+      if (tempMcpConfig) {
+        args.push('--mcp-config-file', tempMcpConfig);
+      } else {
+        args.push(...buildProjectMcpArgs(workingDirectory));
+      }
+      for (const dir of imageAccessDirs) {
+        args.push('--add-dir', dir);
+      }
+    }
+    if (!apiKeyEnv && effectiveModel) {
+      args.push('--model', effectiveModel);
+    }
+    if (isLegacy) {
+      args.push('--prompt', effectivePrompt);
+    } else {
+      args.push('-p', effectivePrompt);
+    }
+
+    // User-defined CLI args from the member editor (#567).
+    const userParts: string[] = [];
+    for (const arg of options?.cliConfigArgs ?? []) {
+      userParts.push(...arg.trim().split(/\s+/));
+    }
+    if (userParts.length > 0) {
+      const accumulativeFlags = new Set(['--add-dir']);
+      const userFlags = new Set(userParts.filter((p) => p.startsWith('-')));
+      const deduped: string[] = [];
+      for (let i = 0; i < args.length; i++) {
+        if (args[i].startsWith('-') && userFlags.has(args[i]) && !accumulativeFlags.has(args[i])) {
+          if (i + 1 < args.length && !args[i + 1].startsWith('-')) i++;
+          continue;
+        }
+        deduped.push(args[i]);
+      }
+      args.length = 0;
+      args.push(...deduped, ...userParts);
+    }
+
+    try {
+      let emittedSessionInit = Boolean(options?.sessionId);
+      let sawThinking = false;
+      let emittedImageCapability = false;
+      let hadCliError = false;
+      const cliOpts = {
+        command: kimiCommand,
+        args,
+        ...(options?.workingDirectory ? { cwd: options.workingDirectory } : {}),
+        ...(options?.callbackEnv || apiKeyEnv || options?.accountEnv
+          ? { env: { ...(options?.callbackEnv ?? {}), ...(apiKeyEnv ?? {}), ...(options?.accountEnv ?? {}) } }
+          : {}),
+        ...(options?.signal ? { signal: options.signal } : {}),
+        ...(options?.invocationId ? { invocationId: options.invocationId } : {}),
+        ...(options?.cliSessionId ? { cliSessionId: options.cliSessionId } : {}),
+        ...(options?.livenessProbe ? { livenessProbe: options.livenessProbe } : {}),
+        ...(options?.parentSpan ? { parentSpan: options.parentSpan } : {}),
+        ...(options?.invocationId && this.rawArchive.getPath
+          ? { rawArchivePath: this.rawArchive.getPath(options.invocationId) }
+          : {}),
+      };
+      const events = options?.spawnCliOverride
+        ? options.spawnCliOverride(cliOpts)
+        : spawnCli(cliOpts, this.spawnFn ? { spawnFn: this.spawnFn } : undefined);
+
+      for await (const event of events) {
+        // #780: Archive raw event for post-mortem diagnostics (fire-and-forget)
+        if (options?.invocationId) {
+          this.rawArchive.append(options.invocationId, sanitizeRawEvent(event)).catch((err) => {
+            log.warn({ agentId: this.agentId, invocationId: options.invocationId, err }, 'Raw archive write failed');
+          });
+        }
+        if (isCliTimeout(event)) {
+          hadCliError = true;
+          const {
+            silenceDurationMs,
+            processAlive,
+            lastEventType,
+            firstEventAt,
+            lastEventAt,
+            cliSessionId: csId,
+            invocationId: invId,
+            rawArchivePath,
+          } = event;
+          yield {
+            type: 'system_info' as const,
+            agentId: this.agentId,
+            timestamp: Date.now(),
+            content: JSON.stringify({
+              type: 'timeout_diagnostics',
+              silenceDurationMs,
+              processAlive,
+              lastEventType,
+              firstEventAt,
+              lastEventAt,
+              cliSessionId: csId,
+              invocationId: invId,
+              rawArchivePath,
+            }),
+          };
+          yield {
+            type: 'error',
+            agentId: this.agentId,
+            // F212 Phase A (云端 codex P2): timeout cliDiagnostics 也透传到 metadata.
+            metadata: event.cliDiagnostics ? { ...metadata, cliDiagnostics: event.cliDiagnostics } : metadata,
+            timestamp: Date.now(),
+            error: `Kimi CLI 响应超时 (${Math.round(event.timeoutMs / 1000)}s${firstEventAt == null ? ', 未收到首帧' : ''})`,
+          };
+          continue;
+        }
+        if (isLivenessWarning(event)) {
+          const w = event as { level?: string; silenceDurationMs?: number };
+          log.warn(
+            {
+              agentId: this.agentId,
+              invocationId: options?.invocationId,
+              level: w.level,
+              silenceMs: w.silenceDurationMs,
+            },
+            '[KimiAgent] liveness warning — CLI may be stuck',
+          );
+          yield {
+            type: 'system_info' as const,
+            agentId: this.agentId,
+            timestamp: Date.now(),
+            content: JSON.stringify({ type: 'liveness_warning', ...event }),
+          };
+          continue;
+        }
+        if (isCliError(event)) {
+          hadCliError = true;
+          // F212 Phase A: forward cliDiagnostics on metadata for frontend folded panel (Phase B).
+          yield {
+            type: 'error',
+            agentId: this.agentId,
+            error: formatCliExitError('Kimi CLI', event),
+            metadata: event.cliDiagnostics ? { ...metadata, cliDiagnostics: event.cliDiagnostics } : metadata,
+            timestamp: Date.now(),
+          };
+          continue;
+        }
+
+        if (
+          event &&
+          typeof event === 'object' &&
+          'line' in event &&
+          typeof (event as { line?: unknown }).line === 'string' &&
+          !emittedSessionInit
+        ) {
+          const line = (event as { line: string }).line;
+          const match = line.match(/To resume this session:\s*kimi\s+-r\s+([a-z0-9-]+)/i);
+          if (match?.[1]) {
+            metadata.sessionId = match[1];
+            emittedSessionInit = true;
+            yield {
+              type: 'session_init',
+              agentId: this.agentId,
+              sessionId: match[1],
+              metadata: { ...metadata, sessionId: match[1] },
+              timestamp: Date.now(),
+            };
+          }
+          continue;
+        }
+
+        const msg = event as KimiPrintMessage;
+
+        if (isLegacy ? msg?.role !== 'assistant' : !(msg?.role === 'assistant' || msg?.role === 'meta')) continue;
+
+        if (msg?.role === 'meta') {
+          const metaMsg = msg as { role: string; type?: string; session_id?: string; content?: string };
+          if (metaMsg.type === 'session.resume_hint' && metaMsg.session_id && !emittedSessionInit) {
+            metadata.sessionId = metaMsg.session_id;
+            emittedSessionInit = true;
+            yield {
+              type: 'session_init',
+              agentId: this.agentId,
+              sessionId: metaMsg.session_id,
+              metadata: { ...metadata, sessionId: metaMsg.session_id },
+              timestamp: Date.now(),
+            };
+          }
+          continue;
+        }
+
+        const usage = parseUsage(msg.usage) ?? parseUsage(msg.stats);
+        if (usage) metadata.usage = { ...(metadata.usage ?? {}), ...usage };
+
+        const messageSessionId = readSessionIdFromMessage(msg);
+        if (messageSessionId) {
+          metadata.sessionId = messageSessionId;
+          if (!emittedSessionInit) {
+            emittedSessionInit = true;
+            yield {
+              type: 'session_init',
+              agentId: this.agentId,
+              sessionId: messageSessionId,
+              metadata,
+              timestamp: Date.now(),
+            };
+          }
+        }
+
+        if (isLegacy) {
+          const thinking = extractThinkingContent(msg);
+          if (thinking) {
+            sawThinking = true;
+            yield {
+              type: 'system_info',
+              agentId: this.agentId,
+              content: JSON.stringify({ type: 'thinking', agentId: this.agentId, text: thinking }),
+              metadata,
+              timestamp: Date.now(),
+            };
+          }
+        }
+
+        if (imagePaths.length > 0 && !emittedImageCapability) {
+          emittedImageCapability = true;
+          yield {
+            type: 'system_info',
+            agentId: this.agentId,
+            content: JSON.stringify({
+              type: 'provider_capability',
+              capability: 'image_input',
+              status: supportsImageInput ? 'available' : 'limited',
+              provider: 'kimi',
+              reason: supportsImageInput
+                ? '已通过工作区附加目录 + 本地路径提示向 kimi-cli 暴露图片输入'
+                : '当前 Kimi 模型未声明 image_in，已回退为本地路径提示',
+            }),
+            metadata,
+            timestamp: Date.now(),
+          };
+        }
+
+        const content = extractTextContent(msg.content);
+        if (content) {
+          yield {
+            type: 'text',
+            agentId: this.agentId,
+            content,
+            metadata,
+            timestamp: Date.now(),
+          };
+        }
+
+        const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+        for (const toolCall of toolCalls) {
+          if (!toolCall || typeof toolCall !== 'object') continue;
+          const call = toolCall as Record<string, unknown>;
+          const fn = call.function;
+          if (!fn || typeof fn !== 'object') continue;
+          const functionCall = fn as Record<string, unknown>;
+          const toolName = typeof functionCall.name === 'string' ? functionCall.name : null;
+          if (!toolName) continue;
+          yield {
+            type: 'tool_use',
+            agentId: this.agentId,
+            toolName,
+            toolInput: parseToolArguments(functionCall.arguments),
+            metadata,
+            timestamp: Date.now(),
+          };
+        }
+      }
+
+      if (!emittedSessionInit) {
+        const inferredSessionId = readKimiSessionId(workingDirectory, options?.callbackEnv);
+        if (inferredSessionId) {
+          metadata.sessionId = inferredSessionId;
+          emittedSessionInit = true;
+          yield {
+            type: 'session_init',
+            agentId: this.agentId,
+            sessionId: inferredSessionId,
+            metadata: { ...metadata, sessionId: inferredSessionId },
+            timestamp: Date.now(),
+          };
+        }
+      }
+
+      if (metadata.sessionId && modelConfig.maxContextSize != null) {
+        try {
+          const contextUsedTokens = await readKimiContextUsedTokens(metadata.sessionId, options?.callbackEnv);
+          if (contextUsedTokens != null) {
+            metadata.usage = {
+              ...(metadata.usage ?? {}),
+              contextUsedTokens,
+              contextWindowSize: modelConfig.maxContextSize,
+              lastTurnInputTokens: contextUsedTokens,
+            };
+          }
+        } catch {
+          // best-effort snapshot enrichment only
+        }
+      }
+
+      if (isLegacy && !sawThinking && !hadCliError) {
+        yield {
+          type: 'system_info',
+          agentId: this.agentId,
+          content: JSON.stringify({
+            type: 'provider_capability',
+            capability: 'thinking',
+            status: 'unavailable',
+            provider: 'kimi',
+            reason: supportsThinking
+              ? 'kimi-cli 本次流式输出未提供可解析的 think/reasoning 内容'
+              : '当前 Kimi 模型能力未声明 thinking，已按普通回答处理',
+          }),
+          metadata,
+          timestamp: Date.now(),
+        };
+      }
+
+      yield { type: 'done', agentId: this.agentId, metadata, timestamp: Date.now() };
+    } catch (err) {
+      yield {
+        type: 'error',
+        agentId: this.agentId,
+        error: err instanceof Error ? err.message : String(err),
+        metadata,
+        timestamp: Date.now(),
+      };
+      yield { type: 'done', agentId: this.agentId, metadata, timestamp: Date.now() };
+    } finally {
+      if (tempMcpConfig) {
+        try {
+          rmSync(dirname(tempMcpConfig), { recursive: true, force: true });
+        } catch {
+          // best-effort cleanup
+        }
+      }
+    }
+  }
+}

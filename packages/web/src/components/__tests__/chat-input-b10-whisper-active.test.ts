@@ -1,0 +1,220 @@
+/**
+ * F122B AC-B10: Whisper mode disables actively-executing agents.
+ */
+import React, { act } from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ChatInput } from '@/components/ChatInput';
+import { useChatStore } from '@/stores/chatStore';
+
+vi.mock('@/components/icons/SendIcon', () => ({
+  SendIcon: () => React.createElement('span', null, 'send'),
+}));
+vi.mock('@/components/icons/LoadingIcon', () => ({
+  LoadingIcon: () => React.createElement('span', null, 'loading'),
+}));
+vi.mock('@/components/icons/AttachIcon', () => ({
+  AttachIcon: () => React.createElement('span', null, 'attach'),
+}));
+vi.mock('@/components/ImagePreview', () => ({ ImagePreview: () => null }));
+vi.mock('@/utils/compressImage', () => ({ compressImage: (f: File) => Promise.resolve(f) }));
+
+vi.mock('@/hooks/useAgentData', () => ({
+  formatAgentName: (agent: { displayName: string; variantLabel?: string }) =>
+    agent.variantLabel ? `${agent.displayName}（${agent.variantLabel}）` : agent.displayName,
+  useAgentData: () => ({
+    agents: [
+      {
+        id: 'opus',
+        displayName: 'Ethan（任务主控与实现）',
+        color: { primary: '#9B7EBD', secondary: '#E8D5F5' },
+        mentionPatterns: ['Ethan', 'opus'],
+        clientId: 'anthropic',
+        defaultModel: 'opus',
+        avatar: '/a.png',
+        roleDescription: 'dev',
+        personality: 'kind',
+      },
+      {
+        id: 'codex',
+        displayName: 'Owen（验证与审查）',
+        color: { primary: '#4CAF50', secondary: '#C8E6C9' },
+        mentionPatterns: ['Owen', 'codex'],
+        clientId: 'openai',
+        defaultModel: 'codex',
+        avatar: '/b.png',
+        roleDescription: 'review',
+        personality: 'steady',
+      },
+    ],
+    isLoading: false,
+    getAgentById: () => undefined,
+    getAgentsByRole: () => new Map(),
+  }),
+}));
+
+let container: HTMLDivElement;
+let root: Root;
+
+beforeAll(() => {
+  (globalThis as { React?: typeof React }).React = React;
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+});
+afterAll(() => {
+  delete (globalThis as { React?: typeof React }).React;
+  delete (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT;
+});
+
+beforeEach(() => {
+  container = document.createElement('div');
+  document.body.appendChild(container);
+  root = createRoot(container);
+  useChatStore.setState({ activeInvocations: {}, hasActiveInvocation: false });
+});
+
+afterEach(() => {
+  act(() => root.unmount());
+  container.remove();
+});
+
+function getWhisperChips() {
+  // F108 Scene 2 v2: selector rows inside the floating popup (absolute bottom-full)
+  const popup = container.querySelector('.absolute.bottom-full');
+  if (!popup) return [];
+  return [...popup.querySelectorAll('button')];
+}
+
+function enterWhisperMode() {
+  const btn = container.querySelector<HTMLButtonElement>('[aria-label="Whisper mode"]');
+  act(() => btn?.click());
+}
+
+describe('F122B AC-B10: whisper mode + executing agents', () => {
+  it('disables executing agent chips in whisper selector', () => {
+    useChatStore.setState({
+      activeInvocations: { 'inv-1': { agentId: 'opus', mode: 'execute', startedAt: Date.now() } },
+      hasActiveInvocation: true,
+    });
+    act(() => root.render(React.createElement(ChatInput, { onSend: vi.fn(), hasActiveInvocation: true })));
+    enterWhisperMode();
+
+    const chips = getWhisperChips();
+    const opusChip = chips.find((b) => b.textContent?.includes('Ethan（任务主控与实现）'));
+    const codexChip = chips.find((b) => b.textContent?.includes('Owen（验证与审查）'));
+
+    expect(opusChip).toBeDefined();
+    expect(codexChip).toBeDefined();
+    expect(opusChip?.disabled).toBe(true);
+    expect(codexChip?.disabled).toBe(false);
+  });
+
+  it('does not auto-select executing agents when entering whisper mode', () => {
+    useChatStore.setState({
+      activeInvocations: { 'inv-1': { agentId: 'opus', mode: 'execute', startedAt: Date.now() } },
+      hasActiveInvocation: true,
+    });
+    act(() => root.render(React.createElement(ChatInput, { onSend: vi.fn(), hasActiveInvocation: true })));
+    enterWhisperMode();
+
+    const chips = getWhisperChips();
+    const opusChip = chips.find((b) => b.textContent?.includes('Ethan（任务主控与实现）'));
+    const codexChip = chips.find((b) => b.textContent?.includes('Owen（验证与审查）'));
+
+    // opus (executing) should NOT be selected and is disabled
+    expect(opusChip?.className).toContain('cursor-not-allowed');
+    expect(opusChip?.className.split(/\s+/)).not.toContain('bg-studio-surface-elevated');
+    // codex (idle) should NOT be pre-selected either (F108B: default none)
+    expect(codexChip?.className.split(/\s+/)).not.toContain('bg-studio-surface-elevated');
+  });
+
+  it('shows "执行中" status badge on executing agent row', () => {
+    useChatStore.setState({
+      activeInvocations: { 'inv-1': { agentId: 'codex', mode: 'execute', startedAt: Date.now() } },
+      hasActiveInvocation: true,
+    });
+    act(() => root.render(React.createElement(ChatInput, { onSend: vi.fn(), hasActiveInvocation: true })));
+    enterWhisperMode();
+
+    const chips = getWhisperChips();
+    const codexChip = chips.find((b) => b.textContent?.includes('Owen（验证与审查）'));
+    expect(codexChip?.textContent).toContain('执行中');
+  });
+
+  it('all agents selectable but none pre-selected when none are executing', () => {
+    act(() => root.render(React.createElement(ChatInput, { onSend: vi.fn() })));
+    enterWhisperMode();
+
+    const chips = getWhisperChips();
+    for (const chip of chips) {
+      expect(chip.disabled).toBe(false);
+      expect(chip.className.split(/\s+/)).not.toContain('bg-studio-surface-elevated'); // F108B: default none selected
+    }
+  });
+
+  it('F108B AC-B7: whisper to idle agent shows whisper placeholder, not queue placeholder', () => {
+    useChatStore.setState({
+      activeInvocations: { 'inv-1': { agentId: 'opus', mode: 'execute', startedAt: Date.now() } },
+      hasActiveInvocation: true,
+    });
+    // Before whisper mode: should show queue placeholder (agent is active)
+    act(() => root.render(React.createElement(ChatInput, { onSend: vi.fn(), hasActiveInvocation: true })));
+    const textarea = container.querySelector('textarea')!;
+    expect(textarea.placeholder).toContain('排队');
+
+    // Enter whisper mode — default is no selection (F108B P1-1 fix)
+    enterWhisperMode();
+
+    // Manually select codex (idle) — simulates user clicking the chip
+    const chips = getWhisperChips();
+    const codexChip = chips.find((b) => b.textContent?.includes('Owen（验证与审查）'));
+    act(() => codexChip?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })));
+
+    // After selecting idle agent: should show whisper placeholder, not queue
+    expect(textarea.placeholder).toBe('悄悄话...');
+  });
+
+  it('P1-1: entering whisper mode defaults to NO agents selected (design spec)', () => {
+    // Design: F108-side-dispatch-phase-b-ux.pen Scene 1 says "默认都不选（✅）"
+    // No active invocations — all agents should be selectable but NONE pre-selected.
+    act(() => root.render(React.createElement(ChatInput, { onSend: vi.fn() })));
+    enterWhisperMode();
+
+    const chips = getWhisperChips();
+    for (const chip of chips) {
+      expect(chip.disabled).toBe(false); // All selectable
+      expect(chip.className.split(/\s+/)).not.toContain('bg-studio-surface-elevated'); // None pre-selected
+    }
+  });
+
+  it('P1-1: entering whisper with active agent — idle agents NOT pre-selected either', () => {
+    useChatStore.setState({
+      activeInvocations: { 'inv-1': { agentId: 'opus', mode: 'execute', startedAt: Date.now() } },
+      hasActiveInvocation: true,
+    });
+    act(() => root.render(React.createElement(ChatInput, { onSend: vi.fn(), hasActiveInvocation: true })));
+    enterWhisperMode();
+
+    const chips = getWhisperChips();
+    const codexChip = chips.find((b) => b.textContent?.includes('Owen（验证与审查）'));
+    // codex is idle but should NOT be auto-selected
+    expect(codexChip?.disabled).toBe(false);
+    expect(codexChip?.className.split(/\s+/)).not.toContain('bg-studio-surface-elevated');
+  });
+
+  it('falls back to targetAgents when activeInvocations is empty but hasActiveInvocation is true (legacy path)', () => {
+    useChatStore.setState({
+      activeInvocations: {},
+      hasActiveInvocation: true,
+      targetAgents: ['opus'],
+    });
+    act(() => root.render(React.createElement(ChatInput, { onSend: vi.fn(), hasActiveInvocation: true })));
+    enterWhisperMode();
+
+    const chips = getWhisperChips();
+    const opusChip = chips.find((b) => b.textContent?.includes('Ethan（任务主控与实现）'));
+    const codexChip = chips.find((b) => b.textContent?.includes('Owen（验证与审查）'));
+
+    expect(opusChip?.disabled).toBe(true);
+    expect(codexChip?.disabled).toBe(false);
+  });
+});

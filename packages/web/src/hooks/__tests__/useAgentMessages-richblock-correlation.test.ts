@@ -1,0 +1,794 @@
+import React, { act } from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { resetSharedReplacedInvocations } from '@/hooks/shared-replaced-invocations';
+import { useAgentMessages } from '@/hooks/useAgentMessages';
+
+const mockAddMessage = vi.fn();
+const mockAppendToMessage = vi.fn();
+const mockAppendToolEvent = vi.fn();
+const mockAppendRichBlock = vi.fn();
+const mockSetStreaming = vi.fn();
+const mockSetLoading = vi.fn();
+const mockSetHasActiveInvocation = vi.fn();
+const mockSetIntentMode = vi.fn();
+const mockSetAgentStatus = vi.fn();
+const mockClearAgentStatuses = vi.fn();
+const mockSetAgentInvocation = vi.fn();
+const mockSetMessageUsage = vi.fn();
+const mockRequestStreamCatchUp = vi.fn();
+const mockSetMessageMetadata = vi.fn();
+const mockSetMessageThinking = vi.fn();
+const mockRemoveActiveInvocation = vi.fn((invocationId: string) => {
+  delete storeState.activeInvocations[invocationId];
+});
+const mockReplaceMessageId = vi.fn((fromId: string, toId: string) => {
+  storeState.messages = storeState.messages.map((m) => (m.id === fromId ? { ...m, id: toId } : m));
+});
+const mockPatchMessage = vi.fn((id: string, patch: Record<string, unknown>) => {
+  storeState.messages = storeState.messages.map((m) => {
+    if (m.id !== id) return m;
+    const next = { ...m, ...patch } as typeof m & { metadata?: Record<string, unknown> };
+    if ('extra' in patch && patch.extra && typeof patch.extra === 'object') {
+      next.extra = { ...m.extra, ...(patch.extra as typeof m.extra) };
+    }
+    if ('metadata' in patch && patch.metadata && typeof patch.metadata === 'object') {
+      next.metadata = { ...(m as { metadata?: Record<string, unknown> }).metadata, ...(patch.metadata as object) };
+    }
+    return next;
+  });
+});
+
+const mockAddMessageToThread = vi.fn();
+const mockClearThreadActiveInvocation = vi.fn();
+const mockResetThreadInvocationState = vi.fn();
+const mockSetThreadMessageStreaming = vi.fn();
+const mockGetThreadState = vi.fn(() => ({ messages: [] }));
+
+const storeState = {
+  messages: [] as Array<{
+    id: string;
+    type: string;
+    agentId?: string;
+    content: string;
+    isStreaming?: boolean;
+    origin?: string;
+    extra?: { rich?: { v: 1; blocks: Array<{ id: string }> }; stream?: { invocationId?: string } };
+    timestamp: number;
+  }>,
+  addMessage: mockAddMessage,
+  appendToMessage: mockAppendToMessage,
+  appendToolEvent: mockAppendToolEvent,
+  appendRichBlock: mockAppendRichBlock,
+  setStreaming: mockSetStreaming,
+  setLoading: mockSetLoading,
+  setHasActiveInvocation: mockSetHasActiveInvocation,
+  setIntentMode: mockSetIntentMode,
+  setAgentStatus: mockSetAgentStatus,
+  clearAgentStatuses: mockClearAgentStatuses,
+  setAgentInvocation: mockSetAgentInvocation,
+  setMessageUsage: mockSetMessageUsage,
+  requestStreamCatchUp: mockRequestStreamCatchUp,
+  setMessageMetadata: mockSetMessageMetadata,
+  setMessageThinking: mockSetMessageThinking,
+  removeActiveInvocation: mockRemoveActiveInvocation,
+  replaceMessageId: mockReplaceMessageId,
+  patchMessage: mockPatchMessage,
+
+  addMessageToThread: mockAddMessageToThread,
+  // F183 B1.2.3+B1.2.4: active stream + callback explicit-invocationId paths →
+  // reducer → replaceMessages. Apply state so storeState.messages assertions work.
+  // Invocationless callback "fail-open" scenario stays on legacy (per 砚砚 verdict),
+  // so this apply-impl doesn't break the ghost-bubble test.
+  replaceMessages: vi.fn((msgs: unknown[]) => {
+    storeState.messages = msgs as typeof storeState.messages;
+  }),
+  hasMore: true,
+  clearThreadActiveInvocation: mockClearThreadActiveInvocation,
+  resetThreadInvocationState: mockResetThreadInvocationState,
+  setThreadMessageStreaming: mockSetThreadMessageStreaming,
+  getThreadState: mockGetThreadState,
+  currentThreadId: 'thread-1',
+  agentInvocations: {} as Record<string, { invocationId?: string }>,
+  activeInvocations: {} as Record<string, { agentId?: string }>,
+};
+
+let captured: ReturnType<typeof useAgentMessages> | undefined;
+
+vi.mock('@/stores/chatStore', () => {
+  const useChatStoreMock = Object.assign(() => storeState, { getState: () => storeState });
+  return {
+    useChatStore: useChatStoreMock,
+  };
+});
+
+function Harness() {
+  captured = useAgentMessages();
+  return null;
+}
+
+describe('useAgentMessages rich_block correlation (Bug A)', () => {
+  let container: HTMLDivElement;
+  let root: Root;
+
+  beforeAll(() => {
+    (globalThis as { React?: typeof React }).React = React;
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  });
+
+  afterAll(() => {
+    delete (globalThis as { React?: typeof React }).React;
+    delete (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT;
+  });
+
+  beforeEach(() => {
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+    captured = undefined;
+    storeState.messages = [];
+    storeState.agentInvocations = {};
+    storeState.activeInvocations = {};
+    resetSharedReplacedInvocations();
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    act(() => {
+      root.unmount();
+    });
+    container.remove();
+  });
+
+  it('appends rich_block (no messageId) to most recent callback message, not streaming message', () => {
+    act(() => {
+      root.render(React.createElement(Harness));
+    });
+
+    // Simulate: a streaming message exists (agent is responding)
+    const streamMsgId = 'msg-stream-opus';
+    storeState.messages.push({
+      id: streamMsgId,
+      type: 'assistant',
+      agentId: 'opus',
+      content: 'I am streaming...',
+      isStreaming: true,
+      origin: 'stream',
+      extra: { stream: { invocationId: 'inv-1' } },
+      timestamp: Date.now() - 1000,
+    });
+    storeState.agentInvocations = { opus: { invocationId: 'inv-1' } };
+
+    // Simulate: callback text message arrives (post_message)
+    const callbackMsgId = 'msg-callback-opus';
+    act(() => {
+      captured?.handleAgentMessage({
+        type: 'text',
+        agentId: 'opus',
+        content: 'Here are your options:',
+        origin: 'callback',
+        messageId: callbackMsgId,
+      });
+    });
+
+    // The callback message should be in the store now
+    storeState.messages.push({
+      id: callbackMsgId,
+      type: 'assistant',
+      agentId: 'opus',
+      content: 'Here are your options:',
+      origin: 'callback',
+      timestamp: Date.now(),
+    });
+
+    // Simulate: rich_block arrives WITHOUT messageId (create_rich_block callback path)
+    const testBlock = { id: 'block-1', kind: 'interactive', v: 1, interactiveType: 'select', options: [] };
+    act(() => {
+      captured?.handleAgentMessage({
+        type: 'system_info',
+        agentId: 'opus',
+        content: JSON.stringify({ type: 'rich_block', block: testBlock }),
+      });
+    });
+
+    // Bug A assertion: appendRichBlock should target the callback message, NOT the streaming message
+    expect(mockAppendRichBlock).toHaveBeenCalledTimes(1);
+    const [targetId, block] = mockAppendRichBlock.mock.calls[0];
+    expect(targetId).toBe(callbackMsgId);
+    expect(block.id).toBe('block-1');
+    // Should NOT be attached to the streaming message
+    expect(targetId).not.toBe(streamMsgId);
+  });
+
+  it('replaces an overlapping stream bubble with callback text from the same invocation', () => {
+    act(() => {
+      root.render(React.createElement(Harness));
+    });
+
+    storeState.messages.push({
+      id: 'msg-stream-opus',
+      type: 'assistant',
+      agentId: 'opus',
+      content: 'thinking...',
+      isStreaming: true,
+      origin: 'stream',
+      extra: { stream: { invocationId: 'inv-1' } },
+      timestamp: Date.now() - 1000,
+    });
+    storeState.agentInvocations = { opus: { invocationId: 'inv-1' } };
+
+    act(() => {
+      captured?.handleAgentMessage({
+        type: 'text',
+        agentId: 'opus',
+        content: 'final answer',
+        origin: 'callback',
+        messageId: 'msg-callback-opus',
+      });
+    });
+
+    expect(mockAddMessage).not.toHaveBeenCalled();
+    expect(mockReplaceMessageId).toHaveBeenCalledWith('msg-stream-opus', 'msg-callback-opus');
+    // F183 Phase B1.4: invocationless callback path now flows through reducer →
+    // replaceMessages. Legacy patchMessage with content/origin/isStreaming is
+    // no longer the writer; storeState end-state below验证 same behavior。
+    expect(storeState.messages).toEqual([
+      expect.objectContaining({
+        id: 'msg-callback-opus',
+        agentId: 'opus',
+        content: 'final answer',
+        origin: 'callback',
+        isStreaming: false,
+        extra: { stream: { invocationId: 'inv-1' } },
+      }),
+    ]);
+  });
+
+  it('replaces a finalized stream bubble when callback text arrives late for the same invocation', () => {
+    act(() => {
+      root.render(React.createElement(Harness));
+    });
+
+    storeState.messages.push({
+      id: 'msg-stream-finalized',
+      type: 'assistant',
+      agentId: 'opus',
+      content: 'thinking...',
+      isStreaming: false,
+      origin: 'stream',
+      extra: { stream: { invocationId: 'inv-2' } },
+      timestamp: Date.now() - 1000,
+    });
+    storeState.agentInvocations = { opus: { invocationId: 'inv-2' } };
+
+    act(() => {
+      captured?.handleAgentMessage({
+        type: 'text',
+        agentId: 'opus',
+        content: 'final answer',
+        origin: 'callback',
+        messageId: 'msg-callback-final',
+      });
+    });
+
+    expect(mockAddMessage).not.toHaveBeenCalled();
+    expect(mockReplaceMessageId).toHaveBeenCalledWith('msg-stream-finalized', 'msg-callback-final');
+    // F183 Phase B1.4: invocationless callback path flows through reducer; storeState
+    // end-state assertion below验证 patched bubble （content/origin/isStreaming）。
+    expect(storeState.messages).toEqual([
+      expect.objectContaining({
+        id: 'msg-callback-final',
+        agentId: 'opus',
+        content: 'final answer',
+        origin: 'callback',
+        isStreaming: false,
+        extra: { stream: { invocationId: 'inv-2' } },
+      }),
+    ]);
+  });
+
+  it('drops late stream chunks after callback replacement instead of recreating a bubble', () => {
+    act(() => {
+      root.render(React.createElement(Harness));
+    });
+
+    storeState.messages.push({
+      id: 'msg-stream-opus',
+      type: 'assistant',
+      agentId: 'opus',
+      content: 'thinking...',
+      isStreaming: true,
+      origin: 'stream',
+      extra: { stream: { invocationId: 'inv-3' } },
+      timestamp: Date.now() - 1000,
+    });
+    storeState.agentInvocations = { opus: { invocationId: 'inv-3' } };
+
+    act(() => {
+      captured?.handleAgentMessage({
+        type: 'text',
+        agentId: 'opus',
+        content: 'final answer',
+        origin: 'callback',
+        messageId: 'msg-callback-opus',
+      });
+    });
+
+    vi.clearAllMocks();
+
+    act(() => {
+      captured?.handleAgentMessage({
+        type: 'text',
+        agentId: 'opus',
+        content: ' late chunk',
+        origin: 'stream',
+      });
+    });
+
+    expect(mockAddMessage).not.toHaveBeenCalled();
+    expect(mockAppendToMessage).not.toHaveBeenCalled();
+    expect(storeState.messages).toEqual([
+      expect.objectContaining({
+        id: 'msg-callback-opus',
+        agentId: 'opus',
+        content: 'final answer',
+        origin: 'callback',
+        isStreaming: false,
+      }),
+    ]);
+  });
+
+  it('unlabeled late chunk fails open after invocation gone — does not pollute callback bubble (砚砚 A.12)', () => {
+    // F173 A.12 — original #586 test asserted "keep suppressing unlabeled chunks until
+    // different invocation observed". 砚砚 round 5 review reversed this: invocationless
+    // flow MUST fail-open (legacy /api/messages emits invocationless agent_messages,
+    // permanent suppression breaks them). The callback content is still protected via
+    // deterministic bubble id (A.3) + store hard-merge by id — late stream chunks
+    // create a NEW bubble (deriveBubbleId fallback `msg-{ts}-{agentId}`) instead of
+    // patching the callback bubble. So fail-open trades a small "extra ghost bubble"
+    // risk for unblocking the legitimate invocationless flow.
+    act(() => {
+      root.render(React.createElement(Harness));
+    });
+
+    storeState.messages.push({
+      id: 'msg-stream-old',
+      type: 'assistant',
+      agentId: 'opus',
+      content: 'thinking...',
+      isStreaming: true,
+      origin: 'stream',
+      extra: { stream: { invocationId: 'inv-old' } },
+      timestamp: Date.now() - 1000,
+    });
+    storeState.agentInvocations = { opus: { invocationId: 'inv-old' } };
+
+    act(() => {
+      captured?.handleAgentMessage({
+        type: 'text',
+        agentId: 'opus',
+        content: 'final answer',
+        origin: 'callback',
+        messageId: 'msg-callback-old',
+      });
+    });
+
+    // Invocation slot is gone — fail-open semantics now allow unlabeled chunks through.
+    storeState.agentInvocations = {};
+    vi.clearAllMocks();
+
+    act(() => {
+      captured?.handleAgentMessage({
+        type: 'text',
+        agentId: 'opus',
+        content: 'stale unlabeled chunk from old invocation',
+        origin: 'stream',
+      });
+    });
+
+    // Callback bubble (`msg-callback-old`) MUST NOT be patched — A.3 deterministic id
+    // routes the new chunk to a DIFFERENT bubble id, never overwrites the callback content.
+    const callbackBubble = storeState.messages.find((m) => m.id === 'msg-callback-old');
+    expect(callbackBubble).toBeDefined();
+    expect(callbackBubble?.content).toBe('final answer');
+    expect(callbackBubble?.origin).toBe('callback');
+    // appendToMessage onto the callback bubble id MUST NOT happen (would overwrite content)
+    const appendToCallbackCalls = mockAppendToMessage.mock.calls.filter((call) => call[0] === 'msg-callback-old');
+    expect(appendToCallbackCalls).toEqual([]);
+
+    storeState.agentInvocations = { opus: { invocationId: 'inv-new' } };
+    vi.clearAllMocks();
+
+    act(() => {
+      captured?.handleAgentMessage({
+        type: 'text',
+        agentId: 'opus',
+        content: 'verified new invocation first chunk',
+        origin: 'stream',
+      });
+    });
+
+    // F183 B1.2.3+B1.2.4: 关键 invariant 是 "callback bubble NOT polluted"。
+    // Step 4 chunk routing (new bubble vs appended onto step 3 stale ghost) is
+    // impl-detail dependent on mock setup; test focuses on the safety invariant.
+    const callbackAfter = storeState.messages.find((m) => m.id === 'msg-callback-old');
+    expect(callbackAfter?.content, 'callback bubble must NOT be polluted by late stream chunks').toBe('final answer');
+    expect(callbackAfter?.origin).toBe('callback');
+    // Verified-new chunk must NOT be appended to callback id specifically
+    const callbackAppendCalls = mockAppendToMessage.mock.calls.filter((c) => c[0] === 'msg-callback-old');
+    expect(callbackAppendCalls).toEqual([]);
+  });
+
+  it('falls back to ensureActiveAssistantMessage when no callback message exists', () => {
+    act(() => {
+      root.render(React.createElement(Harness));
+    });
+
+    // No callback messages, just a streaming message
+    storeState.messages.push({
+      id: 'msg-stream-opus',
+      type: 'assistant',
+      agentId: 'opus',
+      content: 'streaming...',
+      isStreaming: true,
+      origin: 'stream',
+      extra: { stream: { invocationId: 'inv-1' } },
+      timestamp: Date.now(),
+    });
+    storeState.agentInvocations = { opus: { invocationId: 'inv-1' } };
+
+    const testBlock = { id: 'block-2', kind: 'card', v: 1, title: 'test' };
+    act(() => {
+      captured?.handleAgentMessage({
+        type: 'system_info',
+        agentId: 'opus',
+        content: JSON.stringify({ type: 'rich_block', block: testBlock }),
+      });
+    });
+
+    // Should fall back to streaming message (existing behavior when no callback exists)
+    expect(mockAppendRichBlock).toHaveBeenCalledTimes(1);
+  });
+
+  it('replaces an invocationless rich-block placeholder when callback text arrives later', () => {
+    mockAddMessage.mockImplementation((message) => {
+      storeState.messages.push(message);
+    });
+    mockAppendRichBlock.mockImplementation((id: string, block: { id: string }) => {
+      storeState.messages = storeState.messages.map((message) => {
+        if (message.id !== id) return message;
+        const rich = message.extra?.rich ?? { v: 1 as const, blocks: [] };
+        if (rich.blocks.some((candidate) => candidate.id === block.id)) return message;
+        return {
+          ...message,
+          extra: {
+            ...message.extra,
+            rich: {
+              ...rich,
+              blocks: [...rich.blocks, block],
+            },
+          },
+        };
+      });
+    });
+
+    act(() => {
+      root.render(React.createElement(Harness));
+    });
+
+    const testBlock = { id: 'block-orphan', kind: 'card', v: 1, title: 'CLI Output' };
+    act(() => {
+      captured?.handleAgentMessage({
+        type: 'system_info',
+        agentId: 'codex',
+        content: JSON.stringify({ type: 'rich_block', block: testBlock }),
+      });
+    });
+
+    expect(storeState.messages).toEqual([
+      expect.objectContaining({
+        agentId: 'codex',
+        origin: 'stream',
+        isStreaming: true,
+        content: '',
+        extra: {
+          rich: {
+            v: 1,
+            blocks: [expect.objectContaining({ id: 'block-orphan' })],
+          },
+        },
+      }),
+    ]);
+    expect(storeState.messages[0]?.extra?.stream?.invocationId).toBeUndefined();
+
+    act(() => {
+      captured?.handleAgentMessage({
+        type: 'text',
+        agentId: 'codex',
+        content: 'command finished',
+        origin: 'callback',
+        messageId: 'msg-callback-codex',
+      });
+    });
+
+    expect(storeState.messages).toEqual([
+      expect.objectContaining({
+        id: 'msg-callback-codex',
+        agentId: 'codex',
+        content: 'command finished',
+        origin: 'callback',
+        isStreaming: false,
+        extra: {
+          rich: {
+            v: 1,
+            blocks: [expect.objectContaining({ id: 'block-orphan' })],
+          },
+        },
+      }),
+    ]);
+  });
+
+  it('replaces an invocationless rich-block placeholder even when callback carries explicit invocationId', () => {
+    mockAddMessage.mockImplementation((message) => {
+      storeState.messages.push(message);
+    });
+    mockAppendRichBlock.mockImplementation((id: string, block: { id: string }) => {
+      storeState.messages = storeState.messages.map((message) => {
+        if (message.id !== id) return message;
+        const rich = message.extra?.rich ?? { v: 1 as const, blocks: [] };
+        if (rich.blocks.some((candidate) => candidate.id === block.id)) return message;
+        return {
+          ...message,
+          extra: {
+            ...message.extra,
+            rich: {
+              ...rich,
+              blocks: [...rich.blocks, block],
+            },
+          },
+        };
+      });
+    });
+
+    act(() => {
+      root.render(React.createElement(Harness));
+    });
+
+    act(() => {
+      captured?.handleAgentMessage({
+        type: 'system_info',
+        agentId: 'codex',
+        content: JSON.stringify({ type: 'rich_block', block: { id: 'block-explicit', kind: 'card', v: 1 } }),
+        invocationId: 'inv-explicit',
+      });
+    });
+
+    // F173 hotfix: rich_block with explicit msg.invocationId binds the placeholder
+    // directly (no more invocationless rich-block fallback). The strict-match in
+    // findCallbackReplacementTarget then replaces it cleanly when callback arrives.
+    expect(storeState.messages[0]?.extra?.stream?.invocationId).toBe('inv-explicit');
+
+    act(() => {
+      captured?.handleAgentMessage({
+        type: 'text',
+        agentId: 'codex',
+        content: 'command finished with explicit id',
+        origin: 'callback',
+        messageId: 'msg-callback-explicit',
+        invocationId: 'inv-explicit',
+      });
+    });
+
+    expect(storeState.messages).toEqual([
+      expect.objectContaining({
+        id: 'msg-inv-explicit-codex',
+        content: '',
+        origin: 'stream',
+        isStreaming: true,
+      }),
+    ]);
+
+    act(() => {
+      captured?.handleAgentMessage({
+        type: 'done',
+        agentId: 'codex',
+        invocationId: 'inv-explicit',
+        isFinal: true,
+      });
+    });
+
+    expect(storeState.messages).toEqual([
+      expect.objectContaining({
+        id: 'msg-callback-explicit',
+        agentId: 'codex',
+        content: 'command finished with explicit id',
+        origin: 'callback',
+        isStreaming: false,
+        extra: {
+          stream: { invocationId: 'inv-explicit' },
+          rich: {
+            v: 1,
+            blocks: [expect.objectContaining({ id: 'block-explicit' })],
+          },
+        },
+      }),
+    ]);
+  });
+
+  it('skips stale callback when active streaming message exists (cloud P1 fix)', () => {
+    act(() => {
+      root.render(React.createElement(Harness));
+    });
+
+    // Stale callback from a previous invocation
+    storeState.messages.push({
+      id: 'cb-old',
+      type: 'assistant',
+      agentId: 'opus',
+      content: 'Old callback',
+      origin: 'callback',
+      timestamp: Date.now() - 5000,
+    });
+
+    // Current active streaming message
+    storeState.messages.push({
+      id: 'stream-now',
+      type: 'assistant',
+      agentId: 'opus',
+      content: 'Currently streaming...',
+      isStreaming: true,
+      origin: 'stream',
+      extra: { stream: { invocationId: 'inv-2' } },
+      timestamp: Date.now(),
+    });
+    storeState.agentInvocations = { opus: { invocationId: 'inv-2' } };
+
+    // Rich block from CLI stream (e.g. codex-event-transform image extraction), no messageId
+    const testBlock = { id: 'block-stream', kind: 'media_gallery', v: 1, items: [] };
+    act(() => {
+      captured?.handleAgentMessage({
+        type: 'system_info',
+        agentId: 'opus',
+        content: JSON.stringify({ type: 'rich_block', block: testBlock }),
+      });
+    });
+
+    // Should NOT go to the stale callback; should go to streaming message
+    expect(mockAppendRichBlock).toHaveBeenCalledTimes(1);
+    const [targetId] = mockAppendRichBlock.mock.calls[0];
+    expect(targetId).not.toBe('cb-old');
+    // Should target the streaming message (via ensureActiveAssistantMessage fallback)
+    expect(targetId).toBe('stream-now');
+  });
+
+  it('rich_block with explicit messageId still uses that messageId (existing behavior preserved)', () => {
+    act(() => {
+      root.render(React.createElement(Harness));
+    });
+
+    const explicitMsgId = 'msg-explicit-target';
+    storeState.messages.push({
+      id: explicitMsgId,
+      type: 'assistant',
+      agentId: 'opus',
+      content: 'target message',
+      origin: 'callback',
+      timestamp: Date.now(),
+    });
+
+    const testBlock = { id: 'block-3', kind: 'card', v: 1, title: 'test' };
+    act(() => {
+      captured?.handleAgentMessage({
+        type: 'system_info',
+        agentId: 'opus',
+        content: JSON.stringify({ type: 'rich_block', block: testBlock, messageId: explicitMsgId }),
+      });
+    });
+
+    expect(mockAppendRichBlock).toHaveBeenCalledWith(explicitMsgId, testBlock);
+  });
+
+  it('AC-Z17: invocationless rich_block after done attaches to just-finalized stream bubble, not a new small bubble', () => {
+    mockSetStreaming.mockImplementation((id: string, streaming: boolean) => {
+      storeState.messages = storeState.messages.map((m) => (m.id === id ? { ...m, isStreaming: streaming } : m));
+    });
+
+    act(() => {
+      root.render(React.createElement(Harness));
+    });
+
+    storeState.messages.push({
+      id: 'msg-voice-stream',
+      type: 'assistant',
+      agentId: 'opus',
+      content: '🎵 已发！',
+      isStreaming: true,
+      origin: 'stream',
+      extra: { stream: { invocationId: 'inv-voice' } },
+      timestamp: Date.now() - 1000,
+    });
+
+    act(() => {
+      captured?.handleAgentMessage({
+        type: 'done',
+        agentId: 'opus',
+        invocationId: 'inv-voice',
+        isFinal: true,
+      });
+    });
+
+    expect(storeState.messages[0]?.isStreaming).toBe(false);
+    vi.clearAllMocks();
+
+    const voiceBlock = { id: 'voice-after-done', kind: 'audio', v: 1, url: '/api/audio/voice.wav' };
+    act(() => {
+      captured?.handleAgentMessage({
+        type: 'system_info',
+        agentId: 'opus',
+        content: JSON.stringify({ type: 'rich_block', block: voiceBlock }),
+      });
+    });
+
+    // Z6: this is the old "F5 前多一个小气泡，F5 后消失" race. The late rich block
+    // should reuse the finalized stream bubble recorded by done, not create bg-rich/msg-*.
+    expect(mockAddMessage).not.toHaveBeenCalled();
+    expect(mockAppendRichBlock).toHaveBeenCalledTimes(1);
+    expect(mockAppendRichBlock).toHaveBeenCalledWith('msg-voice-stream', voiceBlock);
+  });
+
+  it('does not attach explicit rich_block from a new invocation to the previous finalized bubble', () => {
+    mockSetStreaming.mockImplementation((id: string, streaming: boolean) => {
+      storeState.messages = storeState.messages.map((m) => (m.id === id ? { ...m, isStreaming: streaming } : m));
+    });
+    mockAddMessage.mockImplementation((message) => {
+      storeState.messages.push(message);
+    });
+
+    act(() => {
+      root.render(React.createElement(Harness));
+    });
+
+    storeState.messages.push({
+      id: 'msg-old-voice-stream',
+      type: 'assistant',
+      agentId: 'opus',
+      content: 'old voice done',
+      isStreaming: true,
+      origin: 'stream',
+      extra: { stream: { invocationId: 'inv-old-voice' } },
+      timestamp: Date.now() - 1000,
+    });
+
+    act(() => {
+      captured?.handleAgentMessage({
+        type: 'done',
+        agentId: 'opus',
+        invocationId: 'inv-old-voice',
+        isFinal: true,
+      });
+    });
+
+    vi.clearAllMocks();
+
+    const newVoiceBlock = { id: 'voice-new-invocation', kind: 'audio', v: 1, url: '/api/audio/new.wav' };
+    act(() => {
+      captured?.handleAgentMessage({
+        type: 'system_info',
+        agentId: 'opus',
+        invocationId: 'inv-new-voice',
+        content: JSON.stringify({ type: 'rich_block', block: newVoiceBlock }),
+      });
+    });
+
+    expect(mockAppendRichBlock).toHaveBeenCalledTimes(1);
+    expect(mockAppendRichBlock).toHaveBeenCalledWith('msg-inv-new-voice-opus', newVoiceBlock);
+    expect(mockAppendRichBlock).not.toHaveBeenCalledWith('msg-old-voice-stream', newVoiceBlock);
+    expect(mockAddMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'msg-inv-new-voice-opus',
+        agentId: 'opus',
+        extra: { stream: { invocationId: 'inv-new-voice' } },
+      }),
+    );
+  });
+});
