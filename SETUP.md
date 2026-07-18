@@ -40,11 +40,34 @@ All values in `.env.example` are placeholders or local defaults. Add only creden
 
 ## Development
 
+The root workspace commands do not automatically import `.env`. Export the required values in the shell that launches the process. For a credential-free review, memory mode is the smallest reproducible path.
+
 ```bash
-pnpm dev
+MEMORY_STORE=1 API_SERVER_PORT=3004 pnpm --filter @agent-studio/api dev
 ```
 
-The terminal prints the local API and web addresses. If the default ports are occupied, set the documented local port variables in `.env`.
+In a second terminal:
+
+```bash
+PORT=3003 pnpm --filter @agent-studio/web dev
+```
+
+PowerShell equivalent:
+
+```powershell
+$env:MEMORY_STORE = '1'
+$env:API_SERVER_PORT = '3004'
+pnpm --filter @agent-studio/api dev
+```
+
+In a second PowerShell terminal:
+
+```powershell
+$env:PORT = '3003'
+pnpm --filter @agent-studio/web dev
+```
+
+Open <http://localhost:3003>. If the default ports are occupied, keep the API and web values aligned with the web rewrite configuration.
 
 ## Production-style build
 
@@ -52,10 +75,26 @@ The terminal prints the local API and web addresses. If the default ports are oc
 pnpm build
 ```
 
-Start the API and web workspaces in separate terminals:
+Start the API and web workspaces in separate terminals. The explicit `MEMORY_STORE=1` opt-in is required when Redis is not running:
 
 ```bash
+# Terminal 1
+MEMORY_STORE=1 API_SERVER_PORT=3004 pnpm start:api
+
+# Terminal 2
+PORT=3003 pnpm start:web
+```
+
+PowerShell equivalent:
+
+```powershell
+# Terminal 1
+$env:MEMORY_STORE = '1'
+$env:API_SERVER_PORT = '3004'
 pnpm start:api
+
+# Terminal 2
+$env:PORT = '3003'
 pnpm start:web
 ```
 
@@ -74,4 +113,4 @@ The default test command runs the deterministic Build Week regression set used b
 
 ## Judge shortcut
 
-Judges do not need to rebuild the project. Use the hosted demo and private credentials supplied in the Devpost testing instructions. The recommended path is documented in [README.md](README.md#judge-testing).
+The hosted workspace is an owner-only production instance, so production credentials are not shared. Judges can use the public video and repository, then run the credential-free memory-mode path above for hands-on review. The recommended flow is documented in [README.md](README.md#judge-testing).

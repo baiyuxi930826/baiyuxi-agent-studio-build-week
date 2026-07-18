@@ -61,7 +61,6 @@ cd baiyuxi-agent-studio-build-week
 corepack enable
 pnpm install --frozen-lockfile
 cp .env.example .env
-pnpm dev
 ```
 
 On Windows PowerShell, replace the copy command with:
@@ -70,23 +69,46 @@ On Windows PowerShell, replace the copy command with:
 Copy-Item .env.example .env
 ```
 
-Provider credentials are optional for inspecting the workspace. To invoke an external model, configure your own provider account through the application settings or local environment.
+The root workspace commands do not automatically import the copied `.env` file. For a credential-free local review, start the built application in two terminals with explicit memory mode:
+
+```bash
+# Terminal 1
+MEMORY_STORE=1 API_SERVER_PORT=3004 pnpm start:api
+
+# Terminal 2
+PORT=3003 pnpm start:web
+```
+
+PowerShell equivalent:
+
+```powershell
+# Terminal 1
+$env:MEMORY_STORE = '1'
+$env:API_SERVER_PORT = '3004'
+pnpm start:api
+
+# Terminal 2
+$env:PORT = '3003'
+pnpm start:web
+```
+
+Then open <http://localhost:3003>. Provider credentials are optional for inspecting the workspace. To invoke an external model, configure your own provider account through the application settings or local environment.
 
 Full build and verification instructions are in [SETUP.md](SETUP.md).
 
 ## Judge testing
 
 - Hosted demo: <https://jd.luccc.uk/login>
-- Dedicated judge credentials: supplied privately in the Devpost testing instructions
+- The hosted workspace is an owner-only production instance; production credentials are not shared
 - Repository: this public Build Week edition contains no production credentials or private session data
 
 Recommended test flow:
 
-1. Sign in with the supplied judge account.
-2. Open the Build Week sample workspace.
-3. Inspect agent routing and invocation evidence.
-4. Create or open a thread and request a title candidate.
-5. Edit or confirm the candidate and verify that no title changes before confirmation.
+1. Follow the local memory-mode commands above and open <http://localhost:3003>.
+2. Inspect the agent catalog, routing surfaces, and invocation evidence model.
+3. Create or open a thread and request a title candidate.
+4. Edit or confirm the candidate and verify that no title changes before confirmation.
+5. Use your own authenticated Codex CLI only if you want to exercise a live model invocation.
 
 ## Verification
 
