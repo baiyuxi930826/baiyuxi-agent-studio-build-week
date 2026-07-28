@@ -29,7 +29,7 @@
     "@fastify/cookie": "9",
     "@fastify/cors": "^9.0.0",
     "@fastify/multipart": "8",
-    "@fastify/static": "7",
+    "@fastify/static": "10",
     "@fastify/websocket": "^10.0.0",
     "@larksuiteoapi/node-sdk": "^1.59.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
