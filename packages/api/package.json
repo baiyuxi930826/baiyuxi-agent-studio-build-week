@@ -68,7 +68,7 @@
     "rss-parser": "^3.13.0",
     "sharp": "^0.34.5",
     "silk-wasm": "^3.7.1",
-    "smol-toml": "^1.6.0",
+    "smol-toml": "^1.7.1",
     "socket.io": "^4.7.0",
     "sqlite-vec": "^0.1.9",
     "web-push": "^3.6.7",
